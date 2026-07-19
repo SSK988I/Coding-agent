@@ -1,0 +1,16 @@
+[project]
+name = "agent-llm"
+version = "0.1.0"
+description = "统一的 LLM Provider 与流式传输抽象"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "openai>=2.0,<3",
+]
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

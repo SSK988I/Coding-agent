@@ -1,0 +1,16 @@
+{
+  "extends": "./pyrightconfig.json",
+  "include": [
+    "packages/app/src/coding_agent/cli/main.py",
+    "packages/app/src/coding_agent/cli/initial_message.py",
+    "packages/app/src/coding_agent/core/agent_session.py",
+    "packages/app/src/coding_agent/core/settings.py",
+    "packages/app/src/coding_agent/core/credentials.py",
+    "packages/app/src/coding_agent/core/retry.py",
+    "packages/app/src/coding_agent/modes/interactive/interactive_mode.py",
+    "packages/app/src/coding_agent/modes/interactive/components/status_indicator.py",
+    "packages/core/src/agent_core/tools/bash.py",
+    "packages/core/src/agent_core/session/storage.py",
+    "scripts/check_versions.py"
+  ]
+}

@@ -1,0 +1,38 @@
+[project]
+name = "coding-agent-workspace"
+version = "0.1.0"
+description = "提供交互式终端界面的 Python 编程 Agent"
+requires-python = ">=3.13"
+dependencies = [
+    "coding-agent",
+]
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+coding-agent = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "pytest>=9,<10",
+    "pyright>=1.1.400,<2",
+    "ruff>=0.12,<1",
+]
+
+[tool.pytest.ini_options]
+testpaths = [
+    "packages/llm/tests",
+    "packages/core/tests",
+    "packages/tui/tests",
+    "packages/app/tests",
+]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 120
+extend-exclude = [".venv", "dist", "build"]
+
+[tool.ruff.lint]
+select = ["E", "F"]
+ignore = ["E501"]

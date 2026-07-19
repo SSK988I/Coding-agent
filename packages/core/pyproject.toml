@@ -1,0 +1,28 @@
+[project]
+name = "agent-core"
+version = "0.1.0"
+description = "提供工具调用、会话和上下文管理的 Agent 运行时"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pathspec>=1.1,<2",
+    "agent-llm",
+]
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.uv.sources]
+agent-llm = { workspace = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

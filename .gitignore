@@ -1,0 +1,61 @@
+# Python 字节码和包构建产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+
+# 环境变量和本地凭据
+.env
+.env.*
+!.env.example
+
+# Coding Agent 本地运行数据
+.coding-agent/
+/auth.json
+/settings.json
+/sessions/
+
+# 测试、类型检查和覆盖率缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+.tox/
+.nox/
+coverage.xml
+*.prof
+
+# 本地编辑器和操作系统文件
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# 运行时文件和临时文件
+*.log
+*.stream_debug.log
+*.tmp
+*.bak
+*.orig
+
+# 本地 Agent 工具元数据
+.agents/
+.claude/
+.zcode/
+.codex/

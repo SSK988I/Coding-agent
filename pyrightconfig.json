@@ -1,0 +1,19 @@
+{
+  "include": ["packages"],
+  "exclude": ["**/__pycache__", "**/*.egg-info"],
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.13",
+  "typeCheckingMode": "basic",
+  "executionEnvironments": [
+    {
+      "root": "packages",
+      "extraPaths": [
+        "packages/llm/src",
+        "packages/core/src",
+        "packages/tui/src",
+        "packages/app/src"
+      ]
+    }
+  ]
+}

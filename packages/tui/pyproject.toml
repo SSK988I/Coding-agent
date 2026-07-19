@@ -1,0 +1,27 @@
+[project]
+name = "agent-tui"
+version = "0.1.0"
+description = "用于构建对话和交互式应用的终端界面库"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "mistune>=3,<4",
+    "pillow>=10,<13",
+    "regex>=2024,<2027",
+    "rich>=14,<16",
+    "prompt-toolkit>=3,<4",
+    "agent-llm",
+]
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+agent_tui = ["data/themes/*.json"]
+
+[tool.uv.sources]
+agent-llm = { workspace = true }
