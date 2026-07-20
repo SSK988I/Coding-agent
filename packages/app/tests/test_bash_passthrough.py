@@ -35,7 +35,8 @@ def _model() -> Model:
     )
 
 
-def _make_session(cwd="E:/code/Coding-agent"):
+def _make_session(cwd=None):
+    cwd = cwd or str(Path.cwd())
     sm = SessionManager.create(cwd=cwd, in_memory=True)
     config = AgentSessionConfig(model=_model(), cwd=cwd, session_manager=sm)
     return AgentSession(config)

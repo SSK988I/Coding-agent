@@ -87,7 +87,9 @@ class _FakeKernel32:
 def _install_fake(fake, monkeypatch):
     """Install ``fake`` as ctypes.windll.kernel32 for the duration of a test."""
     windll = types.SimpleNamespace(kernel32=fake)
-    monkeypatch.setattr(ctypes, "windll", windll)
+    # ``ctypes.windll`` only exists on Windows.  These tests intentionally run
+    # on every platform, so allow pytest to create the attribute on POSIX.
+    monkeypatch.setattr(ctypes, "windll", windll, raising=False)
 
 
 def _make_terminal():
