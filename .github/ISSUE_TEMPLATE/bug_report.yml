@@ -1,0 +1,99 @@
+name: Bug 报告
+description: 报告可复现的错误、崩溃或行为异常
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢你报告问题。提交前请搜索现有 Issue，并移除 API Key、令牌、私人会话内容等敏感信息。
+        安全漏洞请不要在此公开提交，请遵循仓库的 SECURITY.md。
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: 受影响组件
+      options:
+        - CLI 与参数解析
+        - Agent 运行循环
+        - LLM Provider 与模型
+        - 工具与 Shell
+        - 会话与上下文压缩
+        - TUI 与终端渲染
+        - 设置、登录与凭据
+        - 构建、打包与 CI
+        - 其他
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Coding Agent 版本
+      description: 填写版本号或提交 SHA。
+      placeholder: "例如：0.1.0 或 353a824"
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: 运行环境
+      description: 操作系统、终端和 Python 版本。
+      placeholder: "例如：Windows 11 / PowerShell 7 / Python 3.13.3"
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 复现步骤
+      description: 提供可以稳定复现问题的最小步骤、命令和输入。
+      placeholder: |
+        1. 执行 ...
+        2. 输入 ...
+        3. 观察到 ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期行为
+      placeholder: 描述你认为应该发生什么。
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+      placeholder: 描述实际发生了什么，以及问题是否稳定出现。
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志、截图或最小示例
+      description: 可直接粘贴日志或拖入截图。请先删除凭据和私人内容。
+      render: shell
+
+  - type: textarea
+    id: context
+    attributes:
+      label: 补充信息
+      description: Provider、模型、相关配置、可能原因或临时解决方案等。
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: 提交确认
+      options:
+        - label: 我已搜索现有 Issue，未发现相同问题。
+          required: true
+        - label: 我已尽量在最新发布版本或最新 `dev` 分支上复现。
+          required: true
+        - label: 我确认内容中不包含 API Key、令牌或其他敏感信息。
+          required: true
