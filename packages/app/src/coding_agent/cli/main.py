@@ -278,6 +278,19 @@ def _load_context_for_run(args: Args, cwd: str, agent_dir: Path) -> list | None:
 # ─── Stdout takeover ─────────
 
 
+def _configure_output_encoding(*streams: Any) -> None:
+    """Use UTF-8 for CLI output even when Windows redirects to a legacy code page."""
+    if not streams:
+        streams = (sys.stdout, sys.stderr)
+    for stream in streams:
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            # StringIO, detached streams, and embedded hosts may not support
+            # reconfiguration. Keep their existing behavior in that case.
+            pass
+
+
 def _take_over_stdout() -> None:
     """Reconfigure stdout for unbuffered streaming in print mode.
 
@@ -311,6 +324,9 @@ def main(argv: list[str] | None = None) -> int:
 
     Supported modes are interactive (default) and print.
     """
+    # argparse may print localized help before normal runtime setup. Windows
+    # pipes can default to cp1252, which cannot encode the Chinese help text.
+    _configure_output_encoding()
     args = parse_args(argv)
 
     # ── Metadata commands (no runtime needed) ────────────────────────────

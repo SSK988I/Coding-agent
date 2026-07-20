@@ -1,13 +1,18 @@
 """Tests for CLI options that affect runtime safety and session handling."""
 from __future__ import annotations
 
+import io
 from pathlib import Path
 from types import SimpleNamespace
 
 from agent_llm import Model, ModelCost
 
 from coding_agent.cli.args import Args, parse_args
-from coding_agent.cli.main import _create_session_manager, _load_context_for_run
+from coding_agent.cli.main import (
+    _configure_output_encoding,
+    _create_session_manager,
+    _load_context_for_run,
+)
 from coding_agent.core.agent_session import AgentSession, AgentSessionConfig
 
 
@@ -86,3 +91,15 @@ def test_unimplemented_resume_option_is_not_advertised():
         assert exc.code == 2
     else:
         raise AssertionError("expected removed resume option to be rejected")
+
+
+def test_output_encoding_handles_localized_help_on_legacy_windows_code_page():
+    raw = io.BytesIO()
+    stream = io.TextIOWrapper(raw, encoding="cp1252")
+
+    _configure_output_encoding(stream)
+    stream.write("用法：coding-agent")
+    stream.flush()
+
+    assert stream.encoding == "utf-8"
+    assert raw.getvalue().decode("utf-8") == "用法：coding-agent"
