@@ -89,6 +89,8 @@ class AgentSessionConfig:
     context_files: list | None = None  # list[ContextFile]
     #: Loaded skills injected as ``<available_skills>``.
     skills: list | None = None  # list[Skill]
+    #: Loaded prompt templates, expanded when the user types ``/name args``.
+    prompt_templates: list | None = None  # list[PromptTemplate]
     retry_policy: RetryPolicy = field(default_factory=RetryPolicy)
     settings_manager: Any = None
     theme_name: str = "dark"

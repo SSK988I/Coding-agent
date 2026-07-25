@@ -85,6 +85,9 @@ class InteractiveMode:
     def __init__(self, session: AgentSession) -> None:
         self._session = session
 
+        # ── Prompt templates (for /name args expansion) ─────────────────
+        self._prompt_templates = getattr(session._config, "prompt_templates", None) or []
+
         # ── Theme ────────────────────────────────────────────────────────
         try:
             self.theme = load_theme(session.theme_name)
@@ -186,6 +189,10 @@ class InteractiveMode:
         filter). Per-command argument completion is NOT wired here:
         ``/model`` uses an inline selector (see :meth:`_open_model_selector`)
         and ``/thinking`` was removed in favor of the Shift+Tab hotkey.
+
+        Prompt templates (``/tplname args``) and skill invocations
+        (``/skill:name``) are appended so they appear in completion and are
+        dispatched by :meth:`_on_submit` / :meth:`_handle_skill_command`.
         """
 
         from coding_agent.modes.interactive.autocomplete_manager import AutocompleteManager
@@ -195,8 +202,28 @@ class InteractiveMode:
             BuiltinSlashCommand(name=cmd.name, description=cmd.description, active=cmd.active)
             for cmd in get_active_commands()
         ]
+        # Prompt templates: surfaced as /name for completion + expansion.
+        for tpl in self._prompt_templates:
+            # Avoid clashing with a real builtin command of the same name.
+            if not any(c.name == tpl.name for c in commands):
+                commands.append(BuiltinSlashCommand(
+                    name=tpl.name,
+                    description=tpl.description or "提示词模板",
+                ))
+        # Skills: surfaced as /skill:<name> for explicit invocation.
+        for skill in self._skills_for_command():
+            cmd_name = f"skill:{skill.name}"
+            if not any(c.name == cmd_name for c in commands):
+                commands.append(BuiltinSlashCommand(
+                    name=cmd_name,
+                    description=skill.description or "技能",
+                ))
         provider = CombinedAutocompleteProvider(commands)
         self._autocomplete = AutocompleteManager(self.tui, self.editor, provider)
+
+    def _skills_for_command(self) -> list:
+        """Return the skills available for ``/skill:name`` invocation."""
+        return getattr(self._session._config, "skills", None) or []
 
     # ── Bash passthrough (the ! command) ──────────────────────────────────
 
@@ -261,6 +288,22 @@ class InteractiveMode:
         if text.startswith("/"):
             if await self._handle_command(text):
                 return
+            # Prompt template expansion: /name args → template content.
+            if self._prompt_templates:
+                from coding_agent.core.prompt_templates import expand_prompt_template
+                expanded = expand_prompt_template(text, self._prompt_templates)
+                if expanded != text:
+                    # Show the expanded prompt as the user message, then run it.
+                    self._add_user_message(expanded)
+                    self._is_responding = True
+                    self.editor.disable_submit = True
+                    try:
+                        await self._respond(expanded)
+                    finally:
+                        self._is_responding = False
+                        self.editor.disable_submit = False
+                        self._refresh_footer()
+                    return
             self._add_user_message(text)
             err = f"未知命令：`{text}`\n\n输入 `/help` 查看可用命令。"
             self._add_assistant_text(err)
@@ -595,6 +638,13 @@ class InteractiveMode:
         parts = trimmed.split(maxsplit=1)
         cmd_name = parts[0][1:]  # strip leading /
 
+        # /skill:name — explicit skill invocation. Reads the SKILL.md content
+        # and sends it as a user message so the model applies it this turn.
+        if cmd_name.startswith("skill:"):
+            handled = await self._handle_skill_command(cmd_name, " ".join(parts[1:]) if len(parts) > 1 else "")
+            if handled:
+                return True
+
         cmd = next((c for c in BUILTIN_SLASH_COMMANDS if c.name == cmd_name), None)
         if cmd is None or not cmd.active:
             # /thinking was removed in favor of the Shift+Tab hotkey — point
@@ -640,11 +690,62 @@ class InteractiveMode:
             return False
         return True
 
+    async def _handle_skill_command(self, cmd_name: str, extra: str) -> bool:
+        """Handle ``/skill:name [args]`` by loading and sending the skill body.
+
+        Reads the SKILL.md content and sends it as a user turn so the model
+        applies the skill instructions for this request. Returns False (so the
+        caller falls through to "unknown command") when the name matches no
+        loaded skill.
+        """
+        name = cmd_name[len("skill:"):]
+        skill = next((s for s in self._skills_for_command() if s.name == name), None)
+        if skill is None:
+            return False
+        try:
+            from pathlib import Path
+            body = Path(skill.file_path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            self._add_system_message(self.theme.fg("error", f"无法读取技能文件：{e}"))
+            return True
+        # Strip frontmatter so only the instructional body is sent.
+        from coding_agent.core.skills import parse_frontmatter
+        _fm, body_content = parse_frontmatter(body)
+        prompt = body_content.strip()
+        if extra:
+            prompt = f"{prompt}\n\n{extra}"
+        if not prompt:
+            self._add_system_message(f"技能 `{name}` 的内容为空。")
+            return True
+        self._add_user_message(f"应用技能 `{name}`：\n\n{prompt}")
+        self._is_responding = True
+        self.editor.disable_submit = True
+        try:
+            await self._respond(prompt)
+        finally:
+            self._is_responding = False
+            self.editor.disable_submit = False
+            self._refresh_footer()
+        return True
+
     def _cmd_help(self) -> None:
         active = get_active_commands()
         lines = ["**可用命令：**\n"]
         for cmd in active:
             lines.append(f"- `/{cmd.name}` — {cmd.description}")
+        # Prompt templates (user/project-discovered).
+        if self._prompt_templates:
+            lines.append("\n**提示词模板：**\n")
+            for tpl in self._prompt_templates:
+                desc = tpl.description or "提示词模板"
+                hint = f" {tpl.argument_hint}" if tpl.argument_hint else ""
+                lines.append(f"- `/{tpl.name}{hint}` — {desc}")
+        # Skills available for explicit /skill:name invocation.
+        skills = self._skills_for_command()
+        if skills:
+            lines.append("\n**技能：**\n")
+            for skill in skills:
+                lines.append(f"- `/skill:{skill.name}` — {skill.description or '技能'}")
         self._add_assistant_text("\n".join(lines))
 
     def _cmd_clear(self) -> None:

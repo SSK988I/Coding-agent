@@ -275,6 +275,43 @@ def _load_context_for_run(args: Args, cwd: str, agent_dir: Path) -> list | None:
     return load_project_context_files(cwd, agent_dir) or None
 
 
+def _load_skills_for_run(args: Args, cwd: str, agent_dir: Path) -> list | None:
+    """Discover skills (user + project + explicit --skill paths).
+
+    Returns ``None`` when discovery is disabled or yields no skills, so the
+    AgentSessionConfig default (``None``) is preserved and no
+    ``<available_skills>`` block is emitted.
+    """
+    if args.no_skills:
+        return None
+    from coding_agent.core.skills import load_skills
+    result = load_skills(
+        cwd, agent_dir,
+        skill_paths=args.skill_paths,
+        include_defaults=True,
+    )
+    # Diagnostics are surfaced to stderr but never fatal.
+    for diag in result.diagnostics:
+        if diag.type == "collision":
+            print(f"技能冲突：{diag.message}（{diag.path}）", file=sys.stderr)
+        else:
+            print(f"技能警告：{diag.message}（{diag.path}）", file=sys.stderr)
+    return result.skills or None
+
+
+def _load_prompt_templates_for_run(args: Args, cwd: str, agent_dir: Path) -> list | None:
+    """Discover prompt templates for interactive ``/name args`` expansion."""
+    if args.no_prompts:
+        return None
+    from coding_agent.core.prompt_templates import load_prompt_templates
+    templates = load_prompt_templates(
+        cwd, agent_dir,
+        prompt_paths=args.prompt_template_paths,
+        include_defaults=True,
+    )
+    return templates or None
+
+
 # ─── Stdout takeover ─────────
 
 
@@ -430,6 +467,8 @@ def main(argv: list[str] | None = None) -> int:
     # ── Create AgentSession ──────────────────────────────────────────────
     # Discover project context files (AGENTS.md/CLAUDE.md) unless disabled.
     context_files = _load_context_for_run(args, cwd, agent_dir)
+    skills = _load_skills_for_run(args, cwd, agent_dir)
+    prompt_templates = _load_prompt_templates_for_run(args, cwd, agent_dir)
 
     config = AgentSessionConfig(
         model=model,
@@ -442,6 +481,8 @@ def main(argv: list[str] | None = None) -> int:
             "\n\n".join(args.append_system_prompt) if args.append_system_prompt else None
         ),
         context_files=context_files,
+        skills=skills,
+        prompt_templates=prompt_templates,
         retry_policy=RetryPolicy(
             enabled=settings.auto_retry,
             max_retries=settings.max_retries,
