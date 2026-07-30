@@ -7,9 +7,12 @@
 布局（自上而下）::
 
     ─── 顶部边框 ───
+      会话树
       <提示行>
+    ─── 分隔边框 ───
       <扁平化树行>
       <扁平化树行>
+      (当前位置/总数)
     ─── 底部边框 ───
 
 组件结构与 ModelSelectorComponent 对齐：单组件自渲染，``focused`` 属性
@@ -17,12 +20,13 @@
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any, Callable, List
 
 from agent_tui.keys import matches_key
 from agent_tui.theme import Theme
-from agent_tui.utils import visible_width
+from agent_tui.utils import slice_by_column, truncate_to_width, visible_width
 
 from agent_core.session.types import (
     CompactionEntry,
@@ -40,12 +44,25 @@ class _FlatRow:
     """扁平化后的一行。
 
     ``entry_id`` 是对应 entry 的 id（用于回传给 on_select）；
+    ``entry`` 保留原始条目，供渲染阶段按 message role 着色；
     ``text`` 是已经拼好缩进 + 连接符 + label 的完整文本；
+    ``anchor_col`` 是 label 在 ``text`` 中的可见起始列，用于窄终端下
+    水平平移，确保选中项正文仍然可见；
     ``on_active_path`` 表示该行是否在当前叶 → 根的活跃路径上。
     """
     entry_id: str
+    entry: SessionEntry
     text: str
+    anchor_col: int
     on_active_path: bool
+
+
+@dataclass(frozen=True)
+class _Gutter:
+    """一个祖先分叉在后代行中留下的竖向连接槽。"""
+
+    position: int
+    show: bool
 
 
 class TreeSelectorComponent:
@@ -79,10 +96,15 @@ class TreeSelectorComponent:
 
         # 活跃路径：从当前叶沿 parent_id 上溯到根的所有 entry.id。
         self._active_path_ids: set[str] = self._compute_active_path()
+        self._tool_calls = _collect_tool_calls(self._sm.entries)
 
-        # 扁平化整棵树。多根时把所有根当成虚拟根的 children，
-        # 这样根之间也能用 ├─ / └─ 区分先后。
-        self._rows: list[_FlatRow] = self._flatten_roots(self._sm.get_tree())
+        # 先把隐藏条目的后代重新挂到最近可见祖先，再计算连接符；否则
+        # tool-call-only assistant 被隐藏后会留下没有父节点的缩进空洞。
+        visible_tree = _build_visible_tree(
+            self._sm.get_tree(),
+            current_leaf_id=getattr(self._sm, "leaf_id", None),
+        )
+        self._rows: list[_FlatRow] = self._flatten_roots(visible_tree)
 
         # 默认选中当前叶。
         self._selected_index = 0
@@ -94,6 +116,7 @@ class TreeSelectorComponent:
                     break
 
         self._scroll_offset = 0
+        self._scroll_to_selection()
         self.focused = True
 
     # ── 活跃路径 ──────────────────────────────────────────────────────────
@@ -116,45 +139,78 @@ class TreeSelectorComponent:
     # ── 扁平化 ────────────────────────────────────────────────────────────
 
     def _flatten_roots(self, roots: list[SessionTreeNode]) -> list[_FlatRow]:
-        """多根场景：把所有根当成一个虚拟根的 children。
+        """以显式栈按 DFS 顺序扁平化整棵树。
 
-        单根时与普通树一样。多根时，根之间用 ``├─`` / ``└─`` 连接符区分。
+        普通单子节点链保持同一文本列；只有父节点出现多个 children 时才
+        绘制连接符并增加视觉深度。分叉后的第一代后裔额外内缩一层，让各
+        分支的线性尾部形成稳定的视觉分组，之后的单链不再继续向右漂移。
+        多根场景等价于一个不可见的分叉根。
         """
         out: list[_FlatRow] = []
-        n = len(roots)
-        for i, root in enumerate(roots):
-            self._flatten(root, is_last=(i == n - 1), prefix_gutters="", out=out)
+        multiple_roots = len(roots) > 1
+        # node, indent, just_branched, show_connector, is_last, gutters
+        stack: list[
+            tuple[SessionTreeNode, int, bool, bool, bool, tuple[_Gutter, ...]]
+        ] = []
+
+        for index in range(len(roots) - 1, -1, -1):
+            stack.append((
+                roots[index],
+                1 if multiple_roots else 0,
+                multiple_roots,
+                multiple_roots,
+                index == len(roots) - 1,
+                (),
+            ))
+
+        while stack:
+            node, indent, just_branched, show_connector, is_last, gutters = stack.pop()
+            prefix = _build_tree_prefix(
+                indent=indent,
+                show_connector=show_connector,
+                is_last=is_last,
+                gutters=gutters,
+            )
+            on_active_path = node.entry.id in self._active_path_ids
+            path_marker = "• " if on_active_path else "  "
+            out.append(_FlatRow(
+                entry_id=node.entry.id,
+                entry=node.entry,
+                text=(
+                    f"{prefix}{path_marker}"
+                    f"{_format_entry_label(node.entry, self._tool_calls)}"
+                ),
+                anchor_col=visible_width(prefix) + 2,
+                on_active_path=on_active_path,
+            ))
+
+            children = node.children
+            multiple_children = len(children) > 1
+            if multiple_children:
+                child_indent = indent + 1
+            elif just_branched and indent > 0:
+                child_indent = indent + 1
+            else:
+                child_indent = indent
+
+            child_gutters = gutters
+            if show_connector:
+                child_gutters = (
+                    *gutters,
+                    _Gutter(position=max(0, indent - 1), show=not is_last),
+                )
+
+            for index in range(len(children) - 1, -1, -1):
+                stack.append((
+                    children[index],
+                    child_indent,
+                    multiple_children,
+                    multiple_children,
+                    index == len(children) - 1,
+                    child_gutters,
+                ))
+
         return out
-
-    def _flatten(
-        self,
-        node: SessionTreeNode,
-        *,
-        is_last: bool,
-        prefix_gutters: str,
-        out: list[_FlatRow],
-    ) -> None:
-        """DFS 扁平化一棵子树。
-
-        ``prefix_gutters`` 是该节点之前所有祖先层的"竖线 / 空白"前缀
-        （每层 3 个字符：``│  `` 或 ``   ``）。
-        ``is_last`` 表示该节点是不是它父亲的最后一个 child（决定用
-        ``└─`` 还是 ``├─``）。
-        """
-        connector = "└─ " if is_last else "├─ "
-        label = _format_entry_label(node.entry)
-        text = f"{prefix_gutters}{connector}{label}"
-        out.append(_FlatRow(
-            entry_id=node.entry.id,
-            text=text,
-            on_active_path=node.entry.id in self._active_path_ids,
-        ))
-        children = node.children
-        for i, child in enumerate(children):
-            child_is_last = (i == len(children) - 1)
-            # 当前节点用 └─ 时，下层前缀补 "   "；用 ├─ 时补 "│  "。
-            new_gutters = prefix_gutters + ("   " if is_last else "│  ")
-            self._flatten(child, is_last=child_is_last, prefix_gutters=new_gutters, out=out)
 
     # ── 输入 ──────────────────────────────────────────────────────────────
 
@@ -200,32 +256,62 @@ class TreeSelectorComponent:
         content_width = max(1, width - len(indent))
 
         total = len(self._rows)
-        if total == 0:
-            hint = "（会话树为空）"
-            return [border, indent + hint, border]
-
-        hint = (
-            f"会话树: ↑↓ 选择, Enter 切换分支, Esc 取消"
-            f"  ({self._selected_index + 1}/{total})"
+        title = truncate_to_width("会话树", content_width, ellipsis="…")
+        hint = truncate_to_width(
+            "↑↓ 选择 · Enter 切换分支 · Esc 取消",
+            content_width,
+            ellipsis="…",
         )
-        hint = _truncate_to_width(hint, content_width)
+        if total == 0:
+            return [
+                border,
+                indent + title,
+                indent + hint,
+                border,
+                indent + truncate_to_width(
+                    "（会话树为空）",
+                    content_width,
+                    ellipsis="…",
+                ),
+                indent + "(0/0)",
+                border,
+            ]
 
-        lines: list[str] = [border, indent + hint]
+        lines: list[str] = [
+            border,
+            indent + title,
+            indent + hint,
+            border,
+        ]
 
         end = min(self._scroll_offset + self._max_visible, total)
+        visible_rows = self._rows[self._scroll_offset:end]
+        horizontal_scroll = _horizontal_scroll_for_selection(
+            visible_rows,
+            selected_entry_id=self._rows[self._selected_index].entry_id,
+            viewport_width=content_width,
+        )
         for i in range(self._scroll_offset, end):
             row = self._rows[i]
             is_selected = (i == self._selected_index)
-            line = row.text
-            # 活跃路径用 accent 着色，让用户看清当前在哪个分支。
-            if row.on_active_path:
-                line = self._theme.fg("accent", line)
-            # 选中行整体反色（盖在 accent 之上，符合 SelectList 既有视觉）。
+            line = _style_entry_text(self._theme, row.entry, row.text)
+            if horizontal_scroll:
+                line = slice_by_column(
+                    line,
+                    horizontal_scroll,
+                    content_width,
+                    strict=True,
+                )
+            line = truncate_to_width(line, content_width, ellipsis="")
+            gutter = "› " if is_selected else indent
+            rendered = gutter + line
+            # 选中行把导航箭头与正文一起反色，和 Pi 的固定 gutter 一致。
             if is_selected:
-                line = f"\x1b[7m{line}\x1b[0m"
-            line = _truncate_to_width(line, content_width)
-            lines.append(indent + line)
+                rendered = f"\x1b[7m{rendered}\x1b[0m"
+            lines.append(rendered)
 
+        status = f"({self._selected_index + 1}/{total})"
+        lines.append(indent + truncate_to_width(status, content_width))
         lines.append(border)
         return lines
 
@@ -233,7 +319,190 @@ class TreeSelectorComponent:
 # ── 模块级辅助 ────────────────────────────────────────────────────────────
 
 
-def _format_entry_label(entry: SessionEntry) -> str:
+def _build_tree_prefix(
+    *,
+    indent: int,
+    show_connector: bool,
+    is_last: bool,
+    gutters: tuple[_Gutter, ...],
+) -> str:
+    """按三列一层构造连接符前缀。"""
+    if indent <= 0:
+        return ""
+
+    gutter_by_position = {gutter.position: gutter.show for gutter in gutters}
+    connector_position = indent - 1 if show_connector else -1
+    parts: list[str] = []
+    for position in range(indent):
+        if position in gutter_by_position:
+            parts.append("│  " if gutter_by_position[position] else "   ")
+        elif position == connector_position:
+            parts.append("└─ " if is_last else "├─ ")
+        else:
+            parts.append("   ")
+    return "".join(parts)
+
+
+def _horizontal_scroll_for_selection(
+    rows: list[_FlatRow],
+    *,
+    selected_entry_id: str,
+    viewport_width: int,
+) -> int:
+    """仅在选中项正文会被缩进挤出屏幕时水平平移树正文。"""
+    if viewport_width <= 0 or not rows:
+        return 0
+
+    selected = next(
+        (row for row in rows if row.entry_id == selected_entry_id),
+        None,
+    )
+    if selected is None:
+        return 0
+
+    max_body_width = max(visible_width(row.text) for row in rows)
+    max_scroll = max(0, max_body_width - viewport_width)
+    if max_scroll == 0:
+        return 0
+
+    min_visible_content = min(
+        20,
+        max(4, viewport_width // 3),
+    )
+    if selected.anchor_col <= viewport_width - min_visible_content:
+        return 0
+
+    anchor_context = min(
+        12,
+        max(2, viewport_width // 4),
+    )
+    return min(max_scroll, max(0, selected.anchor_col - anchor_context))
+
+
+def _build_visible_tree(
+    roots: list[SessionTreeNode],
+    *,
+    current_leaf_id: str | None,
+) -> list[SessionTreeNode]:
+    """Reconnect descendants of hidden nodes to their nearest visible parent."""
+    visible_roots: list[SessionTreeNode] = []
+    stack: list[tuple[SessionTreeNode, SessionTreeNode | None]] = [
+        (root, None) for root in reversed(roots)
+    ]
+    while stack:
+        node, visible_parent = stack.pop()
+        next_parent = visible_parent
+        if _should_show_entry(
+            node.entry,
+            is_current_leaf=node.entry.id == current_leaf_id,
+        ):
+            visible_node = SessionTreeNode(entry=node.entry, children=[])
+            if visible_parent is None:
+                visible_roots.append(visible_node)
+            else:
+                visible_parent.children.append(visible_node)
+            next_parent = visible_node
+        for child in reversed(node.children):
+            stack.append((child, next_parent))
+    return visible_roots
+
+
+def _collect_tool_calls(
+    entries: list[SessionEntry],
+) -> dict[str, tuple[str, dict[str, Any]]]:
+    """Index assistant ToolCall blocks so results can show calls, not output."""
+    calls: dict[str, tuple[str, dict[str, Any]]] = {}
+    for entry in entries:
+        if not isinstance(entry, SessionMessageEntry) or entry.message is None:
+            continue
+        if getattr(entry.message, "role", None) != "assistant":
+            continue
+        content = getattr(entry.message, "content", None)
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if getattr(block, "type", None) != "toolCall":
+                continue
+            call_id = getattr(block, "id", "")
+            if not call_id:
+                continue
+            name = getattr(block, "name", "") or "tool"
+            arguments = getattr(block, "arguments", {})
+            calls[call_id] = (
+                name,
+                arguments if isinstance(arguments, dict) else {},
+            )
+    return calls
+
+
+def _format_tool_call(name: str, arguments: dict[str, Any]) -> str:
+    """Compact common tool arguments using the same information Pi displays."""
+    if name in ("read", "write", "edit"):
+        path = arguments.get("path") or arguments.get("file_path") or ""
+        return f"[{name}: {path}]" if path else f"[{name}]"
+    if name in ("bash", "shell", "shell_command"):
+        raw_command = str(arguments.get("command") or "")
+        command = raw_command.replace("\n", " ").replace("\t", " ").strip()
+        suffix = "…" if len(command) > 50 else ""
+        return f"[{name}: {command[:50]}{suffix}]" if command else f"[{name}]"
+    if name == "grep":
+        pattern = arguments.get("pattern") or ""
+        path = arguments.get("path") or "."
+        return f"[grep: /{pattern}/ in {path}]"
+    if name in ("find", "ls"):
+        path = arguments.get("path") or "."
+        pattern = arguments.get("pattern")
+        if pattern:
+            return f"[{name}: {pattern} in {path}]"
+        return f"[{name}: {path}]"
+    if not arguments:
+        return f"[{name}]"
+    encoded = json.dumps(arguments, ensure_ascii=False, default=str)
+    suffix = "…" if len(encoded) > 40 else ""
+    return f"[{name}: {encoded[:40]}{suffix}]"
+
+
+def _should_show_entry(
+    entry: SessionEntry,
+    *,
+    is_current_leaf: bool,
+) -> bool:
+    """Apply Pi's default visibility rule for tool-only assistant turns."""
+    if not isinstance(entry, SessionMessageEntry) or entry.message is None:
+        return True
+    message = entry.message
+    if getattr(message, "role", None) != "assistant" or is_current_leaf:
+        return True
+    if _extract_message_text(message).strip():
+        return True
+    if getattr(message, "error_message", None):
+        return True
+    stop_reason = getattr(message, "stop_reason", None)
+    return bool(
+        stop_reason
+        and stop_reason not in ("stop", "tool_use", "toolUse")
+    )
+
+
+def _style_entry_text(theme: Theme, entry: SessionEntry, text: str) -> str:
+    """Color visible tree rows by semantic role instead of active-path state."""
+    if isinstance(entry, SessionMessageEntry) and entry.message is not None:
+        role = getattr(entry.message, "role", None)
+        if role == "user":
+            return theme.fg("accent", text)
+        if role == "assistant":
+            return theme.fg("success", text)
+        if role == "toolResult":
+            return theme.fg("muted", text)
+    if isinstance(entry, CompactionEntry):
+        return theme.fg("warning", text)
+    return theme.fg("muted", text)
+
+
+def _format_entry_label(
+    entry: SessionEntry,
+    tool_calls: dict[str, tuple[str, dict[str, Any]]] | None = None,
+) -> str:
     """把一个 entry 渲染成单行 label。
 
     - SessionMessageEntry: ``user: <文本前 N 字>`` / ``assistant: <...>``
@@ -245,13 +514,27 @@ def _format_entry_label(entry: SessionEntry) -> str:
     """
     if isinstance(entry, SessionMessageEntry):
         role = getattr(entry.message, "role", None) if entry.message else None
+        if role == "toolResult":
+            call_id = getattr(entry.message, "tool_call_id", "")
+            tool_call = tool_calls.get(call_id) if tool_calls and call_id else None
+            tool_name = getattr(entry.message, "tool_name", "") or "tool"
+            error_prefix = "错误: " if getattr(entry.message, "is_error", False) else ""
+            if tool_call:
+                formatted = _format_tool_call(*tool_call)
+                return f"[错误] {formatted}" if error_prefix else formatted
+            return f"[{error_prefix}{tool_name}]"
         role_label = {
             "user": "user",
             "assistant": "assistant",
-            "tool": "tool",
         }.get(role, role or "?")
         text = _extract_message_text(entry.message)
-        snippet = text.strip().replace("\n", " ")[:60]
+        snippet = text.strip().replace("\n", " ")[:200]
+        if role == "assistant" and not snippet:
+            error = getattr(entry.message, "error_message", None)
+            if error:
+                return f"assistant: {str(error).strip()[:60]}"
+            if getattr(entry.message, "stop_reason", None) == "aborted":
+                return "assistant: (已中止)"
         return f"{role_label}: {snippet}" if snippet else f"{role_label}: (空)"
     if isinstance(entry, CompactionEntry):
         return "[压缩]"
@@ -280,15 +563,3 @@ def _extract_message_text(message: Any) -> str:
                 parts.append(getattr(block, "text", "") or "")
         return " ".join(parts)
     return ""
-
-
-def _truncate_to_width(text: str, width: int) -> str:
-    """按可见宽度截断，超出末尾加 ``…``。ANSI 转义序列按 0 宽度处理。"""
-    if visible_width(text) <= width:
-        return text
-    out = ""
-    for ch in text:
-        if visible_width(out + ch) >= width:
-            return out + "…"
-        out += ch
-    return out

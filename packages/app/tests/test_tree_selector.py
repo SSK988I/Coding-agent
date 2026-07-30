@@ -8,7 +8,14 @@
 """
 from __future__ import annotations
 
-from agent_llm import AssistantMessage, TextContent, UserMessage
+from agent_llm import (
+    AssistantMessage,
+    TextContent,
+    ToolCall,
+    ToolResultMessage,
+    UserMessage,
+)
+from agent_tui.utils import visible_width
 
 from agent_core.session.session_manager import SessionManager
 from coding_agent.modes.interactive.components.tree_selector import (
@@ -52,8 +59,8 @@ def _make_session_with_branch() -> SessionManager:
 # ─── 扁平化渲染 ───────────────────────────────────────────────────────
 
 
-def test_flatten_renders_connectors_and_indent():
-    """扁平化树应包含 ├─ / └─ 连接符与缩进。"""
+def test_flatten_only_indents_real_branches():
+    """单链保持平坦，只有真实分叉及其线性尾部增加视觉深度。"""
     sm = _make_session_with_branch()
     selector = TreeSelectorComponent(
         theme=FakeTheme(),
@@ -61,15 +68,73 @@ def test_flatten_renders_connectors_and_indent():
         on_select=lambda _id: None,
         on_cancel=lambda: None,
     )
-    # 扁平化后应有 6 行：u1, a1（原分支的 a1，├─），u2, a2, 新分支回答（└─）
+    # DFS 顺序：u1, a1, u2, a2, 新分支回答。
     texts = [row.text for row in selector._rows]
     assert len(texts) == 5, f"expected 5 rows, got {texts}"
-    # 第一个根节点用 └─ 连接符（单根时它就是最后一个）
-    assert "└─ " in texts[0] or "├─ " in texts[0]
-    # 应至少出现一次 └─ 和一次 ├─（分支点）
-    all_text = "\n".join(texts)
-    assert "├─" in all_text, f"should contain ├─ (branch point): {all_text}"
-    assert "└─" in all_text, f"should contain └─ (last child): {all_text}"
+    assert texts[0].startswith("• user:")
+    assert texts[1].startswith("├─   assistant:")
+    assert texts[2].startswith("│       user:")
+    assert texts[3].startswith("│       assistant:")
+    assert texts[4].startswith("└─ • assistant:")
+    assert [row.anchor_col for row in selector._rows] == [2, 5, 8, 8, 5]
+
+
+def test_linear_history_stays_flat_beyond_python_recursion_limit():
+    """深线性历史不应递归溢出，也不应让正文持续向右漂移。"""
+    sm = SessionManager.create(in_memory=True)
+    for index in range(1_050):
+        sm.append_message(_msg_user(f"message-{index}"))
+
+    selector = TreeSelectorComponent(
+        theme=FakeTheme(),
+        session_manager=sm,
+        on_select=lambda _id: None,
+        on_cancel=lambda: None,
+        max_visible=20,
+    )
+
+    assert len(selector._rows) == 1_050
+    assert {row.anchor_col for row in selector._rows} == {2}
+    assert all(row.text.startswith("• user:") for row in selector._rows)
+
+
+def test_get_tree_promotes_missing_parent_entry_to_root():
+    """父节点缺失的可恢复条目仍应作为根出现在 /tree 中。"""
+    sm = SessionManager.create(in_memory=True)
+    first = sm.append_message(_msg_user("root"))
+    orphan = sm.append_message(_msg_user("orphan"))
+    orphan.parent_id = "missing-parent"
+
+    roots = sm.get_tree()
+
+    assert [node.entry.id for node in roots] == [first.id, orphan.id]
+    assert roots[0].children == []
+
+
+def test_narrow_render_pans_to_selected_entry_text():
+    """深分叉在窄终端中应平移正文，让选中项的 label 仍然可见。"""
+    sm = SessionManager.create(in_memory=True)
+    parent = sm.append_message(_msg_user("root"))
+    for depth in range(10):
+        sm.branch(parent.id)
+        main = sm.append_message(_msg_user(f"main-{depth}"))
+        sm.branch(parent.id)
+        sm.append_message(_msg_user(f"side-{depth}"))
+        sm.branch(main.id)
+        parent = main
+
+    selector = TreeSelectorComponent(
+        theme=FakeTheme(),
+        session_manager=sm,
+        on_select=lambda _id: None,
+        on_cancel=lambda: None,
+        max_visible=100,
+    )
+    lines = selector.render(width=24)
+    selected_line = next(line for line in lines if "\x1b[7m" in line)
+
+    assert "main-9" in selected_line
+    assert all(visible_width(line) <= 24 for line in lines)
 
 
 def test_empty_session_renders_placeholder():
@@ -101,6 +166,89 @@ def test_format_entry_label_assistant_message():
     label = _format_entry_label(e)
     assert label.startswith("assistant:")
     assert "好的" in label
+
+
+def test_format_entry_label_tool_result_uses_compact_tool_name():
+    sm = SessionManager.create(in_memory=True)
+    entry = sm.append_message(ToolResultMessage(
+        tool_name="read",
+        content=[TextContent(text="very long raw tool output")],
+    ))
+
+    assert _format_entry_label(entry) == "[read]"
+
+
+def test_tool_only_assistant_turn_is_hidden_unless_current_leaf():
+    sm = SessionManager.create(in_memory=True)
+    sm.append_message(_msg_user("inspect"))
+    hidden = sm.append_message(AssistantMessage(
+        content=[ToolCall(id="call-1", name="read", arguments={"path": "x"})],
+        stop_reason="tool_use",
+    ))
+    sm.append_message(ToolResultMessage(
+        tool_call_id="call-1",
+        tool_name="read",
+        content=[TextContent(text="result")],
+    ))
+    sm.append_message(_msg_asst("done"))
+
+    selector = TreeSelectorComponent(
+        theme=FakeTheme(),
+        session_manager=sm,
+        on_select=lambda _id: None,
+        on_cancel=lambda: None,
+    )
+
+    assert hidden.id not in {row.entry_id for row in selector._rows}
+    assert [getattr(row.entry.message, "role", None) for row in selector._rows] == [
+        "user",
+        "toolResult",
+        "assistant",
+    ]
+    tool_row = next(
+        row for row in selector._rows
+        if getattr(row.entry.message, "role", None) == "toolResult"
+    )
+    assert "[read: x]" in tool_row.text
+    assert "result" not in tool_row.text
+
+
+def test_hidden_tool_assistants_reconnect_visible_branch_children():
+    sm = SessionManager.create(in_memory=True)
+    root = sm.append_message(_msg_user("root"))
+
+    sm.append_message(AssistantMessage(
+        content=[ToolCall(id="call-a", name="read", arguments={"path": "a"})],
+        stop_reason="tool_use",
+    ))
+    sm.append_message(ToolResultMessage(
+        tool_call_id="call-a",
+        tool_name="read",
+        content=[TextContent(text="A")],
+    ))
+
+    sm.set_leaf_id(root.id)
+    sm.append_message(AssistantMessage(
+        content=[ToolCall(id="call-b", name="read", arguments={"path": "b"})],
+        stop_reason="tool_use",
+    ))
+    sm.append_message(ToolResultMessage(
+        tool_call_id="call-b",
+        tool_name="read",
+        content=[TextContent(text="B")],
+    ))
+
+    selector = TreeSelectorComponent(
+        theme=FakeTheme(),
+        session_manager=sm,
+        on_select=lambda _id: None,
+        on_cancel=lambda: None,
+    )
+    texts = [row.text for row in selector._rows]
+
+    assert len(texts) == 3
+    assert texts[1].startswith("├─   [read: a]")
+    assert texts[2].startswith("└─ • [read: b]")
 
 
 def test_format_entry_label_compaction():
@@ -206,6 +354,27 @@ def test_initial_selection_is_current_leaf():
     assert selected_row.entry_id == sm.leaf_id
 
 
+def test_initial_selection_scrolls_current_leaf_into_view():
+    """当前叶超出首屏时，组件打开后应立即滚动到它。"""
+    sm = SessionManager.create(in_memory=True)
+    for index in range(10):
+        sm.append_message(_msg_user(f"message-{index}"))
+
+    selector = TreeSelectorComponent(
+        theme=FakeTheme(),
+        session_manager=sm,
+        on_select=lambda _id: None,
+        on_cancel=lambda: None,
+        max_visible=3,
+    )
+
+    lines = selector.render(width=60)
+    selected_line = next(line for line in lines if "› " in line)
+
+    assert selector._scroll_offset == 7
+    assert "message-9" in selected_line
+
+
 def test_render_includes_borders_and_hint():
     """render 输出应包含顶/底边框和提示行。"""
     sm = _make_session_with_branch()
@@ -221,3 +390,5 @@ def test_render_includes_borders_and_hint():
     assert lines[-1].count("─") > 10
     # 第二行是提示
     assert "会话树" in lines[1]
+    assert any("\x1b[7m› " in line for line in lines)
+    assert any("• " in line for line in lines)
