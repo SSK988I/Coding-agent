@@ -294,3 +294,122 @@ def test_position_hides_cursor_by_default():
     t._hardware_cursor_row = 0
     t._position_hardware_cursor((1, 0), total_lines=10)
     assert term._cursor_hidden is True
+
+
+# ─── Viewport-aware differential rendering ─────────────────────────────
+
+
+class _MutableFrame:
+    def __init__(self, lines: list[str]) -> None:
+        self.lines = lines
+        self.render_widths: list[int] = []
+
+    def render(self, width: int) -> list[str]:
+        self.render_widths.append(width)
+        return list(self.lines)
+
+
+def _rendering_tui(
+    lines: list[str],
+    *,
+    cols: int = 80,
+    rows: int = 4,
+) -> tuple[TUI, _CapturingTerminal, _MutableFrame]:
+    term = _CapturingTerminal(cols=cols, rows=rows)
+    frame = _MutableFrame(lines)
+    tui = TUI(term)
+    tui.add_child(frame)
+    tui._stopped = False
+    return tui, term, frame
+
+
+def test_full_frame_tracks_scrolled_viewport_top():
+    tui, _, _ = _rendering_tui([f"line {i}" for i in range(8)], rows=4)
+
+    tui._do_render()
+
+    assert tui._previous_viewport_top == 4
+    assert tui._hardware_cursor_row == 7
+    assert (
+        tui._hardware_cursor_row - tui._previous_viewport_top
+        == 3
+    )
+
+
+def test_append_at_viewport_bottom_uses_crlf_to_scroll():
+    tui, term, frame = _rendering_tui(
+        [f"line {i}" for i in range(4)],
+        rows=4,
+    )
+    tui._do_render()
+    term.output.clear()
+
+    frame.lines.append("line 4")
+    tui._do_render()
+
+    output = "".join(term.output)
+    assert "\x1b[?2026h\r\n\x1b[2K" in output
+    assert tui._previous_viewport_top == 1
+    assert tui._hardware_cursor_row == 4
+    assert (
+        tui._hardware_cursor_row - tui._previous_viewport_top
+        == 3
+    )
+
+
+def test_change_above_viewport_forces_safe_full_redraw():
+    tui, term, frame = _rendering_tui(
+        [f"line {i}" for i in range(8)],
+        rows=4,
+    )
+    tui._do_render()
+    redraws_before = tui.full_redraws
+    term.output.clear()
+
+    frame.lines[2] = "changed above viewport"
+    tui._do_render()
+
+    assert tui.full_redraws == redraws_before + 1
+    assert "\x1b[2J\x1b[H\x1b[3J" in "".join(term.output)
+    assert tui._previous_viewport_top == 4
+
+
+def test_shrink_ignores_cursor_marker_above_actual_viewport():
+    tui, _, frame = _rendering_tui(
+        [f"line {i}" for i in range(8)],
+        rows=4,
+    )
+    tui._do_render()
+    assert tui._previous_viewport_top == 4
+
+    # Shrinking to five lines leaves the real viewport anchored at logical
+    # row 4, with blank rows below. A marker on row 3 is therefore not
+    # reachable even though it is in the bottom four rows of new content.
+    frame.lines = [
+        "line 0",
+        "line 1",
+        "line 2",
+        "line 3" + CURSOR_MARKER,
+        "line 4",
+    ]
+    tui._do_render()
+
+    assert tui._previous_viewport_top == 4
+    assert tui._hardware_cursor_row == 4
+    assert all(CURSOR_MARKER not in line for line in tui._previous_lines)
+
+
+def test_immediate_wrap_terminal_reserves_last_column():
+    tui, term, frame = _rendering_tui(
+        ["X" * 10],
+        cols=10,
+        rows=4,
+    )
+    term.delayed_wrap_supported = False
+
+    tui._do_render()
+
+    output = "".join(term.output)
+    assert frame.render_widths == [9]
+    assert "X" * 10 not in output
+    assert "X" * 9 in output

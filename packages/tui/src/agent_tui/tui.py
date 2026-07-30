@@ -22,7 +22,12 @@ from typing import Callable, List, Protocol
 
 from agent_tui.keys import is_key_release
 from agent_tui.terminal import Terminal
-from agent_tui.utils import normalize_terminal_output, visible_width
+from agent_tui.utils import (
+    extract_ansi_code,
+    normalize_terminal_output,
+    truncate_to_width,
+    visible_width,
+)
 
 
 # ─── Component interface ────────────────────────────────
@@ -82,38 +87,56 @@ def is_focusable(component: "Component | None") -> bool:
 
 
 #: Box-drawing chars that begin a rendered table line (after stripping ANSI
-#: and leading background fill). Used by the width-overflow guard to skip
-#: truncation on table rows — truncating them slices off the right border.
+#: and leading background fill). Used by the width-overflow guard to preserve
+#: the correct closing border while clipping an overwide row.
 _TABLE_LINE_PREFIXES = frozenset("┌├└│")
+_TABLE_LINE_CLOSERS = {
+    "┌": "┐",
+    "├": "┤",
+    "└": "┘",
+    "│": "│",
+}
 
 
-def _is_table_line(line: str) -> bool:
-    """True if ``line`` looks like a rendered markdown table row/border.
-
-    Detects lines whose first visible (ANSI-stripped, non-space) character is
-    one of ``┌├└│``. These are the only chars that begin a table line in
-    :func:`agent_tui.components.markdown._render_table` (top border, separator,
-    bottom border, data/header rows all start with one of these). Skipping
-    truncation for them preserves border closure even when the row is a
-    column or two wider than the viewport (CJK/emoji content).
-    """
-    # Strip leading ANSI so a colored border still matches.
+def _first_visible_non_space(line: str) -> str | None:
+    """Return the first visible non-space character in an ANSI string."""
     i = 0
     n = len(line)
     while i < n:
-        ch = line[i]
-        if ch == "\x1b" and i + 1 < n and line[i + 1] == "[":
-            # Skip CSI: ESC[ ... <final byte 0x40-0x7E>
-            j = i + 2
-            while j < n and not (0x40 <= ord(line[j]) <= 0x7E):
-                j += 1
-            i = j + 1
+        ansi = extract_ansi_code(line, i)
+        if ansi:
+            i += ansi[1]
             continue
-        if ch == " ":
+        ch = line[i]
+        if ch.isspace():
             i += 1
             continue
-        return ch in _TABLE_LINE_PREFIXES
-    return False
+        return ch
+    return None
+
+
+def _is_table_line(line: str) -> bool:
+    """True if ``line`` looks like a rendered markdown table row/border."""
+    return _first_visible_non_space(line) in _TABLE_LINE_PREFIXES
+
+
+def _fit_line_to_width(line: str, width: int) -> str:
+    """Clip a rendered line without ever allowing a physical terminal wrap.
+
+    Markdown table rows retain a closing border by reserving their last column;
+    every returned line is nevertheless guaranteed to fit ``width``.
+    """
+    if visible_width(line) <= width:
+        return line
+    first = _first_visible_non_space(line)
+    closer = _TABLE_LINE_CLOSERS.get(first or "")
+    if closer and width > 0:
+        return truncate_to_width(
+            line,
+            max(0, width - 1),
+            pad=True,
+        ) + closer
+    return truncate_to_width(line, width)
 
 
 #: Zero-width cursor position marker (APC sequence).
@@ -218,6 +241,10 @@ class TUI(Container):
         self._input_listeners: list[InputListener] = []
         self._cursor_row = 0
         self._hardware_cursor_row = 0
+        # Logical row at the top of the terminal viewport after the previous
+        # frame.  Once content is taller than the terminal, logical row
+        # differences are no longer the same thing as physical cursor moves.
+        self._previous_viewport_top = 0
 
         # Debug.
         self.on_debug: "Callable[[], None] | None" = None
@@ -337,6 +364,7 @@ class TUI(Container):
             self._previous_height = -1
             self._cursor_row = 0
             self._hardware_cursor_row = 0
+            self._previous_viewport_top = 0
             self._max_lines_rendered = 0
             if self._render_timer:
                 self._render_timer.cancel()
@@ -440,11 +468,40 @@ class TUI(Container):
         """
         if self._stopped:
             return
-        width = self.terminal.columns
+        terminal_width = self.terminal.columns
+        delayed_wrap_supported = bool(
+            getattr(self.terminal, "delayed_wrap_supported", True)
+        )
+        # A terminal that immediately wraps on the last column advances one
+        # physical row before our following CRLF, desynchronising the renderer.
+        # Reserve the final column when Windows could not enable delayed wrap.
+        width = (
+            terminal_width
+            if delayed_wrap_supported
+            else max(1, terminal_width - 1)
+        )
         height = self.terminal.rows
 
         width_changed = self._previous_width != 0 and self._previous_width != width
         height_changed = self._previous_height != 0 and self._previous_height != height
+        previous_buffer_length = (
+            self._previous_viewport_top + self._previous_height
+            if self._previous_height > 0
+            else height
+        )
+        prev_viewport_top = (
+            max(0, previous_buffer_length - height)
+            if height_changed
+            else self._previous_viewport_top
+        )
+        viewport_top = prev_viewport_top
+        hardware_cursor_row = self._hardware_cursor_row
+
+        def compute_line_diff(target_row: int) -> int:
+            """Return the physical screen-row delta for a logical target."""
+            current_screen_row = hardware_cursor_row - prev_viewport_top
+            target_screen_row = target_row - viewport_top
+            return target_screen_row - current_screen_row
 
         # Render the tree.
         new_lines = self.render(width)
@@ -452,9 +509,27 @@ class TUI(Container):
         # Extract CURSOR_MARKER before applying line resets (the marker must
         # be found before _apply_line_resets appends SEGMENT_RESET, which
         # would shift its visible column). Strips the marker in place.
-        cursor_pos = self._extract_cursor_position(new_lines, height)
+        theoretical_viewport_top = max(0, len(new_lines) - height)
+        cursor_viewport_top = (
+            theoretical_viewport_top
+            if not self._previous_lines or width_changed or height_changed
+            else max(prev_viewport_top, theoretical_viewport_top)
+        )
+        cursor_pos = self._extract_cursor_position(
+            new_lines,
+            height,
+            viewport_top=cursor_viewport_top,
+        )
 
-        # Apply line resets.
+        # Width-overflow guard. Components are expected to honor the supplied
+        # width, but clip defensively before *every* output path, including the
+        # first/full render. Even with delayed wrap, width+1 would cause a real
+        # wrap followed by our CRLF and desynchronise physical/logical rows.
+        for i, line in enumerate(new_lines):
+            new_lines[i] = _fit_line_to_width(line, width)
+
+        # Apply line resets after clipping so truncated hyperlinks/styles are
+        # always closed by the same reset sequence as normal lines.
         new_lines = self._apply_line_resets(new_lines)
 
         # Full render helper.
@@ -473,6 +548,8 @@ class TUI(Container):
             self._cursor_row = max(0, len(new_lines) - 1)
             self._hardware_cursor_row = self._cursor_row
             self._max_lines_rendered = max(self._max_lines_rendered, len(new_lines))
+            buffer_length = max(height, len(new_lines))
+            self._previous_viewport_top = max(0, buffer_length - height)
             self._previous_lines = new_lines
             self._previous_width = width
             self._previous_height = height
@@ -496,6 +573,8 @@ class TUI(Container):
             self._cursor_row = max(0, len(new_lines) - 1)
             self._hardware_cursor_row = self._cursor_row
             self._max_lines_rendered = max(self._max_lines_rendered, len(new_lines))
+            buffer_length = max(height, len(new_lines))
+            self._previous_viewport_top = max(0, buffer_length - height)
             self._previous_lines = new_lines
             self._previous_width = width
             self._previous_height = height
@@ -535,9 +614,15 @@ class TUI(Container):
             if first_changed == -1:
                 first_changed = len(self._previous_lines)
             last_changed = len(new_lines) - 1
+        append_start = (
+            appended
+            and first_changed == len(self._previous_lines)
+            and first_changed > 0
+        )
 
         # No changes.
         if first_changed == -1:
+            self._previous_viewport_top = prev_viewport_top
             self._previous_height = height
             # Even with no content change, the IME cursor position may have
             # moved within the editor (e.g. arrow keys) — reposition it.
@@ -546,41 +631,60 @@ class TUI(Container):
 
         # All changes in deleted lines (content shrunk): clear extra lines.
         if first_changed >= len(new_lines):
-            self._write_deleted_lines(new_lines)
+            if not self._write_deleted_lines(
+                new_lines,
+                height=height,
+                viewport_top=prev_viewport_top,
+            ):
+                full_render(True)
+                return
             self._previous_lines = new_lines
             self._previous_width = width
             self._previous_height = height
+            self._previous_viewport_top = prev_viewport_top
             # Reposition hardware cursor for IME.
             self._position_hardware_cursor(cursor_pos, len(new_lines))
             return
 
-        # Width-overflow crash guard.
-        # Truncate to avoid a hard crash. Truncating a
-        # table row slices off its right border (│ ┐ ┤ ┘) and leaves every
-        # row at a slightly different visible width — which is exactly the
-        # "边框错位" symptom users see when CJK/emoji content pushes a table
-        # a column or two past `width`. Table rows are identified by their
-        # leading box-drawing char and skipped; they may overflow the viewport
-        # by a column or two (terminal wraps the tail), but the borders stay
-        # closed and the columns stay aligned. Non-table lines still truncate.
+        # Differential rendering can only touch rows that are still visible.
+        # A logical line above the previous viewport cannot be reached with a
+        # relative cursor sequence.
+        if first_changed < prev_viewport_top:
+            full_render(True)
+            return
+
         render_end = min(last_changed, len(new_lines) - 1)
-        for i in range(first_changed, render_end + 1):
-            line = new_lines[i]
-            lw = visible_width(line)
-            if lw > width and not _is_table_line(line):
-                from agent_tui.utils import truncate_to_width
-                new_lines[i] = truncate_to_width(line, width)
 
         # Differential: move cursor to first_changed, write changed lines.
         buf = "\x1b[?2026h"
-        # Move cursor to the right row.
-        target_row = first_changed
-        line_diff = target_row - self._hardware_cursor_row
+        prev_viewport_bottom = prev_viewport_top + height - 1
+        move_target_row = first_changed - 1 if append_start else first_changed
+
+        # CSI-B is clamped at the bottom of the viewport; it cannot enter a
+        # not-yet-existing screen row.  Move to the bottom and use CRLF to
+        # perform the real terminal scroll before continuing the diff.
+        if move_target_row > prev_viewport_bottom:
+            current_screen_row = max(
+                0,
+                min(height - 1, hardware_cursor_row - prev_viewport_top),
+            )
+            move_to_bottom = height - 1 - current_screen_row
+            if move_to_bottom > 0:
+                buf += f"\x1b[{move_to_bottom}B"
+            scroll = move_target_row - prev_viewport_bottom
+            buf += "\r\n" * scroll
+            prev_viewport_top += scroll
+            viewport_top += scroll
+            hardware_cursor_row = move_target_row
+
+        line_diff = compute_line_diff(move_target_row)
         if line_diff > 0:
             buf += f"\x1b[{line_diff}B"
         elif line_diff < 0:
             buf += f"\x1b[{-line_diff}A"
-        buf += "\r"  # Column 0.
+        # A pure append enters the new row with CRLF.  Moving down with CSI-B
+        # would be clamped at the bottom and overwrite the previous last line.
+        buf += "\r\n" if append_start else "\r"
 
         for i in range(first_changed, render_end + 1):
             if i > first_changed:
@@ -634,6 +738,10 @@ class TUI(Container):
 
         self._cursor_row = max(0, len(new_lines) - 1)
         self._max_lines_rendered = max(self._max_lines_rendered, len(new_lines))
+        self._previous_viewport_top = max(
+            prev_viewport_top,
+            final_cursor_row - height + 1,
+        )
         self._previous_lines = new_lines
         self._previous_width = width
         self._previous_height = height
@@ -646,7 +754,11 @@ class TUI(Container):
         return lines
 
     def _extract_cursor_position(
-        self, lines: list[str], height: int
+        self,
+        lines: list[str],
+        height: int,
+        *,
+        viewport_top: int | None = None,
     ) -> "tuple[int, int] | None":
         """Find CURSOR_MARKER in rendered lines, strip it, return (row, col).
 
@@ -662,13 +774,20 @@ class TUI(Container):
         float to a default position (screen bottom-right) regardless of where
         the editor cursor actually is.
 
-        Only scans the bottom ``height`` lines (the visible viewport), matching
-        markers scrolled off-screen are ignored.
+        ``viewport_top`` is the renderer's actual logical viewport origin.
+        Markers outside that viewport are stripped but ignored so a shrink
+        cannot make cursor bookkeeping claim an unreachable row.
         """
         if not lines:
             return None
-        viewport_top = max(0, len(lines) - height)
-        for row in range(len(lines) - 1, viewport_top - 1, -1):
+        actual_viewport_top = (
+            max(0, len(lines) - height)
+            if viewport_top is None
+            else max(0, viewport_top)
+        )
+        viewport_bottom = actual_viewport_top + max(0, height)
+        selected: tuple[int, int] | None = None
+        for row in range(len(lines) - 1, -1, -1):
             line = lines[row]
             idx = line.find(CURSOR_MARKER)
             if idx != -1:
@@ -676,8 +795,12 @@ class TUI(Container):
                 col = visible_width(before)
                 # Strip the marker from the line in place.
                 lines[row] = before + line[idx + len(CURSOR_MARKER):]
-                return (row, col)
-        return None
+                if (
+                    selected is None
+                    and actual_viewport_top <= row < viewport_bottom
+                ):
+                    selected = (row, col)
+        return selected
 
     def _position_hardware_cursor(
         self, cursor_pos: "tuple[int, int] | None", total_lines: int
@@ -723,21 +846,46 @@ class TUI(Container):
             # visually shown.
             self.terminal.hide_cursor()
 
-    def _write_deleted_lines(self, new_lines: list[str]) -> None:
-        """Clear extra lines when content shrunk."""
+    def _write_deleted_lines(
+        self,
+        new_lines: list[str],
+        *,
+        height: int,
+        viewport_top: int,
+    ) -> bool:
+        """Clear visible trailing rows after a shrink.
+
+        Returns ``False`` when the rows to clear are outside the current
+        viewport and the caller must use a full redraw instead.
+        """
         target_row = max(0, len(new_lines) - 1)
-        line_diff = target_row - self._hardware_cursor_row
+        extra = len(self._previous_lines) - len(new_lines)
+        if target_row < viewport_top or extra > height:
+            return False
+
+        current_screen_row = self._hardware_cursor_row - viewport_top
+        target_screen_row = target_row - viewport_top
+        line_diff = target_screen_row - current_screen_row
         buf = "\x1b[?2026h"
         if line_diff > 0:
             buf += f"\x1b[{line_diff}B"
         elif line_diff < 0:
             buf += f"\x1b[{-line_diff}A"
         buf += "\r"
-        extra = len(self._previous_lines) - len(new_lines)
-        for _ in range(extra):
+
+        clear_start_offset = 0 if not new_lines else 1
+        if extra > 0 and clear_start_offset:
+            buf += f"\x1b[{clear_start_offset}B"
+        for i in range(extra):
             buf += "\r\x1b[2K"
+            if i < extra - 1:
+                buf += "\x1b[1B"
+        move_back = max(0, extra - 1 + clear_start_offset)
+        if move_back:
+            buf += f"\x1b[{move_back}A"
         buf += "\x1b[?2026l"
         self.terminal.write(buf)
         self.terminal.flush()
         self._cursor_row = target_row
         self._hardware_cursor_row = target_row
+        return True
