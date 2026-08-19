@@ -12,13 +12,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from agent_llm import Message, UserMessage
+from agent_llm import Message, TextContent, ToolCall, ToolResultMessage, UserMessage
 
 __all__ = [
     "CompactionSummaryMessage",
     "convert_messages_with_compaction",
     "COMPACTION_SUMMARY_PREFIX",
     "COMPACTION_SUMMARY_SUFFIX",
+    "repair_incomplete_tool_calls",
 ]
 
 COMPACTION_SUMMARY_PREFIX = (
@@ -41,6 +42,67 @@ class CompactionSummaryMessage:
     timestamp: float = 0.0
 
 
+def repair_incomplete_tool_calls(messages: list[Message]) -> list[Message]:
+    """Return a provider-safe transcript with every tool call answered.
+
+    A process can be stopped after an assistant tool-call message is persisted
+    but before its tool result is written (for example while a desktop approval
+    dialog is open). OpenAI-compatible providers reject that history on the
+    next request. Insert synthetic error results for only the missing calls and
+    discard orphan/duplicate results; the source session entries are left
+    untouched.
+    """
+    repaired: list[Message] = []
+    pending: dict[str, str] = {}
+
+    def close_pending() -> None:
+        for tool_call_id, tool_name in pending.items():
+            repaired.append(ToolResultMessage(
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                content=[TextContent(text="Tool execution was interrupted before completion.")],
+                is_error=True,
+            ))
+        pending.clear()
+
+    for message in messages:
+        role = getattr(message, "role", None)
+        if role == "toolResult":
+            tool_call_id = getattr(message, "tool_call_id", "")
+            if tool_call_id in pending:
+                repaired.append(message)
+                pending.pop(tool_call_id, None)
+            # A tool result without a preceding pending call is invalid too.
+            continue
+
+        if pending:
+            close_pending()
+
+        if role == "assistant" and getattr(message, "error_message", None):
+            content = getattr(message, "content", [])
+            has_visible_content = any(
+                bool(getattr(block, "text", ""))
+                or bool(getattr(block, "thinking", ""))
+                or isinstance(block, ToolCall)
+                for block in content if isinstance(content, list)
+            )
+            if not has_visible_content:
+                # Transport failures are UI diagnostics, not conversation
+                # turns. Replaying an empty assistant message only adds noise.
+                continue
+
+        repaired.append(message)
+        if role == "assistant":
+            content = getattr(message, "content", [])
+            for block in content if isinstance(content, list) else []:
+                if isinstance(block, ToolCall) and block.id:
+                    pending[block.id] = block.name
+
+    if pending:
+        close_pending()
+    return repaired
+
+
 def convert_messages_with_compaction(messages: list) -> list[Message]:
     """Project transcript messages to LLM-facing messages.
 
@@ -58,4 +120,4 @@ def convert_messages_with_compaction(messages: list) -> list[Message]:
             out.append(UserMessage(  # type: ignore[arg-type]
                 content=COMPACTION_SUMMARY_PREFIX + m.summary + COMPACTION_SUMMARY_SUFFIX
             ))
-    return out
+    return repair_incomplete_tool_calls(out)

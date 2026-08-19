@@ -131,12 +131,12 @@ def test_engine_first_frame_homes_cursor():
     assert "\\x1b[H" in src or "\x1b[H" in src, "first-frame cursor home missing"
 
 
-# ─── width-overflow guard skips table rows (border-closure fix) ──────────
+# ─── width-overflow guard preserves table closure without wrapping ──────
 
 
 def test_is_table_line_detects_borders():
     """The width-overflow guard must recognise every kind of rendered table
-    line so it can skip truncation and preserve border closure."""
+    line so it can preserve the correct closing border while clipping."""
     from agent_tui.tui import _is_table_line
 
     # Top/separator/bottom borders and data rows.
@@ -155,19 +155,12 @@ def test_is_table_line_detects_borders():
     assert not _is_table_line("")
 
 
-def test_overflow_guard_skips_table_lines():
-    """The width-overflow crash guard must skip table rows — truncating them
-    slices off the right ``│`` border and leaves every row at a different
-    visible width (the "边框错位" symptom with CJK/emoji tables).
-
-    This test simulates the guard loop directly: render a table at a wide
-    width, then run the guard at a narrower width. Every table line must be
-    preserved at its original width (not truncated).
-    """
-    from agent_tui.tui import _is_table_line
+def test_overflow_guard_clips_tables_and_preserves_closing_border():
+    """Overwide tables must keep their border without triggering a real wrap."""
+    from agent_tui.tui import _fit_line_to_width, _is_table_line
     from agent_tui.components.markdown import Markdown
     from agent_tui.theme import load_theme, get_markdown_theme
-    from agent_tui.utils import truncate_to_width, visible_width
+    from agent_tui.utils import visible_width
     import re
 
     src = (
@@ -177,25 +170,33 @@ def test_overflow_guard_skips_table_lines():
         "| packages/core | 🫀 躯干 | 运行时 |"
     )
     md_theme = get_markdown_theme(load_theme("dark"))
-    # Render wide, then apply the guard at a narrower width.
+    # Render wide, then apply the renderer's guard at a narrower width.
     lines = Markdown(src, padding_x=1, theme=md_theme).render(100)
     assert lines, "table produced no lines"
+    guarded = [_fit_line_to_width(line, 80) for line in lines]
 
-    guarded = []
-    for line in lines:
-        lw = visible_width(line)
-        if lw > 80 and not _is_table_line(line):
-            guarded.append(truncate_to_width(line, 80))
-        else:
-            guarded.append(line)
-
-    # Every table row's right border must be intact.
+    # Every line fits the terminal, while table rows keep a right border in
+    # the same final column even when clipping stops before a double-width
+    # grapheme.
+    assert all(visible_width(line) <= 80 for line in guarded)
     for line in guarded:
         clean = re.sub(r"\x1b\[[0-9;]*m", "", line).rstrip()
         if not clean or not _is_table_line(line):
             continue
+        assert visible_width(line) == 80
         last = clean[-1]
         assert last in "│┐┤┘", (
             f"table line lost its right border after guard; last char={last!r}\n"
             f"line={clean!r}"
         )
+
+
+def test_overflow_guard_pads_before_border_after_wide_grapheme():
+    """A clipped CJK grapheme must not leave the closing border one cell short."""
+    from agent_tui.tui import _fit_line_to_width
+    from agent_tui.utils import visible_width
+
+    guarded = _fit_line_to_width("│12345汉字│", 8)
+
+    assert visible_width(guarded) == 8
+    assert guarded.endswith("│")

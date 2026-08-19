@@ -72,10 +72,12 @@ def default_convert_to_llm(messages: list) -> list[Message]:
 
     Passes through user/assistant/toolResult; drops any future custom messages.
     """
-    return [
+    from agent_core.session.messages import repair_incomplete_tool_calls
+
+    return repair_incomplete_tool_calls([
         m for m in messages
         if getattr(m, "role", None) in ("user", "assistant", "toolResult")
-    ]
+    ])
 
 
 _EMPTY_USAGE = Usage(cost=UsageCost())

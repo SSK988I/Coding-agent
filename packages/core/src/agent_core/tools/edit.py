@@ -11,13 +11,13 @@ Includes the robustness features:
     the original ending (CRLF/LF) and BOM on write-back.
   - Fuzzy match fallback: when an exact match fails, normalize (NFKC + trim
     trailing whitespace + smart-quote/dash/unicode-space → ASCII) and retry.
-  - Per-realpath asyncio lock to serialize concurrent edits/writes.
+  - Per-realpath asyncio lock shared with ``write`` (see ``_mutation``) to
+    serialize concurrent edits/writes to the same file.
 
 This tool operates on the local filesystem.
 """
 from __future__ import annotations
 
-import asyncio
 import difflib
 import json
 import os
@@ -26,6 +26,7 @@ from typing import Any
 
 from agent_llm import TextContent
 
+from agent_core.tools._mutation import file_mutation_lock
 from agent_core.types import AgentToolResult
 
 EDIT_SCHEMA: dict = {
@@ -68,19 +69,8 @@ EDIT_SCHEMA: dict = {
 
 
 # ─── per-realpath file mutex ──────────
-
-_file_locks: dict[str, asyncio.Lock] = {}
-_locks_guard = asyncio.Lock()
-
-
-async def _file_lock(real_path: str) -> asyncio.Lock:
-    """Get (or create) the asyncio.Lock for a given realpath (thread-safe注册)."""
-    async with _locks_guard:
-        lock = _file_locks.get(real_path)
-        if lock is None:
-            lock = asyncio.Lock()
-            _file_locks[real_path] = lock
-        return lock
+# Edit and write share the lock table in ``_mutation`` so concurrent edits
+# and writes to the same file serialize. See ``file_mutation_lock``.
 
 
 # ─── BOM + line-ending handling ─────────────
@@ -352,10 +342,8 @@ class EditTool:
         if not os.path.isfile(full_path):
             raise FileNotFoundError(f"Could not edit file: {path}. File not found.")
 
-        # Serialize per-realpath.
-        real = os.path.realpath(full_path)
-        lock = await _file_lock(real)
-        async with lock:
+        # Serialize per-realpath (shared with write via _mutation).
+        async with file_mutation_lock(full_path):
             return self._do_edit(full_path, path, edits)
 
     def _do_edit(self, full_path: str, path: str, edits: list[dict]) -> AgentToolResult:

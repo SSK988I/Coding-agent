@@ -38,6 +38,24 @@ BRACKETED_PASTE_DISABLE = "\x1b[?2004l"
 # output handle, not via the input queue).
 _WIN_RESIZE_POLL_SEC = 0.1
 
+# Windows output mode flags (wincon.h).  In particular,
+# DISABLE_NEWLINE_AUTO_RETURN delays an automatic wrap at the final column
+# until the next printable character is written.  The differential renderer
+# relies on that behaviour when it writes a full-width line followed by CRLF.
+_WIN_ENABLE_PROCESSED_OUTPUT = 0x0001
+_WIN_ENABLE_WRAP_AT_EOL_OUTPUT = 0x0002
+_WIN_ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+_WIN_DISABLE_NEWLINE_AUTO_RETURN = 0x0008
+_WIN_VT_OUTPUT_MODE = (
+    _WIN_ENABLE_PROCESSED_OUTPUT
+    | _WIN_ENABLE_WRAP_AT_EOL_OUTPUT
+    | _WIN_ENABLE_VIRTUAL_TERMINAL_PROCESSING
+)
+_WIN_REQUIRED_OUTPUT_MODE = (
+    _WIN_VT_OUTPUT_MODE
+    | _WIN_DISABLE_NEWLINE_AUTO_RETURN
+)
+
 
 class _COORD(ctypes.Structure):
     """Windows ``COORD`` (windef.h)."""
@@ -234,6 +252,8 @@ class ProcessTerminal:
         self._old_input_mode: int | None = None
         self._old_output_mode: int | None = None
         self._stdin_handle: int | None = None
+        self._stdout_handle: int | None = None
+        self._windows_delayed_wrap_enabled = False
 
     # ── dimensions ─────────────────────────────────────────────────────
 
@@ -248,6 +268,18 @@ class ProcessTerminal:
     @property
     def kitty_protocol_active(self) -> bool:
         return self._kitty_active
+
+    @property
+    def delayed_wrap_supported(self) -> bool:
+        """Whether writing the final column waits before wrapping.
+
+        Real Unix terminals provide delayed-wrap semantics. On Windows this
+        is only safe after ``DISABLE_NEWLINE_AUTO_RETURN`` was successfully
+        enabled. This is deliberately an optional ``ProcessTerminal``
+        capability rather than part of :class:`Terminal`, so existing fake
+        terminals and third-party implementations remain compatible.
+        """
+        return not _is_windows() or self._windows_delayed_wrap_enabled
 
     # ── lifecycle ───────────────────────
 
@@ -709,25 +741,39 @@ class ProcessTerminal:
         literal "[A" in the editor. Symptom: pressing Up/Down prints "[A[B"
         as text. So we deliberately leave VT input OFF on stdin.
 
-        OUTPUT side: ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT |
-        ENABLE_VIRTUAL_TERMINAL_PROCESSING so our diff renderer's escape
-        sequences (cursor moves, colors, Synchronized Output) are honored.
+        OUTPUT side: preserve the caller's existing flags, then enable
+        ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT |
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN so
+        our diff renderer's escape sequences are honored without a
+        full-width line immediately advancing the physical cursor.
         """
+        self._old_input_mode = None
+        self._old_output_mode = None
+        self._stdin_handle = None
+        self._stdout_handle = None
+        self._windows_delayed_wrap_enabled = False
+
         try:
             kernel32 = ctypes.windll.kernel32
             # Get stdin/stdout handles.
             STD_INPUT_HANDLE = -10
             STD_OUTPUT_HANDLE = -11
             self._stdin_handle = kernel32.GetStdHandle(STD_INPUT_HANDLE)
-            stdout_handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+            self._stdout_handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
 
             # Save old modes.
             input_mode = ctypes.c_uint32(0)
             output_mode = ctypes.c_uint32(0)
-            kernel32.GetConsoleMode(self._stdin_handle, ctypes.byref(input_mode))
-            kernel32.GetConsoleMode(stdout_handle, ctypes.byref(output_mode))
-            self._old_input_mode = input_mode.value
-            self._old_output_mode = output_mode.value
+            input_mode_read = bool(
+                kernel32.GetConsoleMode(self._stdin_handle, ctypes.byref(input_mode))
+            )
+            output_mode_read = bool(
+                kernel32.GetConsoleMode(self._stdout_handle, ctypes.byref(output_mode))
+            )
+            if input_mode_read:
+                self._old_input_mode = input_mode.value
+            if output_mode_read:
+                self._old_output_mode = output_mode.value
 
             # Stdin: raw, no line buffering, no echo, NO VT input. We want
             # every key press as a structured KEY_EVENT_RECORD so we can
@@ -739,10 +785,22 @@ class ProcessTerminal:
             #   ENABLE_ECHO_INPUT  (0x0004)  — OFF (we render ourselves)
             #   ENABLE_PROCESSED_INPUT (0x0001) — OFF (no auto Ctrl+C signal)
             #   ENABLE_WINDOW_INPUT (0x0008) — ON (window events if ever needed)
-            kernel32.SetConsoleMode(self._stdin_handle, 0x0008)
-            # Stdout: ENABLE_PROCESSED_OUTPUT(1) | ENABLE_WRAP_AT_EOL_OUTPUT(2)
-            # | ENABLE_VIRTUAL_TERMINAL_PROCESSING(4).
-            kernel32.SetConsoleMode(stdout_handle, 0x0007)
+            if input_mode_read:
+                kernel32.SetConsoleMode(self._stdin_handle, 0x0008)
+
+            if output_mode_read:
+                output_mode_with_vt = output_mode.value | _WIN_REQUIRED_OUTPUT_MODE
+                self._windows_delayed_wrap_enabled = bool(
+                    kernel32.SetConsoleMode(self._stdout_handle, output_mode_with_vt)
+                )
+                if not self._windows_delayed_wrap_enabled:
+                    # Some console hosts support VT processing but reject
+                    # DISABLE_NEWLINE_AUTO_RETURN. Keep ANSI rendering enabled
+                    # and let TUI reserve the final column as its wrap fallback.
+                    kernel32.SetConsoleMode(
+                        self._stdout_handle,
+                        output_mode.value | _WIN_VT_OUTPUT_MODE,
+                    )
         except (AttributeError, OSError):
             pass
 
@@ -751,11 +809,16 @@ class ProcessTerminal:
             kernel32 = ctypes.windll.kernel32
             if self._old_input_mode is not None and self._stdin_handle is not None:
                 kernel32.SetConsoleMode(self._stdin_handle, self._old_input_mode)
-            stdout_handle = kernel32.GetStdHandle(-11)
-            if self._old_output_mode is not None:
-                kernel32.SetConsoleMode(stdout_handle, self._old_output_mode)
+            if self._old_output_mode is not None and self._stdout_handle is not None:
+                kernel32.SetConsoleMode(self._stdout_handle, self._old_output_mode)
         except (AttributeError, OSError):
             pass
+        finally:
+            self._old_input_mode = None
+            self._old_output_mode = None
+            self._stdin_handle = None
+            self._stdout_handle = None
+            self._windows_delayed_wrap_enabled = False
 
     # ── output ───────────────────────────────────
 

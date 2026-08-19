@@ -46,6 +46,14 @@ class Args:
 
     no_context_files: bool = False
 
+    # 技能加载
+    skill_paths: list[str] | None = None  # --skill (repeatable)
+    no_skills: bool = False
+
+    # 提示词模板
+    prompt_template_paths: list[str] | None = None  # --prompt-template (repeatable)
+    no_prompts: bool = False
+
     # 运行模式
     print_mode: bool = False
     #: 非交互模式输出格式：``text`` 为最终回复，``json`` 为事件流。
@@ -224,6 +232,26 @@ def build_parser() -> argparse.ArgumentParser:
         "-nc", "--no-context-files", action="store_true",
         help="禁用 AGENTS.md 和 CLAUDE.md 自动发现",
     )
+    context_group.add_argument(
+        "--skill",
+        dest="skill_paths",
+        action="append",
+        help="额外加载的技能文件或目录（可多次使用）",
+    )
+    context_group.add_argument(
+        "-ns", "--no-skills", action="store_true",
+        help="禁用技能发现与加载",
+    )
+    context_group.add_argument(
+        "--prompt-template",
+        dest="prompt_template_paths",
+        action="append",
+        help="额外加载的提示词模板文件或目录（可多次使用）",
+    )
+    context_group.add_argument(
+        "-np", "--no-prompts", action="store_true",
+        help="禁用提示词模板发现与加载",
+    )
 
     # ── Mode flags ───────────────────────────────────────────────────────
     mode_group = parser.add_argument_group("运行模式")
@@ -378,6 +406,10 @@ def _apply_namespace(args: Args, ns: argparse.Namespace) -> None:
     args.no_builtin_tools = ns.no_builtin_tools
 
     args.no_context_files = ns.no_context_files
+    args.skill_paths = list(ns.skill_paths) if ns.skill_paths else None
+    args.no_skills = ns.no_skills
+    args.prompt_template_paths = list(ns.prompt_template_paths) if ns.prompt_template_paths else None
+    args.no_prompts = ns.no_prompts
 
     # 运行模式
     args.print_mode = ns.print_mode

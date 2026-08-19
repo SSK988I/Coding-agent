@@ -423,29 +423,72 @@ class SessionManager:
         """构建嵌套会话树，供 /tree 选择器渲染。
 
         算法：
-          1. 一遍扫所有 entries，建 ``parent_id -> [children]`` 索引
-          2. 从 ``parent_id is None`` 的根开始 DFS
-          3. 每一层的 children 按 timestamp 排序
+          1. 为所有可见 entry 建立 ``id -> node`` 映射
+          2. 建立 ``parent_id -> [children]`` 索引；父节点缺失的孤儿视为根
+          3. 用显式栈连接节点，每一层的 children 按 timestamp 稳定排序
 
         LeafEntry 不参与树结构（它是元数据，不该作为可见节点）。
         """
-        children_by_parent: dict[str | None, list[SessionEntry]] = {}
-        for e in self.entries:
-            if isinstance(e, LeafEntry):
-                continue  # LeafEntry 是元数据，不进树
-            children_by_parent.setdefault(e.parent_id, []).append(e)
+        visible_entries = [
+            entry for entry in self.entries
+            if not isinstance(entry, LeafEntry)
+        ]
+        nodes_by_id = {
+            entry.id: SessionTreeNode(entry=entry, children=[])
+            for entry in visible_entries
+        }
 
-        def build_node(entry: SessionEntry) -> SessionTreeNode:
-            node = SessionTreeNode(entry=entry, children=[])
-            for child in sorted(children_by_parent.get(entry.id, []),
-                                key=lambda e: e.timestamp):
-                node.children.append(build_node(child))
-            return node
+        children_by_parent: dict[str, list[SessionEntry]] = {}
+        root_entries: list[SessionEntry] = []
+        for entry in visible_entries:
+            parent_id = entry.parent_id
+            if (
+                parent_id is None
+                or parent_id not in nodes_by_id
+                or parent_id == entry.id
+            ):
+                root_entries.append(entry)
+            else:
+                children_by_parent.setdefault(parent_id, []).append(entry)
+
+        def sort_key(entry: SessionEntry) -> str:
+            return entry.timestamp
+        root_entries.sort(key=sort_key)
+        for children in children_by_parent.values():
+            children.sort(key=sort_key)
 
         roots: list[SessionTreeNode] = []
-        for root_entry in sorted(children_by_parent.get(None, []),
-                                 key=lambda e: e.timestamp):
-            roots.append(build_node(root_entry))
+        attached_ids: set[str] = set()
+
+        def attach_from_root(root_entry: SessionEntry) -> None:
+            """连接一棵可达子树；重复引用和环在首次访问处截断。"""
+            if root_entry.id in attached_ids:
+                return
+            root = nodes_by_id[root_entry.id]
+            roots.append(root)
+            attached_ids.add(root_entry.id)
+            stack = [root]
+            while stack:
+                parent = stack.pop()
+                added_children: list[SessionTreeNode] = []
+                for child_entry in children_by_parent.get(parent.entry.id, []):
+                    if child_entry.id in attached_ids:
+                        continue
+                    child = nodes_by_id[child_entry.id]
+                    parent.children.append(child)
+                    attached_ids.add(child_entry.id)
+                    added_children.append(child)
+                # 逆序入栈，保持与递归 DFS 相同的 timestamp 顺序。
+                stack.extend(reversed(added_children))
+
+        for root_entry in root_entries:
+            attach_from_root(root_entry)
+
+        # 没有自然根的残余节点只能来自环或损坏数据。把其中最早的节点提升
+        # 为根并迭代连接，保证 /tree 仍能展示所有可恢复条目。
+        for entry in sorted(visible_entries, key=sort_key):
+            attach_from_root(entry)
+
         return roots
 
     def get_latest_compaction_entry(self, entries: list[SessionEntry] | None = None) -> CompactionEntry | None:

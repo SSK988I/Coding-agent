@@ -1,223 +1,277 @@
 # Coding Agent
 
-[中文](#中文) | [English](#english)
+[简体中文](README.zh-CN.md) · **English**
 
-## 中文
+Coding Agent is a programming agent for local development workflows. Its agent runtime is implemented in Python, with both a terminal interface and an Electron + React desktop MVP.
 
-Coding Agent 是一个面向本地日常开发的 Python 终端编程助手。它提供流式对话、文件与 Shell 工具、会话恢复、上下文压缩、图片输入和可持久化设置。目前内置 DeepSeek 与智谱 Z.AI Coding Plan（中国区）支持。
+It can read and modify project files, search code, execute shell commands, and stream model responses and tool progress to the interface. Conversations are stored as JSONL and support restoration, branches, and context compaction.
 
-### 环境要求
+> The project is in an early stage of development. The terminal application provides the broader feature set; the desktop runtime is connected and usable, while packaging and additional desktop features are still in progress.
 
-- Python 3.13
-- [uv](https://docs.astral.sh/uv/)
-- Windows、Linux 或 macOS
-- Windows 推荐安装 Git for Windows；程序会优先使用 Git Bash
+## Features
 
-### 在 Windows CMD 中启动
+- **Streaming agent loop**: processes model output, tool calls, tool results, and subsequent reasoning, with abort, steering, and follow-up support.
+- **Seven built-in development tools**: `read`, `write`, `edit`, `grep`, `find`, `ls`, and `bash`.
+- **Restorable sessions**: stores messages and settings changes in append-only JSONL and tracks the active branch through an entry tree.
+- **Context management**: includes token estimation, summary compaction, and compact-and-retry after context overflow.
+- **Multiple model providers**: currently includes catalogs for DeepSeek and Z.AI Coding Plan (China).
+- **Project context**: discovers `AGENTS.md`, `CLAUDE.md`, skills, and prompt templates.
+- **Terminal UI**: renders Markdown, streaming content, tool cards, model selection, and line-based differential updates.
+- **Desktop MVP**: supports workspace selection, session history, streaming messages, tool approval, model switching, and a slash-command palette.
 
-下载或克隆仓库后：
+## Interfaces
 
-```bat
-cd /d E:\code\Coding-agent
-uv sync
-set DEEPSEEK_API_KEY=你的_API_KEY
-uv run coding-agent
-```
+### Terminal
 
-使用智谱：
+The terminal application is currently the primary entry point. It is designed to run directly inside a project directory and includes the complete interactive command set, project-context discovery, session branches, and exports.
 
-```bat
-set ZAI_CODING_CN_API_KEY=你的_API_KEY
-uv run coding-agent --provider zhipu
-```
+### Desktop
 
-也可以启动后使用 `/login` 保存 API Key。凭据保存在 `~/.coding-agent/auth.json`，写入时采用原子替换并尽可能限制文件权限。
+The desktop application uses Electron + React with the Python `AgentSession` running as a separate sidecar. The renderer has no direct access to the shell, filesystem, or API keys. Native operations cross a restricted Electron IPC bridge and a versioned NDJSON RPC boundary before reaching the Python runtime.
 
-### 常用命令
+The desktop MVP currently supports:
 
-```powershell
-# 查看帮助和模型
-uv run coding-agent --help
-uv run coding-agent --list-models
+- Opening a local project and switching between saved sessions
+- Streaming response text and thinking content
+- Tool execution cards and result updates
+- Approval prompts for `bash`, `write`, and `edit`
+- A command palette that opens when `/` is entered
+- `/help`, `/new`, `/model`, `/compact`, `/clear`, and `/session`
 
-# 直接提出问题
-uv run coding-agent "解释这个项目的结构"
+## Requirements
 
-# 非交互输出 / JSONL 事件输出
-uv run coding-agent -p "检查当前目录"
-uv run coding-agent --mode json "检查当前目录"
+### Python runtime
 
-# 恢复最近会话或指定会话
-uv run coding-agent --continue
-uv run coding-agent --session <文件路径或会话ID>
-
-# 指定模型与思考级别
-uv run coding-agent --model zhipu/glm-5.2:high
-```
-
-非交互模式使用稳定退出码：`0` 成功、`1` 模型或请求失败、`2` 参数/输入错误、`130` 用户中断。
-
-### 文件与图片
-
-在参数前添加 `@` 可附加文本文件或图片：
-
-```powershell
-uv run coding-agent --provider zhipu --model glm-5v-turbo `
-  @screenshot.png "分析截图中的错误"
-```
-
-图片只允许发送给模型目录中声明支持 `image` 输入的模型；否则程序会在发起请求前报错。
-
-### 交互命令
-
-- `/help`：查看当前可用命令
-- `/model`：切换已配置 Provider 的模型
-- `/login`、`/logout`：管理 API Key
-- `/new`：创建并切换到新的会话文件
-- `/session`、`/tree`：查看会话信息与分支
-- `/compact`：压缩上下文
-- `/settings`：查看设置
-- `/settings <键> <值>`：保存设置
-- `/export`：导出 HTML 或 JSONL
-- `/quit`：退出
-
-### 设置和数据目录
-
-默认目录为 `~/.coding-agent`，可通过 `CODING_AGENT_HOME` 修改。
-
-```text
-~/.coding-agent/
-|-- auth.json       # API Key
-|-- settings.json   # 默认模型、思考级别和重试设置
-`-- sessions/       # JSONL 会话
-```
-
-可持久化设置包括：`default_provider`、`default_model`、`thinking_level`、`auto_retry`、`max_retries`、`retry_initial_delay`、`retry_max_delay`。当前内置主题只有 `dark`。
-
-临时网络故障、429 和常见 5xx 会在尚未输出内容时自动指数退避重试；认证失败和无效请求不会重试。
-
-### 项目结构
-
-```text
-packages/
-|-- llm/     # Provider、模型、消息类型和流式协议
-|-- core/    # Agent 循环、工具、会话和上下文压缩
-|-- tui/     # 终端 UI 与渲染组件
-`-- app/     # CLI、设置和交互模式
-```
-
-每个包使用标准 Python `src` 布局，`src/agent_llm` 等目录是实际可导入包，不应删除这一层。
-
-### 开发验证
-
-```powershell
-uv sync
-uv run ruff check .
-uv run pyright --project pyrightconfig.release.json
-uv run pytest -q
-uv build --all-packages
-```
-
-### 安全边界
-
-Coding Agent 不是沙箱。模型可以通过工具执行命令，并读取或修改当前用户有权限访问的文件。请只在可信项目中运行；处理陌生仓库时建议使用容器、虚拟机或受限账户。详细说明见 [SECURITY.md](SECURITY.md)。
-
-## English
-
-Coding Agent is a Python terminal coding assistant for everyday local development. It provides streaming chat, file and shell tools, resumable sessions, context compaction, image input, and persistent settings. The built-in providers are DeepSeek and Z.AI Coding Plan (China).
-
-### Requirements
-
-- Python 3.13
+- Python 3.13 or newer
 - [uv](https://docs.astral.sh/uv/)
 - Windows, Linux, or macOS
-- Git for Windows is recommended; Coding Agent prefers Git Bash on Windows
+- Git for Windows is recommended; the application prefers Git Bash on Windows
 
-### Start from Windows CMD
+### Desktop development
 
-After downloading or cloning the repository:
+- Node.js
+- pnpm
+- A project virtual environment created by `uv sync`
 
-```bat
-cd /d E:\code\Coding-agent
+## Quick start
+
+### 1. Clone and install dependencies
+
+```powershell
+git clone https://github.com/SSK988I/Coding-agent.git
+cd Coding-agent
 uv sync
-set DEEPSEEK_API_KEY=your_api_key
+```
+
+### 2. Configure provider credentials
+
+DeepSeek:
+
+```powershell
+$env:DEEPSEEK_API_KEY = "your API key"
+```
+
+Z.AI Coding Plan:
+
+```powershell
+$env:ZAI_CODING_CN_API_KEY = "your API key"
+```
+
+You can also run `/login` from the terminal interface. Stored credentials are written to `~/.coding-agent/auth.json`.
+
+### 3. Start the terminal interface
+
+```powershell
 uv run coding-agent
 ```
 
-For Z.AI:
+Start with an initial task:
 
-```bat
-set ZAI_CODING_CN_API_KEY=your_api_key
-uv run coding-agent --provider zhipu
+```powershell
+uv run coding-agent "Read this project and explain its main modules"
 ```
 
-You can also run `/login` after startup. Credentials are stored in `~/.coding-agent/auth.json` using atomic writes and restrictive permissions where supported.
+### 4. Start the desktop application
 
-### Common commands
+```powershell
+cd apps/desktop
+pnpm install
+pnpm dev
+```
+
+Development mode uses the repository's `.venv` for the Python sidecar by default. To select a different Python executable:
+
+```powershell
+$env:CODING_AGENT_PYTHON = "C:\path\to\python.exe"
+pnpm dev
+```
+
+## CLI usage
+
+### Help and model catalog
 
 ```powershell
 uv run coding-agent --help
 uv run coding-agent --list-models
-uv run coding-agent "Explain this project"
-uv run coding-agent -p "Inspect the current directory"
-uv run coding-agent --mode json "Inspect the current directory"
+uv run coding-agent --provider zhipu --list-models
+```
+
+### Non-interactive mode
+
+Print only the final response:
+
+```powershell
+uv run coding-agent -p "Inspect this project for potential issues"
+```
+
+Stream newline-delimited JSON events:
+
+```powershell
+uv run coding-agent --mode json "Analyze packages/core"
+```
+
+Exit codes:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Success |
+| `1` | Model or request failure |
+| `2` | Invalid arguments or missing input |
+| `130` | User interruption |
+
+### Session restoration
+
+```powershell
+# Continue the latest session for the current project
 uv run coding-agent --continue
+
+# Open a session file or partial UUID
 uv run coding-agent --session <path-or-session-id>
+
+# Run without saving the session
+uv run coding-agent --no-session
+```
+
+### Provider and model selection
+
+```powershell
+uv run coding-agent --model deepseek-v4-pro
+uv run coding-agent --provider zhipu --model glm-5.2
 uv run coding-agent --model zhipu/glm-5.2:high
 ```
 
-Print mode uses stable exit codes: `0` success, `1` model/request failure, `2` invalid arguments or missing input, and `130` user interruption.
-
-### Files and images
-
-Prefix a path with `@` to attach a text file or image:
+### Tool restrictions
 
 ```powershell
-uv run coding-agent --provider zhipu --model glm-5v-turbo `
-  @screenshot.png "Analyze the error in this screenshot"
+# Enable only selected tools
+uv run coding-agent --tools read,grep,find
+
+# Disable shell execution
+uv run coding-agent --exclude-tools bash
+
+# Disable all tools
+uv run coding-agent --no-tools
 ```
 
-Images are accepted only by models whose catalog entry declares `image` input support.
+### File and image attachments
 
-### Interactive commands
+Prefix a path with `@` to attach a text file or image to the initial message:
 
-- `/help`: show available commands
-- `/model`: switch models across configured providers
-- `/login`, `/logout`: manage API keys
-- `/new`: create and attach a new session file
-- `/session`, `/tree`: inspect the session and its branches
-- `/compact`: compact context
-- `/settings`: show persistent settings
-- `/settings <key> <value>`: update a setting
-- `/export`: export HTML or JSONL
-- `/quit`: exit
+```powershell
+uv run coding-agent @README.md "Summarize this file"
 
-### Configuration and data
+uv run coding-agent --provider zhipu --model glm-5v-turbo `
+  @screenshot.png "Analyze the problem in this screenshot"
+```
 
-Data is stored under `~/.coding-agent` by default. Set `CODING_AGENT_HOME` to override it.
+Images can only be sent to models whose catalog entries declare `image` input support.
+
+## Built-in tools
+
+| Tool | Purpose |
+| --- | --- |
+| `read` | Read text files or images |
+| `write` | Create or overwrite files |
+| `edit` | Modify files by matching exact text fragments |
+| `grep` | Search file contents |
+| `find` | Find files by name or pattern |
+| `ls` | List directory contents |
+| `bash` | Execute shell commands |
+
+Tools expose their name, description, JSON Schema parameters, and asynchronous execution method through a common interface. The agent runtime validates arguments before execution and emits start, update, and end events. Embedding frontends can use before/after hooks for approval, auditing, or result transformation.
+
+## Terminal commands
+
+| Command | Description |
+| --- | --- |
+| `/help` | Show commands and keybindings |
+| `/model` | Select a model from configured providers |
+| `/login`, `/logout` | Manage provider credentials |
+| `/new` | Start a new session |
+| `/session` | Show session information and statistics |
+| `/tree` | Inspect and switch session branches |
+| `/compact` | Compact context manually |
+| `/settings` | View or update persistent settings |
+| `/export` | Export HTML or JSONL |
+| `/copy` | Copy the latest assistant response |
+| `/hotkeys` | Show keyboard shortcuts |
+| `/quit` | Exit the application |
+
+The terminal editor provides slash-command completion. Entering `/` in the desktop composer opens a filterable command palette.
+
+## Sessions and configuration
+
+The default data directory is `~/.coding-agent`. Override it with `CODING_AGENT_HOME`:
 
 ```text
 ~/.coding-agent/
-|-- auth.json
-|-- settings.json
-`-- sessions/
+├── auth.json        # Provider credentials
+├── settings.json    # Model, thinking level, and retry settings
+└── sessions/        # Per-project JSONL sessions
 ```
 
-Persistent settings include the default provider/model, thinking level, and retry policy. The only bundled theme is currently `dark`. Transient network, 429, and common 5xx failures are retried with exponential backoff before any response content has been emitted.
+Session files are append-only. In addition to user and assistant messages, they record model changes, thinking levels, compaction entries, and branch pointers so the active context can be restored after a restart.
 
-### Repository layout
+If a task is interrupted before a tool finishes, the next LLM request inserts an error `toolResult` for the missing result at the model boundary. This prevents providers from rejecting an incomplete `tool_calls` history without overwriting the original JSONL file.
+
+## Architecture
 
 ```text
-packages/
-|-- llm/     # Providers, models, message types, streaming protocol
-|-- core/    # Agent loop, tools, sessions, context compaction
-|-- tui/     # Terminal UI and rendering components
-`-- app/     # CLI, settings, and interactive mode
+Coding-agent/
+├── apps/
+│   └── desktop/                 # Electron + React desktop app
+│       └── src/
+│           ├── main/            # Electron main process and sidecar lifecycle
+│           ├── preload/         # Restricted IPC bridge
+│           ├── renderer/        # React interface
+│           └── shared/          # Shared TypeScript types
+└── packages/
+    ├── llm/                     # Providers, models, messages, and SSE adapters
+    ├── core/                    # Agent loop, tools, sessions, and compaction
+    ├── tui/                     # Terminal components and renderer
+    └── app/                     # CLI, AgentSession, and application runtime
 ```
 
-Each distribution uses the standard Python `src` layout. Directories such as `src/agent_llm` are the importable packages and should remain.
+The main desktop request path is:
 
-### Development
+```text
+React Renderer
+    ↓ typed IPC
+Electron Main / Preload
+    ↓ versioned NDJSON RPC
+Python DesktopRuntime
+    ↓
+AgentSession → Agent Loop → LLM Provider
+    ↓                         ↓
+Tool Runtime              SSE Events
+    └──────────── events ─────┘
+```
+
+The core packages do not depend on a specific UI. The terminal and desktop applications share model adapters, the agent loop, tool execution, session restoration, and context compaction while implementing their own event presentation and interaction layers.
+
+## Development and validation
+
+### Python
 
 ```powershell
 uv sync
@@ -227,6 +281,27 @@ uv run pytest -q
 uv build --all-packages
 ```
 
-### Security boundary
+### Desktop
 
-Coding Agent is not a sandbox. The model can run commands and read or modify any file accessible to the current OS user. Use it only in trusted projects; use a container, VM, or restricted account for unfamiliar repositories. See [SECURITY.md](SECURITY.md).
+```powershell
+cd apps/desktop
+pnpm install
+pnpm typecheck
+pnpm build
+```
+
+## Security boundary
+
+Coding Agent is not an operating-system sandbox. Once the model invokes a tool, it can read files, modify files, or execute commands with the permissions of the current user.
+
+- Enable project context files only in trusted repositories.
+- Use a container, virtual machine, or restricted account for unfamiliar projects.
+- Never commit API keys to the repository.
+- The desktop renderer does not hold API keys and cannot access the shell or filesystem directly.
+- `bash`, `write`, and `edit` require user approval in the desktop application by default.
+
+See [SECURITY.md](SECURITY.md) for more information.
+
+## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting changes, and make sure the relevant tests, static checks, and type checks pass.
