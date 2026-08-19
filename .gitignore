@@ -37,6 +37,13 @@ htmlcov/
 coverage.xml
 *.prof
 
+# Node / Electron 依赖和构建产物
+node_modules/
+.pnpm-store/
+dist-electron/
+dist-renderer/
+.tmp/
+
 # 本地编辑器和操作系统文件
 .idea/
 .vscode/

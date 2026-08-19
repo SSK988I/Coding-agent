@@ -91,6 +91,10 @@ class AgentSessionConfig:
     skills: list | None = None  # list[Skill]
     #: Loaded prompt templates, expanded when the user types ``/name args``.
     prompt_templates: list | None = None  # list[PromptTemplate]
+    # Optional runtime hooks. Desktop and other embedding frontends use these
+    # to implement approval gates and audit logging without changing tools.
+    before_tool_call: Any = None
+    after_tool_call: Any = None
     retry_policy: RetryPolicy = field(default_factory=RetryPolicy)
     settings_manager: Any = None
     theme_name: str = "dark"
@@ -245,6 +249,8 @@ class AgentSession:
             reasoning=config.reasoning,
             session_manager=self.session_manager,
             convert_to_llm=_convert_to_llm,
+            before_tool_call=config.before_tool_call,
+            after_tool_call=config.after_tool_call,
         )
         self._restore_persisted_context()
         self._agent.subscribe(self._on_agent_event)

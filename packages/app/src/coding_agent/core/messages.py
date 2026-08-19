@@ -20,6 +20,7 @@ from agent_llm import (
     TextContent,
     UserMessage,
 )
+from agent_core.session.messages import repair_incomplete_tool_calls
 
 # ─── Summary wrappers ────────────────────────────
 
@@ -159,6 +160,11 @@ def convert_to_llm(messages: list[AgentAppMessage]) -> list[Message]:
     for m in messages:
         role = getattr(m, "role", None)
         if role in ("user", "assistant", "toolResult"):
+            if role == "user" and isinstance(getattr(m, "content", None), str):
+                if m.content.strip().startswith("/"):
+                    # Slash commands are application control messages. Early
+                    # desktop builds accidentally persisted them as prompts.
+                    continue
             result.append(m)
         elif role == "bashExecution":
             if getattr(m, "exclude_from_context", False):
@@ -187,4 +193,4 @@ def convert_to_llm(messages: list[AgentAppMessage]) -> list[Message]:
                 timestamp=getattr(m, "timestamp", 0.0),
             ))
         # Unknown roles are omitted from the LLM context.
-    return result
+    return repair_incomplete_tool_calls(result)

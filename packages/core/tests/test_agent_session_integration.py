@@ -14,6 +14,7 @@ from pathlib import Path
 from agent_llm import AssistantMessage, Model, ModelCost, TextContent, ToolCall, ToolResultMessage, UserMessage
 
 from agent_core import Agent, SessionManager
+from agent_core.agent import default_convert_to_llm
 
 
 def _model() -> Model:
@@ -115,6 +116,45 @@ def test_resume_rebuilds_transcript_from_session(tmp_path: Path):
     assert agent2.state.messages[0].role == "user"
     assert agent2.state.messages[1].role == "assistant"
     assert agent2.state.messages[0].content == "old question"
+
+
+def test_resume_repairs_tool_call_interrupted_before_result(tmp_path: Path):
+    """A stopped approval must not poison every later provider request."""
+    _, sm = _make_agent_with_session(tmp_path)
+    sm.append_message(AssistantMessage(
+        content=[ToolCall(id="pending-1", name="bash", arguments={"command": "pwd"})],
+        provider="deepseek",
+        model="m",
+        stop_reason="tool_use",
+    ))
+    sm.append_message(UserMessage(content="continue"))
+
+    messages = default_convert_to_llm(sm.build_session_context().messages)
+
+    assert [message.role for message in messages] == ["assistant", "toolResult", "user"]
+    assert messages[1].tool_call_id == "pending-1"
+    assert messages[1].is_error is True
+
+
+def test_resume_keeps_complete_tool_call_pair_unchanged(tmp_path: Path):
+    _, sm = _make_agent_with_session(tmp_path)
+    assistant = AssistantMessage(
+        content=[ToolCall(id="complete-1", name="read", arguments={"path": "x"})],
+        provider="deepseek",
+        model="m",
+        stop_reason="tool_use",
+    )
+    result = ToolResultMessage(
+        tool_call_id="complete-1",
+        tool_name="read",
+        content=[TextContent(text="ok")],
+    )
+    sm.append_message(assistant)
+    sm.append_message(result)
+
+    messages = default_convert_to_llm(sm.build_session_context().messages)
+
+    assert messages == [assistant, result]
 
 
 # ─── persistence errors don't break the loop ──────────────────────────
