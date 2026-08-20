@@ -1,2 +1,5 @@
 onlyBuiltDependencies:
   - electron
+
+overrides:
+  yauzl: ^3.3.1

@@ -52,6 +52,16 @@ def test_new_session_switches_manager_and_storage(tmp_path: Path):
     assert old.path.exists()
 
 
+def test_new_session_does_not_persist_empty_previous_manager(tmp_path: Path):
+    old = SessionManager.create(cwd=str(tmp_path), agent_dir=tmp_path)
+    session = AgentSession(AgentSessionConfig(model=_model(), tools=[], session_manager=old))
+
+    session.new_session()
+
+    assert old.path is not None
+    assert not old.path.exists()
+
+
 def test_model_shorthand_sets_provider_and_thinking():
     args = Args(model="zhipu/glm-5.2:high")
     _normalize_model_options(args)
