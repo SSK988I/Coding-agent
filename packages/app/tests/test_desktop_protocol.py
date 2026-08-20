@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from agent_core import SessionManager
 from agent_llm import AssistantMessage, Model, ModelCost, TextContent, ToolCall, UserMessage
 
 from coding_agent.core.agent_session import AgentSession, AgentSessionConfig
@@ -91,3 +92,43 @@ def test_desktop_command_catalog_only_exposes_supported_commands() -> None:
     assert [command["name"] for command in commands] == [
         "help", "clear", "model", "compact", "session", "new",
     ]
+
+
+def test_opening_saved_session_does_not_persist_abandoned_empty_session(
+    tmp_path: Path,
+) -> None:
+    import asyncio
+    import coding_agent.core.config as config
+
+    workspace = Path(tmp_path.anchor)
+
+    saved = SessionManager.create(
+        cwd=str(workspace),
+        sessions_dir=config.get_sessions_dir(),
+    )
+    saved.append_message(UserMessage(content="existing question"))
+    saved.append_message(AssistantMessage(content=[TextContent(text="existing answer")]))
+
+    async def exercise() -> None:
+        runtime = DesktopRuntime(lambda _event: None)
+        try:
+            opened = await runtime.dispatch(
+                "workspace.open",
+                {"path": str(workspace), "resume": True},
+            )
+            assert opened["sessionId"] == saved.header.id
+
+            created = await runtime.dispatch("session.new", {})
+            assert created["sessionId"] != saved.header.id
+            assert [item["id"] for item in await runtime.dispatch("session.list", {})] == [
+                saved.header.id,
+            ]
+
+            await runtime.dispatch("session.open", {"sessionId": saved.header.id})
+            assert [item["id"] for item in await runtime.dispatch("session.list", {})] == [
+                saved.header.id,
+            ]
+        finally:
+            await runtime.dispose()
+
+    asyncio.run(exercise())
