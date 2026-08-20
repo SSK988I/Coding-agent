@@ -355,7 +355,7 @@ class AgentSession:
         leak into the old JSONL file.
         """
         previous = self.session_manager
-        if not previous.in_memory:
+        if not previous.in_memory and previous.entries:
             previous.flush()
 
         new_manager = SessionManager.create(
@@ -552,8 +552,12 @@ class AgentSession:
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
     def dispose(self) -> None:
-        """Clean up resources. Flushes the session to disk if needed."""
-        if self.session_manager is not None and not self.session_manager.in_memory:
+        """Clean up resources, persisting only sessions that contain entries."""
+        if (
+            self.session_manager is not None
+            and not self.session_manager.in_memory
+            and self.session_manager.entries
+        ):
             self.session_manager.flush()
 
     def _restore_persisted_context(self) -> None:
