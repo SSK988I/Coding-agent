@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import os
 from pathlib import Path
+import re
+import shlex
 import time
 from typing import Any, Awaitable, Callable, cast
 import uuid
@@ -24,6 +26,17 @@ from coding_agent.desktop.protocol import PROTOCOL_VERSION, RpcError, to_jsonabl
 
 EventEmitter = Callable[[dict[str, Any]], None]
 _APPROVAL_TOOLS = {"bash", "write", "edit"}
+_READ_ONLY_COMMANDS = {
+    "cat", "du", "file", "find", "grep", "head", "ls", "pwd", "rg",
+    "stat", "tail", "wc",
+}
+_READ_ONLY_GIT_SUBCOMMANDS = {
+    "diff", "grep", "log", "ls-files", "rev-parse", "show", "status",
+}
+_DANGEROUS_FIND_FLAGS = {
+    "-delete", "-exec", "-execdir", "-fls", "-fprint", "-fprintf", "-ok", "-okdir",
+}
+_SHELL_SPLIT_RE = re.compile(r"\s*(?:&&|\|)\s*")
 _DESKTOP_COMMANDS = {
     "help": ("帮助", "查看桌面端可用命令"),
     "new": ("新会话", "创建一个新的会话"),
@@ -37,7 +50,7 @@ _DESKTOP_COMMANDS = {
 class DesktopRuntime:
     """Own one live workspace/session and translate RPC commands to AgentSession."""
 
-    def __init__(self, emit: EventEmitter) -> None:
+    def __init__(self, emit: EventEmitter, *, approval_timeout_seconds: float = 120.0) -> None:
         self._emit_raw = emit
         self._session: AgentSession | None = None
         self._workspace: Path | None = None
@@ -46,6 +59,7 @@ class DesktopRuntime:
         self._run_id: str | None = None
         self._seq = 0
         self._approvals: dict[str, asyncio.Future[bool]] = {}
+        self._approval_timeout_seconds = approval_timeout_seconds
 
     async def dispatch(self, method: str, params: dict[str, Any]) -> Any:
         handlers: dict[str, Callable[[dict[str, Any]], Awaitable[Any]]] = {
@@ -354,6 +368,10 @@ class DesktopRuntime:
     ) -> BeforeToolCallResult | None:
         if context.tool_call.name not in _APPROVAL_TOOLS:
             return None
+        if context.tool_call.name == "bash" and _is_read_only_bash_command(
+            str(context.args.get("command", "")),
+        ):
+            return None
         approval_id = uuid.uuid4().hex
         future = asyncio.get_running_loop().create_future()
         self._approvals[approval_id] = future
@@ -369,8 +387,16 @@ class DesktopRuntime:
         signal_task = asyncio.create_task(signal.wait())
         try:
             done, _ = await asyncio.wait(
-                {future, signal_task}, return_when=asyncio.FIRST_COMPLETED,
+                {future, signal_task},
+                timeout=self._approval_timeout_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
             )
+            if not done:
+                self._publish(
+                    "approval.expired",
+                    {"approvalId": approval_id, "toolCallId": context.tool_call.id},
+                )
+                return BeforeToolCallResult(block=True, reason="工具审批已超时")
             approved = future in done and future.result()
             if approved:
                 return None
@@ -489,3 +515,72 @@ class DesktopRuntime:
         if self._session is None:
             raise RpcError("WORKSPACE_REQUIRED", "请先打开工作区")
         return self._session
+
+
+def _is_read_only_bash_command(command: str) -> bool:
+    """Conservatively recognize shell pipelines that cannot mutate state.
+
+    This is intentionally an allowlist, not a complete shell parser. Anything
+    involving redirection, substitution, alternate control flow, absolute
+    paths, parent traversal, or an unknown executable still requires approval.
+    """
+    command = command.strip()
+    if not command or any(
+        token in command
+        for token in (";", "||", "`", "$(", ">", "<", "\n", "\r")
+    ):
+        return False
+    if re.search(r"(?:^|\s)\.\.(?:[\\/]|(?:\s|$))", command):
+        return False
+
+    segments = _SHELL_SPLIT_RE.split(command)
+    if not segments or any(not segment.strip() for segment in segments):
+        return False
+
+    for segment in segments:
+        try:
+            tokens = shlex.split(segment, posix=True)
+        except ValueError:
+            return False
+        if not tokens:
+            return False
+        executable = tokens[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if executable.endswith(".exe"):
+            executable = executable[:-4]
+
+        if executable == "cd":
+            if len(tokens) != 2 or not _is_workspace_relative_token(tokens[1]):
+                return False
+            continue
+        if executable == "git":
+            if len(tokens) < 2 or tokens[1].lower() not in _READ_ONLY_GIT_SUBCOMMANDS:
+                return False
+            if any(
+                token in {"-c", "-o", "--paginate"}
+                or token.startswith(("--exec-path", "--output", "--open-files-in-pager"))
+                for token in tokens[2:]
+            ):
+                return False
+        elif executable not in _READ_ONLY_COMMANDS:
+            return False
+
+        if executable == "find" and any(token.lower() in _DANGEROUS_FIND_FLAGS for token in tokens[1:]):
+            return False
+        if executable == "rg" and any(token == "--pre" or token.startswith("--pre=") for token in tokens[1:]):
+            return False
+        if any(not _is_workspace_relative_token(token) for token in tokens[1:] if _looks_like_path(token)):
+            return False
+    return True
+
+
+def _looks_like_path(token: str) -> bool:
+    if token.startswith("-"):
+        return False
+    return "/" in token or "\\" in token or token in {".", ".."} or bool(re.match(r"^[A-Za-z]:", token))
+
+
+def _is_workspace_relative_token(token: str) -> bool:
+    normalized = token.replace("\\", "/")
+    if normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized):
+        return False
+    return ".." not in normalized.split("/")

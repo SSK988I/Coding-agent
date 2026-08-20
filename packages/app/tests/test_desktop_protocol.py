@@ -4,12 +4,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from agent_core import AgentContext, BeforeToolCallContext
 from agent_llm import AssistantMessage, Model, ModelCost, TextContent, ToolCall, UserMessage
 
 from coding_agent.core.agent_session import AgentSession, AgentSessionConfig
 from coding_agent.core.messages import convert_to_llm
 from coding_agent.desktop.protocol import RpcError, parse_request, to_jsonable
-from coding_agent.desktop.runtime import DesktopRuntime
+from coding_agent.desktop.runtime import DesktopRuntime, _is_read_only_bash_command
 
 
 @dataclass
@@ -90,4 +91,110 @@ def test_desktop_command_catalog_only_exposes_supported_commands() -> None:
 
     assert [command["name"] for command in commands] == [
         "help", "clear", "model", "compact", "session", "new",
+    ]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "find . -maxdepth 3 -type f | head -100",
+        "rg --files packages/core | head -20",
+        "git status --short",
+        "cd packages/core && git log --oneline -5",
+    ],
+)
+def test_read_only_bash_commands_skip_approval(command: str) -> None:
+    assert _is_read_only_bash_command(command) is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "find . -delete",
+        "find . -exec rm {} ;",
+        "rm -rf build",
+        "git checkout -- file.py",
+        "cat file > copy",
+        "cat $(pwd)/secret",
+        "git branch new-feature",
+        "git diff --output=changes.patch",
+        "rg --pre 'touch marker' pattern .",
+        "sort input.txt -o output.txt",
+        "uniq input.txt output.txt",
+        "tree -o tree.txt",
+        "rg token ..\\private",
+        "bash -c 'pwd'",
+    ],
+)
+def test_mutating_or_ambiguous_bash_commands_still_require_approval(command: str) -> None:
+    assert _is_read_only_bash_command(command) is False
+
+
+def _tool_context(name: str, args: dict) -> BeforeToolCallContext:
+    tool_call = ToolCall(id="tool-call-1", name=name, arguments=args)
+    return BeforeToolCallContext(
+        assistant_message=AssistantMessage(content=[tool_call]),
+        tool_call=tool_call,
+        args=args,
+        context=AgentContext(),
+    )
+
+
+def test_read_only_bash_hook_does_not_wait_for_approval() -> None:
+    import asyncio
+
+    events: list[dict] = []
+    runtime = DesktopRuntime(events.append)
+    context = _tool_context(
+        "bash",
+        {"command": "find . -maxdepth 3 -type f | head -100"},
+    )
+
+    result = asyncio.run(runtime._before_tool_call(context, asyncio.Event()))
+
+    assert result is None
+    assert events == []
+
+
+def test_mutating_tool_waits_for_and_accepts_explicit_approval() -> None:
+    import asyncio
+
+    async def scenario() -> tuple[object, list[dict]]:
+        events: list[dict] = []
+        runtime = DesktopRuntime(events.append)
+        task = asyncio.create_task(runtime._before_tool_call(
+            _tool_context("write", {"path": "answer.txt", "content": "ok"}),
+            asyncio.Event(),
+        ))
+        await asyncio.sleep(0)
+        approval = events[0]["event"]["payload"]
+        await runtime._approval_resolve({
+            "approvalId": approval["approvalId"],
+            "approved": True,
+        })
+        return await task, events
+
+    result, events = asyncio.run(scenario())
+
+    assert result is None
+    assert [event["event"]["type"] for event in events] == ["approval.requested"]
+
+
+def test_unanswered_approval_expires_instead_of_waiting_forever() -> None:
+    import asyncio
+
+    events: list[dict] = []
+    runtime = DesktopRuntime(events.append, approval_timeout_seconds=0.001)
+
+    result = asyncio.run(runtime._before_tool_call(
+        _tool_context("bash", {"command": "rm -rf build"}),
+        asyncio.Event(),
+    ))
+
+    assert result is not None
+    assert result.block is True
+    assert result.reason == "工具审批已超时"
+    assert [event["event"]["type"] for event in events] == [
+        "approval.requested",
+        "approval.expired",
     ]

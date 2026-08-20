@@ -194,7 +194,7 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #8e8a82; outli
 .message-body table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 12px; }
 .message-body th, .message-body td { border-bottom: 1px solid var(--line); padding: 8px 9px; text-align: left; }
 .message-body th { color: #5b5751; background: #f7f6f3; font-weight: 650; }
-.message-body pre, .tool-card pre, .approval-card pre, .thinking-block pre {
+.message-body pre, .tool-card pre, .thinking-block pre {
   overflow: auto;
   padding: 12px;
   border: 1px solid var(--line);
@@ -209,7 +209,7 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #8e8a82; outli
 .thinking-block summary { cursor: pointer; font-size: 11px; }
 .thinking-block pre { white-space: pre-wrap; border: 0; background: transparent; padding: 7px 0 0; color: #77736c; }
 
-.tool-card, .approval-card {
+.tool-card {
   border: 1px solid var(--line);
   border-radius: 10px;
   background: #faf9f7;
@@ -218,15 +218,15 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #8e8a82; outli
   margin-bottom: 9px;
 }
 .tool-card.running { border-color: #b8b2a8; }
+.tool-card.approval { border-color: #ddcfad; background: #fffdf6; }
 .tool-card.error { border-color: #d7aaa8; background: #fff8f7; }
 .tool-card-header { display: flex; align-items: center; gap: 8px; }
 .tool-card-header strong { font-size: 11px; font-weight: 650; }
 .tool-card-header span:last-child { margin-left: auto; color: var(--muted); font-size: 9px; }
 .tool-card pre { max-height: 230px; white-space: pre-wrap; }
 .tool-icon { color: #79756e; }
-.approval-card { border-color: #ddcfad; background: #fffdf6; }
-.approval-card h3 { margin: 7px 0 0; color: #39342a; font-size: 14px; }
-.approval-card pre { max-height: 210px; background: #fff; }
+.tool-approval { display: flex; align-items: center; gap: 12px; padding-top: 9px; border-top: 1px solid #e8dcc0; color: #6a604c; font-size: 10px; }
+.tool-approval > span { flex: 1; }
 .approval-actions { display: flex; justify-content: flex-end; gap: 8px; }
 .primary-button, .danger-button { border: 1px solid transparent; border-radius: 8px; padding: 7px 12px; cursor: pointer; font-size: 11px; font-weight: 600; }
 .primary-button { background: #272623; color: #fff; }

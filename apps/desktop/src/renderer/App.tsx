@@ -11,6 +11,7 @@ import type {
 
 interface ViewMessage {
   id: string;
+  order: number;
   role: "user" | "assistant";
   text: string;
   thinking: string;
@@ -19,10 +20,12 @@ interface ViewMessage {
 
 interface ToolView {
   id: string;
+  order: number;
   name: string;
   args: unknown;
   result?: unknown;
-  status: "running" | "done" | "error";
+  status: "running" | "approval" | "done" | "error";
+  approval?: ApprovalView;
 }
 
 interface ApprovalView {
@@ -75,12 +78,30 @@ function persistedMessages(messages: AgentMessage[]): ViewMessage[] {
     if (message.role === "assistant" && !content.text && !content.thinking) return [];
     return [{
       id: `persisted-${message.timestamp ?? index}-${index}`,
+      order: index,
       role: message.role,
       text: content.text,
       thinking: content.thinking,
       status: message.stop_reason,
     } as ViewMessage];
   });
+}
+
+function toolOutput(value: unknown): string {
+  if (value && typeof value === "object" && "content" in value) {
+    const content = (value as { content?: unknown }).content;
+    if (Array.isArray(content)) {
+      const text = content
+        .flatMap((item) => item && typeof item === "object" && "text" in item
+          ? [String((item as { text?: unknown }).text ?? "")]
+          : [])
+        .filter(Boolean)
+        .join("\n");
+      if (text) return text;
+    }
+  }
+  if (typeof value === "string") return value;
+  return JSON.stringify(value, null, 2) ?? "";
 }
 
 function shortPath(value: string): string {
@@ -95,7 +116,6 @@ export function App() {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [messages, setMessages] = useState<ViewMessage[]>([]);
   const [tools, setTools] = useState<ToolView[]>([]);
-  const [approvals, setApprovals] = useState<ApprovalView[]>([]);
   const [commandOptions, setCommandOptions] = useState<CommandOption[]>([]);
   const [commandMenuOpen, setCommandMenuOpen] = useState(false);
   const [selectedCommandIndex, setSelectedCommandIndex] = useState(0);
@@ -112,6 +132,7 @@ export function App() {
   const rafId = useRef<number | null>(null);
   const activeAssistantIds = useRef(new Map<string, string>());
   const assistantSequence = useRef(0);
+  const timelineSequence = useRef(0);
 
   const refreshSessions = async () => {
     try {
@@ -130,10 +151,10 @@ export function App() {
   };
 
   const applyWorkspace = (payload: WorkspacePayload) => {
+    timelineSequence.current = payload.messages.length;
     setWorkspace(payload);
     setMessages(persistedMessages(payload.messages));
     setTools([]);
-    setApprovals([]);
     setCommandMenuOpen(false);
     setModelPickerOpen(false);
     activeAssistantIds.current.clear();
@@ -146,6 +167,7 @@ export function App() {
     setError(null);
     try {
       const result = await window.agent.request<WorkspacePayload>("workspace.open", { path, resume });
+      setSidecarStatus("ready");
       applyWorkspace(result);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
@@ -179,7 +201,7 @@ export function App() {
   useEffect(() => {
     const timeline = timelineRef.current;
     if (timeline) timeline.scrollTop = timeline.scrollHeight;
-  }, [messages, tools, approvals, running]);
+  }, [messages, tools, running]);
 
   const handleRuntimeEvent = (envelope: RuntimeEvent) => {
     const { type, payload } = envelope.event;
@@ -199,10 +221,18 @@ export function App() {
       const raw = payload.message as AgentMessage | undefined;
       if (raw?.role !== "assistant") return;
       const messageId = `${runKey}-assistant-${++assistantSequence.current}`;
+      const order = ++timelineSequence.current;
       activeAssistantIds.current.set(runKey, messageId);
       setMessages((current) => [
         ...current,
-        { id: messageId, role: "assistant", text: "", thinking: "", status: "streaming" },
+        {
+          id: messageId,
+          order,
+          role: "assistant",
+          text: "",
+          thinking: "",
+          status: "streaming",
+        },
       ]);
       return;
     }
@@ -239,21 +269,63 @@ export function App() {
     }
     if (type === "tool_execution_start") {
       const id = String(payload.tool_call_id);
-      setTools((current) => [
-        ...current.filter((item) => item.id !== id),
-        { id, name: String(payload.tool_name), args: payload.args, status: "running" },
-      ]);
+      const order = ++timelineSequence.current;
+      setTools((current) => {
+        const existing = current.find((item) => item.id === id);
+        if (existing) {
+          return current.map((item) => item.id === id
+            ? { ...item, name: String(payload.tool_name), args: payload.args, status: "running" }
+            : item);
+        }
+        return [...current, {
+          id,
+          order,
+          name: String(payload.tool_name),
+          args: payload.args,
+          status: "running",
+        }];
+      });
       return;
     }
     if (type === "tool_execution_end") {
       const id = String(payload.tool_call_id);
       setTools((current) => current.map((item) => item.id === id
-        ? { ...item, result: payload.result, status: payload.is_error ? "error" : "done" }
+        ? {
+            ...item,
+            approval: undefined,
+            result: payload.result,
+            status: payload.is_error ? "error" : "done",
+          }
         : item));
       return;
     }
     if (type === "approval.requested") {
-      setApprovals((current) => [...current, payload as unknown as ApprovalView]);
+      const approval = payload as unknown as ApprovalView;
+      const order = ++timelineSequence.current;
+      setTools((current) => {
+        const existing = current.find((item) => item.id === approval.toolCallId);
+        if (existing) {
+          return current.map((item) => item.id === approval.toolCallId
+            ? { ...item, approval, status: "approval" }
+            : item);
+        }
+        return [...current, {
+          id: approval.toolCallId,
+          order,
+          name: approval.toolName,
+          args: approval.args,
+          approval,
+          status: "approval",
+        }];
+      });
+      return;
+    }
+    if (type === "approval.expired") {
+      const toolCallId = String(payload.toolCallId);
+      setTools((current) => current.map((item) => item.id === toolCallId
+        ? { ...item, approval: undefined, result: "工具审批已超时", status: "error" }
+        : item));
+      return;
     }
     if (type === "session.changed") {
       applyWorkspace(payload as unknown as WorkspacePayload);
@@ -270,8 +342,10 @@ export function App() {
   };
 
   const addNotice = (text: string) => {
+    const order = ++timelineSequence.current;
     setMessages((current) => [...current, {
       id: `notice-${Date.now()}-${current.length}`,
+      order,
       role: "assistant",
       text,
       thinking: "",
@@ -340,8 +414,10 @@ export function App() {
     }
     setInput("");
     setError(null);
+    const order = ++timelineSequence.current;
     setMessages((current) => [...current, {
       id: `user-${Date.now()}`,
+      order,
       role: "user",
       text,
       thinking: "",
@@ -426,10 +502,17 @@ export function App() {
     }
   };
 
-  const resolveApproval = async (approvalId: string, approved: boolean) => {
+  const resolveApproval = async (approval: ApprovalView, approved: boolean) => {
+    setTools((current) => current.map((item) => item.id === approval.toolCallId
+      ? {
+          ...item,
+          approval: undefined,
+          result: approved ? item.result : "用户拒绝了本次工具调用",
+          status: approved ? "running" : "error",
+        }
+      : item));
     try {
-      await window.agent.request("approval.resolve", { approvalId, approved });
-      setApprovals((current) => current.filter((item) => item.approvalId !== approvalId));
+      await window.agent.request("approval.resolve", { approvalId: approval.approvalId, approved });
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     }
@@ -452,6 +535,11 @@ export function App() {
     if (sidecarStatus === "starting") return "正在启动运行时";
     return sidecarStatus.startsWith("error:") ? "运行时异常" : "运行时已断开";
   }, [sidecarStatus]);
+
+  const timelineItems = useMemo(() => [
+    ...messages.map((value) => ({ kind: "message" as const, order: value.order, value })),
+    ...tools.map((value) => ({ kind: "tool" as const, order: value.order, value })),
+  ].sort((left, right) => left.order - right.order), [messages, tools]);
 
   return (
     <div className="app-shell">
@@ -514,45 +602,51 @@ export function App() {
               </section>
             )}
 
-            {messages.map((message) => (
-              <article key={message.id} className={`message ${message.role}`}>
-                <div className="message-avatar">{message.role === "user" ? "你" : "AI"}</div>
-                <div className="message-body">
-                  {message.thinking && (
-                    <details className="thinking-block">
-                      <summary>思考过程</summary>
-                      <pre>{message.thinking}</pre>
-                    </details>
+            {timelineItems.map((item) => {
+              if (item.kind === "message") {
+                const message = item.value;
+                return (
+                  <article key={`message-${message.id}`} className={`message ${message.role}`}>
+                    <div className="message-avatar">{message.role === "user" ? "你" : "AI"}</div>
+                    <div className="message-body">
+                      {message.thinking && (
+                        <details className="thinking-block">
+                          <summary>思考过程</summary>
+                          <pre>{message.thinking}</pre>
+                        </details>
+                      )}
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.text || (message.status === "streaming" ? "正在思考…" : "")}</ReactMarkdown>
+                    </div>
+                  </article>
+                );
+              }
+
+              const tool = item.value;
+              const status = tool.status === "approval"
+                ? "等待确认"
+                : tool.status === "running"
+                  ? "执行中"
+                  : tool.status === "done" ? "已完成" : "失败";
+              return (
+                <section key={`tool-${tool.id}`} className={`tool-card ${tool.status}`}>
+                  <div className="tool-card-header">
+                    <span className="tool-icon">⌁</span>
+                    <strong>{tool.name}</strong>
+                    <span>{status}</span>
+                  </div>
+                  <pre>{toolOutput(tool.result ?? tool.args)}</pre>
+                  {tool.approval && (
+                    <div className="tool-approval">
+                      <span>此操作可能修改文件或系统状态，是否允许执行？</span>
+                      <div className="approval-actions">
+                        <button className="danger-button" onClick={() => resolveApproval(tool.approval!, false)}>拒绝</button>
+                        <button className="primary-button" onClick={() => resolveApproval(tool.approval!, true)}>允许一次</button>
+                      </div>
+                    </div>
                   )}
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.text || (message.status === "streaming" ? "正在思考…" : "")}</ReactMarkdown>
-                </div>
-              </article>
-            ))}
-
-            {tools.map((tool) => (
-              <section key={tool.id} className={`tool-card ${tool.status}`}>
-                <div className="tool-card-header">
-                  <span className="tool-icon">⌁</span>
-                  <strong>{tool.name}</strong>
-                  <span>{tool.status === "running" ? "执行中" : tool.status === "done" ? "已完成" : "失败"}</span>
-                </div>
-                <pre>{JSON.stringify(tool.result ?? tool.args, null, 2)}</pre>
-              </section>
-            ))}
-
-            {approvals.map((approval) => (
-              <section key={approval.approvalId} className="approval-card">
-                <div>
-                  <span className="eyebrow">需要确认</span>
-                  <h3>允许执行 {approval.toolName}？</h3>
-                  <pre>{JSON.stringify(approval.args, null, 2)}</pre>
-                </div>
-                <div className="approval-actions">
-                  <button className="danger-button" onClick={() => resolveApproval(approval.approvalId, false)}>拒绝</button>
-                  <button className="primary-button" onClick={() => resolveApproval(approval.approvalId, true)}>允许一次</button>
-                </div>
-              </section>
-            ))}
+                </section>
+              );
+            })}
           </div>
 
           <div className="composer-wrap">
