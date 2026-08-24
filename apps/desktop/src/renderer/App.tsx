@@ -69,6 +69,7 @@ const COMMAND_ICONS: Record<string, string> = {
   compact: "⌁",
   clear: "↺",
   session: "◷",
+  memory: "◎",
 };
 
 function messageText(message: AgentMessage): { text: string; thinking: string } {
@@ -438,6 +439,12 @@ export function App() {
       const model = payload as unknown as WorkspacePayload["model"];
       setWorkspace((current) => current ? { ...current, model } : current);
     }
+    if (type === "memory.changed") {
+      setWorkspace((current) => current ? {
+        ...current,
+        memory: { ...current.memory, ...(payload as unknown as WorkspacePayload["memory"]) },
+      } : current);
+    }
     if (type === "collaboration_mode_changed") {
       const mode = payload.mode === "plan" ? "plan" : "default";
       setWorkspace((current) => current ? {
@@ -580,6 +587,102 @@ export function App() {
       }
       if (name === "execute-plan") {
         await executePlan();
+        return;
+      }
+      if (name === "memory") {
+        const parts = args.trim().split(/\s+/).filter(Boolean);
+        const action = parts[0]?.toLocaleLowerCase() || "status";
+        if (action === "on" || action === "off") {
+          const memory = await window.agent.request<WorkspacePayload["memory"]>("memory.setEnabled", {
+            enabled: action === "on",
+          });
+          setWorkspace((current) => current ? { ...current, memory } : current);
+          addNotice(`长期记忆已${action === "on" ? "开启" : "关闭"}。`);
+          return;
+        }
+        if (action === "status") {
+          const memory = await window.agent.request<WorkspacePayload["memory"]>("memory.status");
+          setWorkspace((current) => current ? { ...current, memory } : current);
+          addNotice([
+            "### 长期记忆状态", "",
+            `- 状态：\`${memory.enabled ? "on" : "off"}\``,
+            `- 用户：\`${memory.userId ?? "none"}\``,
+            `- 项目：\`${memory.projectId ?? "none"}\``,
+            `- 全局记忆：\`${memory.globalCount ?? 0}\``,
+            `- 项目记忆：\`${memory.projectCount ?? 0}\``,
+            `- 待解决冲突：\`${memory.conflictCount ?? 0}\``,
+            `- 目录：\`${memory.root ?? ""}\``,
+          ].join("\n"));
+          return;
+        }
+        if (action === "list") {
+          const scope = parts.includes("--global") ? "global" : parts.includes("--project") ? "project" : undefined;
+          const records = await window.agent.request<Array<{ scope: string; record: Record<string, unknown> }>>(
+            "memory.list", scope ? { scope } : {},
+          );
+          addNotice(records.length ? [
+            "### 长期记忆", "",
+            ...records.map((item) => [
+              `- \`${String(item.record.key)}\`（\`${String(item.record.id)}\`）= `,
+              `\`${JSON.stringify(item.record.value)}\``,
+              `（${String(item.record.kind)}/${item.scope}，状态 ${String(item.record.status)}，`,
+              `来源 ${String(item.record.authority)}，更新于 ${String(item.record.updated_at)}）`,
+            ].join("")),
+          ].join("\n") : "没有匹配的长期记忆。");
+          return;
+        }
+        if (action === "conflicts") {
+          const conflicts = await window.agent.request<Array<{ scope: string; conflict: Record<string, unknown> }>>(
+            "memory.conflicts",
+          );
+          addNotice(conflicts.length ? [
+            "### 记忆冲突", "",
+            ...conflicts.map((item) => {
+              const candidates = Array.isArray(item.conflict.candidates)
+                ? item.conflict.candidates as Array<Record<string, unknown>>
+                : [];
+              const values = candidates.map((candidate) => [
+                JSON.stringify(candidate.value), `（\`${String(candidate.id)}\`）`,
+              ].join("")).join(" / ");
+              return `- \`${String(item.conflict.key)}\`（${item.scope}）：${values}`;
+            }),
+          ].join("\n") : "当前没有待解决的记忆冲突。");
+          return;
+        }
+        if (action === "forget") {
+          const key = parts.find((item, index) => index > 0 && !item.startsWith("--"));
+          if (!key || !parts.includes("--confirm")) {
+            addNotice("用法：`/memory forget <key> [--global|--project] --confirm`");
+            return;
+          }
+          const scope = parts.includes("--global") ? "global" : parts.includes("--project") ? "project" : undefined;
+          const result = await window.agent.request<{
+            removed: boolean;
+            memory: WorkspacePayload["memory"];
+          }>("memory.forget", {
+            key, scope, confirmed: true,
+          });
+          setWorkspace((current) => current ? { ...current, memory: result.memory } : current);
+          addNotice(result.removed ? "记忆已遗忘并写入墓碑。" : "未找到该记忆。");
+          return;
+        }
+        if (action === "clear") {
+          const allScopes = parts.includes("--all");
+          if ((!allScopes && !parts.includes("--project")) || !parts.includes("--confirm")) {
+            addNotice("用法：`/memory clear --project|--all --confirm`");
+            return;
+          }
+          const result = await window.agent.request<{
+            count: number;
+            memory: WorkspacePayload["memory"];
+          }>("memory.clear", {
+            allScopes, confirmed: true,
+          });
+          setWorkspace((current) => current ? { ...current, memory: result.memory } : current);
+          addNotice(`已遗忘 ${result.count} 条记忆，并保留墓碑记录。`);
+          return;
+        }
+        addNotice("用法：`/memory status|list|conflicts|forget|clear|on|off`");
         return;
       }
       setError(`桌面端暂不支持命令：/${name}`);
@@ -843,6 +946,14 @@ export function App() {
               <strong>{workspace.model.name || workspace.model.id}</strong>
               <span>工具</span>
               <strong>{workspace.tools.length} 个已启用</strong>
+              <span>长期记忆</span>
+              <button
+                className={`memory-toggle ${workspace.memory.enabled ? "on" : "off"}`}
+                onClick={() => void executeSlashCommand("memory", workspace.memory.enabled ? "off" : "on")}
+                disabled={running || compacting}
+              >
+                {workspace.memory.enabled ? "已开启" : "已关闭"}
+              </button>
             </div>
           )}
         </aside>

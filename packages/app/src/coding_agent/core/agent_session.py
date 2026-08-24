@@ -21,6 +21,7 @@ import contextlib
 import sys
 import time
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Literal, cast
 
 from agent_llm import (
@@ -46,6 +47,7 @@ from agent_core import (
 )
 from agent_core.prompts import build_system_prompt
 from coding_agent.core.retry import RetryPolicy, retrying_stream
+from coding_agent.memory.types import MemoryScope
 from coding_agent.core.plan_mode import (
     CollaborationMode,
     PLAN_MODE_OVERLAY,
@@ -120,6 +122,16 @@ class AgentSessionConfig:
     theme_name: str = "dark"
     collaboration_mode: CollaborationMode = "default"
     question_behavior: QuestionBehavior = "interactive"
+    # Long-term memory is application-owned and opt-in for programmatic hosts.
+    # CLI/Desktop pass their persisted settings explicitly.
+    memory_configured: bool = False
+    memory_enabled: bool = False
+    memory_user_id: str = "local-user"
+    memory_root: Path | None = None
+    memory_max_records: int = 8
+    memory_token_budget: int = 800
+    memory_service: Any = None
+    memory_identity: Any = None
 
 
 @dataclass
@@ -302,6 +314,42 @@ class AgentSession:
         # listeners, so callers don't double-emit.
         self._compaction_orchestrator.on_event = self._emit_event
 
+        # ── Long-term memory ─────────────────────────────────────────────
+        self.memory_identity = config.memory_identity
+        self.memory_service = config.memory_service
+        if (config.memory_configured or config.memory_enabled) and self.memory_service is None:
+            self._initialize_memory()
+
+    def _initialize_memory(self) -> None:
+        """Build the default file-backed memory service for application hosts."""
+        from coding_agent.core.config import get_memory_dir
+        from coding_agent.memory.extractor import LLMMemoryExtractor
+        from coding_agent.memory.paths import resolve_project_id
+        from coding_agent.memory.service import MemoryService
+        from coding_agent.memory.store import FileMemoryStore
+        from coding_agent.memory.types import MemoryIdentity
+
+        if self.memory_identity is None:
+            self.memory_identity = MemoryIdentity(
+                user_id=self._config.memory_user_id,
+                project_id=resolve_project_id(self.cwd),
+            )
+        store = FileMemoryStore(self._config.memory_root or get_memory_dir())
+        extractor = LLMMemoryExtractor(
+            get_model=lambda: self._model,
+            get_stream_fn=lambda: self._agent.stream_fn,
+            get_api_key=self._config.get_api_key,
+            get_reasoning=lambda: self._agent.reasoning,
+        )
+        self.memory_service = MemoryService(
+            store=store,
+            extractor=extractor,
+            enabled=self._config.memory_enabled,
+            max_records=self._config.memory_max_records,
+            token_budget=self._config.memory_token_budget,
+            event_sink=self._emit_event,
+        )
+
     # ── Public properties ─────────────────────────────────────────────────
 
     @property
@@ -335,6 +383,10 @@ class AgentSession:
     @property
     def plan_state(self) -> PlanState:
         return self._plan_state
+
+    @property
+    def memory_enabled(self) -> bool:
+        return bool(self.memory_service is not None and self.memory_service.enabled)
 
     # ── Event subscription ────────────────────────────────────────────────
 
@@ -487,7 +539,7 @@ class AgentSession:
         if not answer:
             raise PlanModeError("INVALID_PARAMS", "回答不能为空")
         plan_id = self._plan_state.active_plan_id or ""
-        self.session_manager.append_plan_question_answer(
+        answer_entry = self.session_manager.append_plan_question_answer(
             plan_id=plan_id, question_id=question_id, answer=answer,
         )
         self._plan_state.pending_question = None
@@ -499,9 +551,18 @@ class AgentSession:
         if self._question_future is not None and not self._question_future.done():
             self._question_future.set_result(answer)
             return self._plan_state
+        from coding_agent.memory.types import MemoryEvidence
         await self.prompt(
             f"<plan_question_answer question_id=\"{question_id}\">\n{answer}\n"
-            "</plan_question_answer>"
+            "</plan_question_answer>",
+            _memory_query=answer,
+            _memory_evidence=[MemoryEvidence(
+                id=answer_entry.id,
+                text=answer,
+                source_kind="user",
+                timestamp=answer_entry.timestamp,
+            )],
+            _memory_mode="plan_answer",
         )
         return self._plan_state
 
@@ -520,7 +581,7 @@ class AgentSession:
             })
             raise PlanModeError("STALE_PLAN_REVISION", "只能执行最新的 Plan revision")
 
-        self.session_manager.append_plan_run(
+        started_entry = self.session_manager.append_plan_run(
             plan_id=plan_id, revision=revision, digest=digest,
             status="started", run_id=run_id,
         )
@@ -532,6 +593,7 @@ class AgentSession:
             "type": "plan_execution_started", "plan": latest.to_payload(),
             "run_id": run_id,
         })
+        await self._extract_plan_memory(latest, started_entry, completed=False)
         execution_prompt = (
             "<confirmed_plan_execution>\n"
             f"plan_id: {plan_id}\nrevision: {revision}\ndigest: {digest}\n\n"
@@ -548,22 +610,26 @@ class AgentSession:
             self._finish_plan_run(latest, "failed", run_id=run_id, error=str(exc))
             raise
         stop_reason = getattr(self._last_assistant_message, "stop_reason", None)
-        if self._plan_abort_requested:
+        if self._plan_abort_requested or stop_reason == "aborted":
             self._finish_plan_run(latest, "aborted", run_id=run_id)
-        elif stop_reason == "error":
+        elif stop_reason in {None, "error", "length"}:
             self._finish_plan_run(
                 latest, "failed", run_id=run_id,
-                error=getattr(self._last_assistant_message, "error_message", None),
+                error=(
+                    getattr(self._last_assistant_message, "error_message", None)
+                    or f"plan execution stopped with reason: {stop_reason}"
+                ),
             )
         else:
-            self._finish_plan_run(latest, "completed", run_id=run_id)
+            completed_entry = self._finish_plan_run(latest, "completed", run_id=run_id)
+            await self._extract_plan_memory(latest, completed_entry, completed=True)
         return latest
 
     def _finish_plan_run(
         self, plan: PlanRevision, status: Literal["completed", "failed", "aborted"],
         *, run_id: str | None, error: str | None = None,
-    ) -> None:
-        self.session_manager.append_plan_run(
+    ) -> Any:
+        entry = self.session_manager.append_plan_run(
             plan_id=plan.plan_id, revision=plan.revision, digest=plan.digest,
             status=status, run_id=run_id, error=error,
         )
@@ -574,6 +640,36 @@ class AgentSession:
             "type": f"plan_execution_{event_suffix}", "plan": plan.to_payload(),
             "run_id": run_id, "error": error,
         })
+        return entry
+
+    async def _extract_plan_memory(
+        self, plan: PlanRevision, entry: Any, *, completed: bool,
+    ) -> None:
+        """Extract only from an explicitly accepted immutable Plan revision."""
+        if self.memory_service is None or self.memory_identity is None:
+            return
+        from coding_agent.memory.types import CompletedTask, MemoryEvidence
+
+        evidence = MemoryEvidence(
+            id=entry.id,
+            text=plan.markdown,
+            source_kind="plan_completed" if completed else "accepted_plan",
+            timestamp=entry.timestamp,
+        )
+        task = CompletedTask(
+            identity=self.memory_identity,
+            session_id=self.session_manager.header.id,
+            evidence=[evidence],
+            final_response=_assistant_text(self._last_assistant_message) if completed else "",
+            mode="plan_completed" if completed else "plan_accepted",
+            success=True,
+            ended_at=entry.timestamp,
+        )
+        try:
+            await self.memory_service.after_task(task)
+        except Exception:
+            # Memory is an isolated side effect and cannot block Plan execution.
+            self._emit_event({"type": "memory_extraction_failed", "error_code": "PLAN_MEMORY"})
 
     def refresh_plan_state_from_branch(self) -> PlanState:
         self._plan_state = reduce_plan_state(self.session_manager.get_branch())
@@ -582,16 +678,30 @@ class AgentSession:
 
     # ── Prompt ────────────────────────────────────────────────────────────
 
-    async def prompt(self, message: Any) -> None:
+    async def prompt(
+        self,
+        message: Any,
+        *,
+        _retrieve_memory: bool = True,
+        _extract_memory: bool = True,
+        _memory_query: str | None = None,
+        _memory_evidence: list[Any] | None = None,
+        _memory_mode: str | None = None,
+    ) -> None:
         """Send a user message and run the agent loop.
 
         This path has no extension interception, queueing, or skill expansion. Compaction
         lifecycle events (start/end) are emitted by the orchestrator via the
         bridged callback; on overflow recovery (``need_retry``) the original
-        message is re-prompted once after compaction.
+        message is re-prompted once after compaction. Long-term memory is retrieved
+        as transient system context and extracted only at the stable outer-task end.
         """
         if self._is_processing:
             raise RuntimeError("Agent is already processing a prompt.")
+        if isinstance(message, str) and message.lstrip().startswith("<confirmed_plan_execution>"):
+            _retrieve_memory = False
+            _extract_memory = False
+            _memory_mode = "plan_execution"
         if (
             self._plan_state.mode == "plan"
             and self._plan_state.pending_question is not None
@@ -612,31 +722,174 @@ class AgentSession:
                 "plan_id": self._plan_state.active_plan_id,
             })
 
+        branch_before = {entry.id for entry in self.session_manager.get_branch()}
+        task_mode = _memory_mode or self._plan_state.mode
+        query = _memory_query if _memory_query is not None else _message_text(message)
+        base_prompt = self._build_effective_system_prompt()
+        # Set the guard before the first await. Otherwise two concurrent callers
+        # can both pass the initial check while the first one is retrieving memory.
         self._is_processing = True
+        try:
+            if (
+                _retrieve_memory
+                and self.memory_service is not None
+                and self.memory_identity is not None
+                and query.strip()
+            ):
+                try:
+                    memory_context = await self.memory_service.before_task(
+                        self.memory_identity, query,
+                    )
+                except Exception:
+                    memory_context = None
+                if memory_context is not None and memory_context.prompt_block:
+                    self._agent.state.system_prompt = (
+                        f"{base_prompt.rstrip()}\n\n{memory_context.prompt_block}\n"
+                    )
+                else:
+                    self._agent.state.system_prompt = base_prompt
+            else:
+                self._agent.state.system_prompt = base_prompt
+        except BaseException:
+            self._is_processing = False
+            self._agent.state.system_prompt = base_prompt
+            raise
+
         self._retry_abort_event.clear()
         self._compaction_orchestrator.reset_overflow_guard()
         self._turn_index += 1
+        self._last_assistant_message = None
 
         try:
             await self._agent.prompt(message)
+
+            # Auto-compaction check after each turn.
+            # The orchestrator emits compaction_start/end via on_event.
+            outcome = await self._compaction_orchestrator.check_compaction()
+
+            # Overflow recovery: the orchestrator stripped the errored assistant
+            # message and compacted; re-prompt the original message once so the
+            # user's request is retried against the compacted context.
+            if outcome.need_retry:
+                self._last_assistant_message = None
+                await self._agent.prompt(message)
+                # A second compaction pass after the retry is intentionally skipped:
+                # Limit overflow recovery to one attempt per turn.
+
+            stop_reason = getattr(self._last_assistant_message, "stop_reason", None)
+            succeeded = stop_reason not in {None, "error", "aborted", "length"}
+            if (
+                _extract_memory
+                and succeeded
+                and self.memory_service is not None
+                and self.memory_identity is not None
+            ):
+                completed = self._build_completed_memory_task(
+                    branch_before=branch_before,
+                    explicit_evidence=_memory_evidence,
+                    mode=task_mode,
+                )
+                if completed is not None:
+                    try:
+                        await self.memory_service.after_task(completed)
+                    except Exception:
+                        self._emit_event({
+                            "type": "memory_extraction_failed",
+                            "error_code": "TASK_MEMORY",
+                        })
         finally:
             self._is_processing = False
+            # Plan transitions may have changed the effective base prompt while
+            # the run was active. Never retain a retrieved memory block globally.
+            self._system_prompt = self._build_effective_system_prompt()
+            self._agent.state.system_prompt = self._system_prompt
 
-        # Auto-compaction check after each turn.
-        # The orchestrator emits compaction_start/end via on_event.
-        outcome = await self._compaction_orchestrator.check_compaction()
+    def _build_completed_memory_task(
+        self,
+        *,
+        branch_before: set[str],
+        explicit_evidence: list[Any] | None,
+        mode: str,
+    ) -> Any:
+        from agent_core.session.types import PlanQuestionAnswerEntry, SessionMessageEntry
+        from coding_agent.memory.types import CompletedTask, MemoryEvidence
 
-        # Overflow recovery: the orchestrator stripped the errored assistant
-        # message and compacted; re-prompt the original message once so the
-        # user's request is retried against the compacted context.
-        if outcome.need_retry:
-            self._is_processing = True
-            try:
-                await self._agent.prompt(message)
-            finally:
-                self._is_processing = False
-            # A second compaction pass after the retry is intentionally skipped:
-            # Limit overflow recovery to one attempt per turn.
+        evidence: list[MemoryEvidence] = list(explicit_evidence or [])
+        if explicit_evidence is None:
+            for entry in self.session_manager.get_branch():
+                if entry.id in branch_before:
+                    continue
+                if isinstance(entry, SessionMessageEntry) and entry.message is not None:
+                    if getattr(entry.message, "role", None) != "user":
+                        continue
+                    text = _message_text(entry.message)
+                    if text.strip():
+                        evidence.append(MemoryEvidence(
+                            id=entry.id,
+                            text=text,
+                            source_kind="user",
+                            timestamp=entry.timestamp,
+                        ))
+                elif isinstance(entry, PlanQuestionAnswerEntry) and entry.answer.strip():
+                    evidence.append(MemoryEvidence(
+                        id=entry.id,
+                        text=entry.answer,
+                        source_kind="user",
+                        timestamp=entry.timestamp,
+                    ))
+        if not evidence:
+            return None
+        return CompletedTask(
+            identity=self.memory_identity,
+            session_id=self.session_manager.header.id,
+            evidence=evidence,
+            final_response=_assistant_text(self._last_assistant_message),
+            mode=mode,
+            success=True,
+        )
+
+    # ── Long-term memory management ────────────────────────────────────
+
+    def set_memory_enabled(self, enabled: bool) -> None:
+        self._config.memory_enabled = enabled
+        if self.memory_service is None and enabled:
+            self._initialize_memory()
+        if self.memory_service is not None:
+            self.memory_service.set_enabled(enabled)
+
+    async def memory_overview(self) -> Any:
+        if self.memory_service is None or self.memory_identity is None:
+            return None
+        return await self.memory_service.overview(self.memory_identity)
+
+    async def memory_list(self, scope: MemoryScope | None = None) -> list[Any]:
+        if self.memory_service is None or self.memory_identity is None:
+            return []
+        return await self.memory_service.list_records(self.memory_identity, scope)
+
+    async def memory_conflicts(self) -> list[Any]:
+        if self.memory_service is None or self.memory_identity is None:
+            return []
+        return await self.memory_service.list_conflicts(self.memory_identity)
+
+    async def memory_forget(self, key: str, scope: MemoryScope | None = None) -> bool:
+        if self.memory_service is None or self.memory_identity is None:
+            return False
+        return await self.memory_service.forget(
+            self.memory_identity,
+            key,
+            scope=scope,
+            session_id=self.session_manager.header.id,
+        )
+
+    async def memory_clear(self, *, all_scopes: bool) -> int:
+        if self.memory_service is None or self.memory_identity is None:
+            return 0
+        return await self.memory_service.clear(
+            self.memory_identity,
+            all_scopes=all_scopes,
+            session_id=self.session_manager.header.id,
+        )
 
     def new_session(self) -> SessionManager:
         """Finish the current session and attach a brand-new one.
@@ -1070,4 +1323,20 @@ def _assistant_text(message: Any) -> str:
     for block in content if isinstance(content, list) else []:
         if getattr(block, "type", None) == "text":
             parts.append(str(getattr(block, "text", "")))
+    return "".join(parts)
+
+
+def _message_text(message: Any) -> str:
+    """Extract only user-visible text from a prompt/message value."""
+    if isinstance(message, str):
+        return message
+    content = getattr(message, "content", message)
+    if isinstance(content, str):
+        return content
+    parts: list[str] = []
+    for block in content if isinstance(content, list) else []:
+        if getattr(block, "type", None) == "text":
+            parts.append(str(getattr(block, "text", "") or ""))
+        elif isinstance(block, dict) and block.get("type") == "text":
+            parts.append(str(block.get("text", "") or ""))
     return "".join(parts)

@@ -34,10 +34,16 @@ def test_set_value_validates_and_persists(tmp_path: Path):
     manager.load()
     manager.set_value("auto_retry", "false")
     manager.set_value("max_retries", "3")
+    manager.set_value("memory_enabled", "off")
+    manager.set_value("memory_max_records", "12")
+    manager.set_value("memory_token_budget", "1200")
 
     loaded = SettingsManager(manager.path).load()
     assert loaded.auto_retry is False
     assert loaded.max_retries == 3
+    assert loaded.memory_enabled is False
+    assert loaded.memory_max_records == 12
+    assert loaded.memory_token_budget == 1200
 
     with pytest.raises(ValueError, match="Unknown setting"):
         manager.set_value("not_real", "x")

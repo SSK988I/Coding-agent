@@ -13,6 +13,7 @@ from coding_agent.core.agent_session import AgentSession, AgentSessionConfig
 from coding_agent.core.messages import convert_to_llm
 from coding_agent.desktop.protocol import RpcError, parse_request, to_jsonable
 from coding_agent.desktop.runtime import DesktopRuntime, _is_read_only_bash_command
+from coding_agent.memory.types import MemoryIdentity, MemoryOverview
 
 
 @dataclass
@@ -96,8 +97,54 @@ def test_desktop_command_catalog_only_exposes_supported_commands() -> None:
 
     assert [command["name"] for command in commands] == [
         "help", "clear", "model", "compact", "session", "new",
-        "plan", "cancel-plan", "execute-plan",
+        "plan", "cancel-plan", "execute-plan", "memory",
     ]
+
+
+def test_memory_rpc_requires_confirmation_and_publishes_updated_status() -> None:
+    import asyncio
+
+    class MemorySession:
+        memory_enabled = True
+        memory_identity = MemoryIdentity("local-user", "project-a")
+        settings_manager = None
+        session_manager = SimpleNamespace(header=SimpleNamespace(id="memory-session"))
+
+        async def memory_overview(self) -> MemoryOverview:
+            return MemoryOverview(
+                enabled=self.memory_enabled,
+                user_id="local-user",
+                project_id="project-a",
+                global_count=1,
+                project_count=2,
+                conflict_count=0,
+                root="memory-root",
+            )
+
+        async def memory_forget(self, key: str, scope: str | None) -> bool:
+            assert key == "response.language"
+            assert scope == "global"
+            return True
+
+    events: list[dict] = []
+    runtime = DesktopRuntime(events.append)
+    runtime._session = MemorySession()  # type: ignore[assignment]
+
+    with pytest.raises(RpcError, match="显式确认") as error:
+        asyncio.run(runtime.dispatch("memory.forget", {
+            "key": "response.language", "scope": "global",
+        }))
+    assert error.value.code == "CONFIRMATION_REQUIRED"
+
+    result = asyncio.run(runtime.dispatch("memory.forget", {
+        "key": "response.language", "scope": "global", "confirmed": True,
+    }))
+    assert result["removed"] is True
+    assert result["memory"]["projectCount"] == 2
+    assert events[-1]["event"] == {
+        "type": "memory.changed",
+        "payload": result["memory"],
+    }
 
 
 def test_manual_compaction_rehydrates_desktop_with_persisted_summary(tmp_path: Path) -> None:

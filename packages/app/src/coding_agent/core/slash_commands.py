@@ -60,6 +60,7 @@ BUILTIN_SLASH_COMMANDS: list[BuiltinSlashCommand] = [
     BuiltinSlashCommand("plan", "Enter Plan Mode"),
     BuiltinSlashCommand("cancel-plan", "Cancel Plan Mode without executing"),
     BuiltinSlashCommand("execute-plan", "Execute the latest confirmed Plan revision"),
+    BuiltinSlashCommand("memory", "Inspect and manage long-term memory"),
 
     # ── Export and utility commands ───────────────────────────────────────
     BuiltinSlashCommand("export", "Export session to HTML (default) or JSONL (.jsonl path)"),

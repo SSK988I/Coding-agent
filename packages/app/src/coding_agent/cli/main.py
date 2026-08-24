@@ -505,6 +505,11 @@ def main(argv: list[str] | None = None) -> int:
         theme_name=settings.theme,
         collaboration_mode=cast(Any, args.agent_mode or "default"),
         question_behavior="interactive" if app_mode == "interactive" else "deferred",
+        memory_configured=True,
+        memory_enabled=settings.memory_enabled,
+        memory_user_id=settings.memory_user_id,
+        memory_max_records=settings.memory_max_records,
+        memory_token_budget=settings.memory_token_budget,
     )
     if args.no_tools:
         config.no_tools = True

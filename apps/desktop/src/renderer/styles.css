@@ -125,6 +125,18 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #8e8a82; outli
 }
 .workspace-meta span { color: var(--muted); font-size: 9px; text-transform: uppercase; letter-spacing: .08em; margin-top: 5px; }
 .workspace-meta strong { color: #4c4944; font-size: 10px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+.memory-toggle {
+  border: 0;
+  border-radius: 6px;
+  padding: 5px 7px;
+  text-align: left;
+  font-size: 10px;
+  cursor: pointer;
+  color: #595650;
+  background: #e6e4df;
+}
+.memory-toggle.on { color: #246c48; background: #dfece4; }
+.memory-toggle:disabled { cursor: default; opacity: .55; }
 
 .conversation {
   position: relative;

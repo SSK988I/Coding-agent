@@ -14,6 +14,7 @@ It can read and modify project files, search code, execute shell commands, and s
 - **Seven built-in development tools**: `read`, `write`, `edit`, `grep`, `find`, `ls`, and `bash`.
 - **Restorable sessions**: stores messages and settings changes in append-only JSONL and tracks the active branch through an entry tree.
 - **Context management**: includes token estimation, summary compaction, and compact-and-retry after context overflow.
+- **File-backed long-term memory**: extracts stable preferences and confirmed project decisions, retrieves them by user and project, and persists YAML snapshots backed by append-only JSONL facts.
 - **Multiple model providers**: currently includes catalogs for DeepSeek and Z.AI Coding Plan (China).
 - **Project context**: discovers `AGENTS.md`, `CLAUDE.md`, skills, and prompt templates.
 - **Terminal UI**: renders Markdown, streaming content, tool cards, model selection, and line-based differential updates.
@@ -37,7 +38,7 @@ The desktop MVP currently supports:
 - Tool execution cards and result updates
 - Approval prompts for `bash`, `write`, and `edit`
 - A command palette that opens when `/` is entered
-- `/help`, `/new`, `/model`, `/compact`, `/clear`, `/session`, `/plan`, `/cancel-plan`, and `/execute-plan`
+- `/help`, `/new`, `/model`, `/compact`, `/clear`, `/session`, `/plan`, `/cancel-plan`, `/execute-plan`, and `/memory`
 
 ## Requirements
 
@@ -228,6 +229,7 @@ Tools expose their name, description, JSON Schema parameters, and asynchronous e
 | `/session` | Show session information and statistics |
 | `/tree` | Inspect and switch session branches |
 | `/compact` | Compact context manually |
+| `/memory` | Inspect, toggle, forget, or clear long-term memory |
 | `/settings` | View or update persistent settings |
 | `/export` | Export HTML or JSONL |
 | `/copy` | Copy the latest assistant response |
@@ -236,6 +238,23 @@ Tools expose their name, description, JSON Schema parameters, and asynchronous e
 
 The terminal editor provides slash-command completion. Entering `/` in the desktop composer opens a filterable command palette.
 
+### Long-term memory
+
+Long-term memory is enabled by default. After a successful outer task, extraction uses only user-authored evidence, structured Plan answers, or the exact Plan revision the user explicitly executed. Tool output, assistant-only conclusions, Plan drafts, and compaction summaries are excluded. Relevant records are injected transiently before the next task and are never appended to the session JSONL.
+
+```text
+/memory status
+/memory list [--global|--project]
+/memory conflicts
+/memory forget <id-or-key> [--global|--project] --confirm
+/memory clear --project --confirm
+/memory clear --all --confirm
+/memory on
+/memory off
+```
+
+Memories are isolated by user and project. Forget and clear operations append tombstones so replaying old sessions cannot restore deleted values.
+
 ## Sessions and configuration
 
 The default data directory is `~/.coding-agent`. Override it with `CODING_AGENT_HOME`:
@@ -243,8 +262,9 @@ The default data directory is `~/.coding-agent`. Override it with `CODING_AGENT_
 ```text
 ~/.coding-agent/
 ├── auth.json        # Provider credentials
-├── settings.json    # Model, thinking level, and retry settings
-└── sessions/        # Per-project JSONL sessions
+├── settings.json    # Model, thinking, retry, and memory settings
+├── sessions/        # Per-project JSONL sessions
+└── memory/          # User/project YAML snapshots and JSONL fact logs
 ```
 
 Session files are append-only. In addition to user and assistant messages, they record model changes, thinking levels, compaction entries, and branch pointers so the active context can be restored after a restart.

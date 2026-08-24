@@ -34,6 +34,17 @@ export interface WorkspacePayload {
   messages: AgentMessage[];
   collaborationMode: "default" | "plan";
   planState: PlanStatePayload;
+  memory: MemoryStatePayload;
+}
+
+export interface MemoryStatePayload {
+  enabled: boolean;
+  userId: string | null;
+  projectId: string | null;
+  globalCount?: number;
+  projectCount?: number;
+  conflictCount?: number;
+  root?: string;
 }
 
 export type PlanPhase =

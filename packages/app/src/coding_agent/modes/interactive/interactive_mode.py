@@ -721,6 +721,8 @@ class InteractiveMode:
             self._cmd_hotkeys()
         elif cmd_name == "settings":
             self._cmd_settings(" ".join(parts[1:]) if len(parts) > 1 else "")
+        elif cmd_name == "memory":
+            await self._cmd_memory(" ".join(parts[1:]) if len(parts) > 1 else "")
         else:
             return False
         return True
@@ -1450,10 +1452,128 @@ class InteractiveMode:
                 initial_delay=settings.retry_initial_delay,
                 max_delay=settings.retry_max_delay,
             )
+            if pieces[0] == "memory_enabled":
+                self._session.set_memory_enabled(settings.memory_enabled)
         except (OSError, TypeError, ValueError) as exc:
             self._add_system_message(f"设置更新失败：{exc}")
             return
         self._add_system_message(f"已保存 `{pieces[0]}`；必要时重启后生效。")
+
+    async def _cmd_memory(self, arg: str) -> None:
+        """Inspect and mutate file-backed long-term memory."""
+        import shlex
+
+        try:
+            parts = shlex.split(arg)
+        except ValueError as exc:
+            self._add_system_message(f"记忆命令参数错误：{exc}")
+            return
+        action = parts[0].lower() if parts else "status"
+        manager = self._session.settings_manager
+
+        if action in {"on", "off"}:
+            enabled = action == "on"
+            try:
+                if manager is not None:
+                    manager.set_value("memory_enabled", "true" if enabled else "false")
+                self._session.set_memory_enabled(enabled)
+            except (OSError, TypeError, ValueError) as exc:
+                self._add_system_message(f"长期记忆设置失败：{exc}")
+                return
+            self._add_system_message(f"长期记忆已{'开启' if enabled else '关闭'}。")
+            return
+
+        if action == "status":
+            overview = await self._session.memory_overview()
+            if overview is None:
+                self._add_system_message("当前运行未配置长期记忆。")
+                return
+            self._add_assistant_text(
+                "**长期记忆状态**\n\n"
+                f"- 状态：`{'on' if overview.enabled else 'off'}`\n"
+                f"- 用户：`{overview.user_id}`\n"
+                f"- 项目：`{overview.project_id or 'none'}`\n"
+                f"- 全局记忆：`{overview.global_count}`\n"
+                f"- 项目记忆：`{overview.project_count}`\n"
+                f"- 待解决冲突：`{overview.conflict_count}`\n"
+                f"- 目录：`{overview.root}`"
+            )
+            return
+
+        if action == "list":
+            scope = None
+            if "--global" in parts:
+                scope = "global"
+            elif "--project" in parts:
+                scope = "project"
+            records = await self._session.memory_list(scope)
+            if not records:
+                self._add_system_message("没有匹配的长期记忆。")
+                return
+            lines = ["**长期记忆**\n"]
+            for item_scope, record in records:
+                lines.append(
+                    f"- `{record.key}` (`{record.id}`) = `{record.value}` "
+                    f"（{record.kind}/{item_scope}，状态 {record.status}，"
+                    f"来源 {record.authority}，更新于 {record.updated_at}）"
+                )
+            self._add_assistant_text("\n".join(lines))
+            return
+
+        if action == "conflicts":
+            conflicts = await self._session.memory_conflicts()
+            if not conflicts:
+                self._add_system_message("当前没有待解决的记忆冲突。")
+                return
+            lines = ["**记忆冲突**\n"]
+            for scope, conflict in conflicts:
+                values = " / ".join(
+                    f"{item.value} (`{item.id}`)" for item in conflict.candidates
+                )
+                lines.append(f"- `{conflict.key}`（{scope}）：{values}")
+            self._add_assistant_text("\n".join(lines))
+            return
+
+        if action == "forget":
+            values = [item for item in parts[1:] if not item.startswith("--")]
+            if not values:
+                self._add_system_message("用法：/memory forget <id-or-key> [--global|--project] --confirm")
+                return
+            if "--confirm" not in parts:
+                selected_scope = (
+                    " --global" if "--global" in parts
+                    else " --project" if "--project" in parts
+                    else ""
+                )
+                self._add_system_message(
+                    f"该操作会遗忘 `{values[0]}`。确认请执行："
+                    f"`/memory forget {values[0]}{selected_scope} --confirm`"
+                )
+                return
+            scope = "global" if "--global" in parts else ("project" if "--project" in parts else None)
+            removed = await self._session.memory_forget(values[0], scope)
+            self._add_system_message("记忆已遗忘并写入墓碑。" if removed else "未找到该记忆。")
+            return
+
+        if action == "clear":
+            all_scopes = "--all" in parts
+            project = "--project" in parts
+            if not all_scopes and not project:
+                self._add_system_message("用法：/memory clear --project|--all --confirm")
+                return
+            if "--confirm" not in parts:
+                target = "--all" if all_scopes else "--project"
+                self._add_system_message(
+                    f"该操作会批量遗忘记忆。确认请执行：`/memory clear {target} --confirm`"
+                )
+                return
+            count = await self._session.memory_clear(all_scopes=all_scopes)
+            self._add_system_message(f"已遗忘 {count} 条记忆，并保留墓碑记录。")
+            return
+
+        self._add_system_message(
+            "用法：/memory status|list|conflicts|forget|clear|on|off"
+        )
 
     def _cmd_export(self, arg: str) -> None:
         """Export the current session to HTML (default) or JSONL."""

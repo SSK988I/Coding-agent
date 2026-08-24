@@ -28,6 +28,7 @@ function workspace(overrides: Partial<WorkspacePayload> = {}): WorkspacePayload 
       latestRevision: latestPlan,
       pendingQuestion: null,
     },
+    memory: { enabled: true, userId: "local-user", projectId: "sha256:test" },
     ...overrides,
   };
 }
@@ -245,5 +246,102 @@ describe("desktop context compaction", () => {
     });
     expect(await screen.findByText("上下文压缩完成")).toBeInTheDocument();
     expect(screen.getByText("自动压缩摘要")).toBeInTheDocument();
+  });
+});
+
+describe("desktop long-term memory", () => {
+  const requests = vi.fn();
+  const memoryCommand = {
+    name: "memory",
+    label: "长期记忆",
+    description: "查看和管理用户画像与项目决策",
+  };
+
+  beforeEach(() => {
+    requests.mockImplementation(async (method: string) => {
+      if (method === "workspace.open") return workspace({
+        collaborationMode: "default",
+        planState: { phase: "idle", activePlanId: null, latestRevision: null, pendingQuestion: null },
+      });
+      if (method === "session.list") return [];
+      if (method === "command.list") return [memoryCommand];
+      if (method === "memory.status") return {
+        enabled: true,
+        userId: "local-user",
+        projectId: "sha256:test",
+        globalCount: 2,
+        projectCount: 3,
+        conflictCount: 1,
+        root: "C:\\memory",
+      };
+      if (method === "memory.setEnabled") return {
+        enabled: false,
+        userId: "local-user",
+        projectId: "sha256:test",
+      };
+      if (method === "memory.forget") return {
+        removed: true,
+        memory: {
+          enabled: true,
+          userId: "local-user",
+          projectId: "sha256:test",
+          globalCount: 1,
+          projectCount: 3,
+          conflictCount: 1,
+        },
+      };
+      return {};
+    });
+    window.agent = {
+      request: requests,
+      onEvent: () => () => undefined,
+      onStatus: () => () => undefined,
+    };
+    window.desktop = {
+      chooseWorkspace: async () => null,
+      getBootstrap: async () => ({ defaultWorkspace: "G:\\Coding-agent", platform: "win32" }),
+    };
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+  });
+
+  it("toggles memory from the workspace sidebar", async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "已开启" }));
+
+    await waitFor(() => expect(requests).toHaveBeenCalledWith("memory.setEnabled", { enabled: false }));
+    expect(await screen.findByRole("button", { name: "已关闭" })).toBeInTheDocument();
+    expect(screen.getByText("长期记忆已关闭。")).toBeInTheDocument();
+  });
+
+  it("shows status without sending the slash command to the model", async () => {
+    render(<App />);
+    const composer = await screen.findByPlaceholderText("描述你想完成的任务…");
+    fireEvent.change(composer, { target: { value: "/memory status" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送 ↑" }));
+
+    await waitFor(() => expect(requests).toHaveBeenCalledWith("memory.status"));
+    expect(await screen.findByText("长期记忆状态")).toBeInTheDocument();
+    expect(requests).not.toHaveBeenCalledWith("run.start", expect.anything());
+  });
+
+  it("requires explicit confirmation before forgetting a memory", async () => {
+    render(<App />);
+    const composer = await screen.findByPlaceholderText("描述你想完成的任务…");
+    fireEvent.change(composer, { target: { value: "/memory forget response.language" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送 ↑" }));
+
+    expect(await screen.findByText(/memory forget.*--confirm/)).toBeInTheDocument();
+    expect(requests).not.toHaveBeenCalledWith("memory.forget", expect.anything());
+
+    fireEvent.change(composer, { target: { value: "/memory forget response.language --confirm" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送 ↑" }));
+    await waitFor(() => expect(requests).toHaveBeenCalledWith("memory.forget", {
+      key: "response.language", scope: undefined, confirmed: true,
+    }));
+    expect(await screen.findByText("记忆已遗忘并写入墓碑。")).toBeInTheDocument();
   });
 });

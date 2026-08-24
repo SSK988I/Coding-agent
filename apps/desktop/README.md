@@ -13,7 +13,8 @@ pnpm dev
 ```
 
 The desktop includes workspace opening, persistent sessions, streaming messages,
-tool execution cards, approval gates for `bash`/`write`/`edit`, and run abort.
+tool execution cards, approval gates for `bash`/`write`/`edit`, run abort, and
+file-backed long-term-memory management through the sidebar and `/memory` command.
 
 Plan Mode is shared with the CLI through the Python `AgentSession`. The composer
 mode selector, structured question card, immutable revision card, and explicit

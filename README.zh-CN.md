@@ -14,6 +14,7 @@ Coding Agent 是一个面向本地开发工作的编程 Agent。项目以 Python
 - **七个内置开发工具**：`read`、`write`、`edit`、`grep`、`find`、`ls` 和 `bash`。
 - **可恢复会话**：使用 Append-only JSONL 保存消息和设置变更，通过 Entry Tree 记录活动分支。
 - **上下文管理**：提供 Token 估算、摘要压缩和上下文溢出后的 Compact-and-Retry。
+- **文件式长期记忆**：从成功任务中提取稳定偏好和已确认项目决策，按用户与项目检索，使用 YAML 快照与 Append-only JSONL 事实日志持久化。
 - **多模型 Provider**：当前内置 DeepSeek 和智谱 Z.AI Coding Plan（中国区）模型目录。
 - **项目上下文**：支持发现 `AGENTS.md`、`CLAUDE.md`、Skills 和提示词模板。
 - **终端界面**：支持 Markdown、流式内容、工具卡片、模型选择和按行差分渲染。
@@ -37,7 +38,7 @@ Coding Agent 是一个面向本地开发工作的编程 Agent。项目以 Python
 - 展示工具调用状态和执行结果
 - 对 `bash`、`write`、`edit` 请求执行确认
 - 输入 `/` 打开命令面板
-- `/help`、`/new`、`/model`、`/compact`、`/clear`、`/session`、`/plan`、`/cancel-plan`、`/execute-plan`
+- `/help`、`/new`、`/model`、`/compact`、`/clear`、`/session`、`/plan`、`/cancel-plan`、`/execute-plan`、`/memory`
 
 ## 环境要求
 
@@ -228,6 +229,7 @@ uv run coding-agent --provider zhipu --model glm-5v-turbo `
 | `/session` | 查看会话信息和统计数据 |
 | `/tree` | 查看并切换会话分支 |
 | `/compact` | 手动压缩上下文 |
+| `/memory` | 查看、开关、遗忘或清理长期记忆 |
 | `/settings` | 查看或修改持久化设置 |
 | `/export` | 导出 HTML 或 JSONL |
 | `/copy` | 复制最近一条助手回复 |
@@ -236,6 +238,23 @@ uv run coding-agent --provider zhipu --model glm-5v-turbo `
 
 终端输入框支持斜杠命令补全。桌面端输入 `/` 会打开可筛选的命令面板。
 
+### 长期记忆
+
+长期记忆默认开启。每个成功的外层任务结束后，应用只使用本轮用户原文、结构化 Plan 回答或用户明确执行的精确 Plan revision 提取候选；工具输出、助手单方面结论、Plan 草稿和压缩摘要不能作为事实证据。新任务开始前，相关记录会以临时系统上下文注入，不写回会话 JSONL。
+
+```text
+/memory status
+/memory list [--global|--project]
+/memory conflicts
+/memory forget <id-or-key> [--global|--project] --confirm
+/memory clear --project --confirm
+/memory clear --all --confirm
+/memory on
+/memory off
+```
+
+记忆按用户和项目隔离。项目级记录只在当前项目生效；同 key 的项目记录会临时覆盖全局记录。`forget` 和 `clear` 会写入墓碑，防止旧会话重放后恢复已删除内容。
+
 ## 会话与配置
 
 默认数据目录为 `~/.coding-agent`，可以通过 `CODING_AGENT_HOME` 修改：
@@ -243,8 +262,9 @@ uv run coding-agent --provider zhipu --model glm-5v-turbo `
 ```text
 ~/.coding-agent/
 ├── auth.json        # Provider 凭据
-├── settings.json    # 模型、思考级别和重试设置
-└── sessions/        # 按项目保存的 JSONL 会话
+├── settings.json    # 模型、思考级别、重试和记忆设置
+├── sessions/        # 按项目保存的 JSONL 会话
+└── memory/          # 用户/项目隔离的 YAML 快照与 JSONL 事实日志
 ```
 
 会话文件使用追加写入。除用户和助手消息外，还会记录模型切换、思考级别、压缩节点和分支指针等状态，因此可以在重启后恢复活动上下文。
