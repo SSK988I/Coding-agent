@@ -45,6 +45,7 @@ class WriteTool:
     """
 
     name: str = "write"
+    effect: str = "write"
     label: str = "write"
     description: str = (
         "Write content to a file. Creates the file if it doesn't exist, "

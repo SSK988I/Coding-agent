@@ -18,6 +18,7 @@ It can read and modify project files, search code, execute shell commands, and s
 - **Project context**: discovers `AGENTS.md`, `CLAUDE.md`, skills, and prompt templates.
 - **Terminal UI**: renders Markdown, streaming content, tool cards, model selection, and line-based differential updates.
 - **Desktop MVP**: supports workspace selection, session history, streaming messages, tool approval, model switching, and a slash-command palette.
+- **Cross-client Plan Mode**: provides read-only exploration, structured questions, immutable plan revisions, and explicit execution confirmation shared by CLI and desktop.
 
 ## Interfaces
 
@@ -36,7 +37,7 @@ The desktop MVP currently supports:
 - Tool execution cards and result updates
 - Approval prompts for `bash`, `write`, and `edit`
 - A command palette that opens when `/` is entered
-- `/help`, `/new`, `/model`, `/compact`, `/clear`, and `/session`
+- `/help`, `/new`, `/model`, `/compact`, `/clear`, `/session`, `/plan`, `/cancel-plan`, and `/execute-plan`
 
 ## Requirements
 
@@ -152,6 +153,21 @@ uv run coding-agent --session <path-or-session-id>
 uv run coding-agent --no-session
 ```
 
+### Plan Mode
+
+Enter Plan Mode interactively with `/plan`, `Shift+Tab`, or `Alt+M`. `Shift+Tab`/`Alt+M` leaves Plan Mode by cancelling; it never executes a plan. Thinking-level cycling is `Alt+T`, while `Ctrl+T` only toggles thinking-block visibility.
+
+For resumable non-interactive workflows:
+
+```powershell
+uv run coding-agent --agent-mode plan -p "Plan the requested change"
+uv run coding-agent --session <session-id> --answer-plan-question <question-id> "answer"
+uv run coding-agent --session <session-id> --execute-plan <revision>
+uv run coding-agent --session <session-id> --cancel-plan
+```
+
+Plan State is stored in JSONL v4 and can be resumed by either the CLI or desktop client. When a revision is ready, the interactive clients ask whether to execute it or supplement ideas; supplemental text returns the episode to drafting and never authorizes execution. See [Plan Mode Specification](docs/specs/plan-mode.md).
+
 ### Provider and model selection
 
 ```powershell
@@ -208,6 +224,7 @@ Tools expose their name, description, JSON Schema parameters, and asynchronous e
 | `/model` | Select a model from configured providers |
 | `/login`, `/logout` | Manage provider credentials |
 | `/new` | Start a new session |
+| `/plan`, `/cancel-plan`, `/execute-plan` | Enter, cancel, or explicitly execute Plan Mode |
 | `/session` | Show session information and statistics |
 | `/tree` | Inspect and switch session branches |
 | `/compact` | Compact context manually |

@@ -30,6 +30,7 @@ from coding_agent.core.config import (
 )
 from coding_agent.core.credentials import CredentialStore
 from coding_agent.core.retry import RetryPolicy
+from coding_agent.core.plan_mode import PlanModeError
 from coding_agent.core.settings import SettingsManager
 
 
@@ -442,6 +443,17 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── Build initial message (stdin + @file text + first positional) ────
     # Combine stdin, referenced files, and the first positional message.
+    control_answer: str | None = None
+    if args.answer_plan_question:
+        if len(args.messages) != 1 or args.file_args or stdin_content is not None:
+            print("错误：--answer-plan-question 必须且只能附带一个位置参数作为答案。", file=sys.stderr)
+            return 2
+        control_answer = args.messages[0]
+    elif args.execute_plan is not None or args.cancel_plan:
+        if args.messages or args.file_args or stdin_content is not None:
+            print("错误：执行或取消计划时不能附带普通提示词。", file=sys.stderr)
+            return 2
+
     file_text = ""
     file_images = None
     if args.file_args:
@@ -491,6 +503,8 @@ def main(argv: list[str] | None = None) -> int:
         ),
         settings_manager=settings_manager,
         theme_name=settings.theme,
+        collaboration_mode=cast(Any, args.agent_mode or "default"),
+        question_behavior="interactive" if app_mode == "interactive" else "deferred",
     )
     if args.no_tools:
         config.no_tools = True
@@ -502,6 +516,25 @@ def main(argv: list[str] | None = None) -> int:
         config.excluded_tool_names = args.exclude_tools
 
     session = AgentSession(config)
+
+    if (
+        args.agent_mode == "default"
+        and session.collaboration_mode == "plan"
+        and not args.cancel_plan
+        and args.execute_plan is None
+    ):
+        print(
+            "错误：恢复中的 Plan 会话不能用 --agent-mode default 绕过确认；"
+            "请使用 --cancel-plan 或 --execute-plan。",
+            file=sys.stderr,
+        )
+        session.dispose()
+        return 2
+
+    if args.answer_plan_question or args.execute_plan is not None or args.cancel_plan:
+        return _run_plan_control(
+            session, args, answer=control_answer, mode=args.output_mode,
+        )
 
     # ── Dispatch to mode ─────────────────────────────────────────────────
     if app_mode == "interactive":
@@ -606,6 +639,18 @@ def _run_print(
                     had_error = True
                     err = getattr(msg, "error_message", "") or "未知错误"
                     print(f"\n错误：{err}", file=sys.stderr)
+            elif etype == "plan_question_requested":
+                question = event.get("question") or {}
+                print(
+                    f"\nPlan 问题 [{question.get('questionId', '')}]：{question.get('question', '')}",
+                    file=sys.stderr,
+                )
+            elif etype == "plan_ready":
+                plan = event.get("plan") or {}
+                print(
+                    f"\nPlan revision {plan.get('revision')} 已就绪，digest={plan.get('digest')}",
+                    file=sys.stderr,
+                )
 
         session.on_event(_on_event)
         if initial_prompt is not None:
@@ -619,6 +664,7 @@ def _run_print(
             await session.prompt(msg)
         sys.stdout.write("\n")
         sys.stdout.flush()
+        _print_plan_resume_hint(session)
         return 1 if had_error else 0
 
     try:
@@ -627,6 +673,79 @@ def _run_print(
         return 130
     finally:
         session.dispose()
+
+
+def _run_plan_control(
+    session: AgentSession, args: Args, *, answer: str | None, mode: str,
+) -> int:
+    """Run one resumable Plan control operation in non-interactive mode."""
+    async def _control() -> int:
+        if mode == "json":
+            session.on_event(
+                lambda event: (
+                    sys.stdout.write(json.dumps(event, default=_json_default) + "\n"),
+                    sys.stdout.flush(),
+                )
+            )
+        else:
+            def _text_event(event: dict) -> None:
+                if event.get("type") == "message_update":
+                    inner = event.get("event") or {}
+                    if inner.get("type") == "text_delta":
+                        sys.stdout.write(str(inner.get("delta", "")))
+                        sys.stdout.flush()
+            session.on_event(_text_event)
+        try:
+            if args.answer_plan_question:
+                await session.answer_plan_question(args.answer_plan_question, answer or "")
+            elif args.cancel_plan:
+                session.cancel_plan_mode(session.plan_state.active_plan_id)
+            else:
+                latest = session.plan_state.latest_revision
+                requested_revision = args.execute_plan
+                if latest is None or requested_revision is None:
+                    raise PlanModeError("PLAN_NOT_READY", "当前没有可执行的计划")
+                await session.execute_plan(
+                    latest.plan_id, requested_revision, latest.digest,
+                )
+        except PlanModeError as exc:
+            print(f"错误 [{exc.code}]：{exc}", file=sys.stderr)
+            return 2
+        except Exception as exc:  # noqa: BLE001 - CLI runtime boundary
+            print(f"错误：{exc}", file=sys.stderr)
+            return 1
+        if mode == "text":
+            sys.stdout.write("\n")
+            _print_plan_resume_hint(session)
+        return 1 if session.plan_state.phase in {"failed", "aborted"} else 0
+
+    try:
+        return asyncio.run(_control())
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        session.dispose()
+
+
+def _print_plan_resume_hint(session: AgentSession) -> None:
+    state = getattr(session, "plan_state", None)
+    if state is None:
+        return
+    session_id = session.session_manager.header.id
+    if state.pending_question is not None:
+        question = state.pending_question
+        print(
+            f"下一步：coding-agent --session {session_id} "
+            f"--answer-plan-question {question.question_id} \"<answer>\"",
+            file=sys.stderr,
+        )
+    elif state.mode == "plan" and state.latest_revision is not None:
+        revision = state.latest_revision
+        print(
+            f"下一步：coding-agent --session {session_id} --execute-plan {revision.revision} "
+            f"（或 --cancel-plan）",
+            file=sys.stderr,
+        )
 
 
 def _json_default(obj: Any) -> Any:

@@ -5,6 +5,8 @@ import type {
   AgentMessage,
   ContentBlock,
   RuntimeEvent,
+  PlanQuestionPayload,
+  PlanRevisionPayload,
   SessionInfo,
   WorkspacePayload,
 } from "../shared/types";
@@ -26,6 +28,18 @@ interface ToolView {
   result?: unknown;
   status: "running" | "approval" | "done" | "error";
   approval?: ApprovalView;
+}
+
+type CompactionStatus = "running" | "completed" | "skipped" | "failed" | "aborted";
+
+interface CompactionView {
+  id: string;
+  order: number;
+  status: CompactionStatus;
+  reason: string;
+  summary: string;
+  tokensBefore?: number;
+  detail?: string;
 }
 
 interface ApprovalView {
@@ -75,6 +89,9 @@ function persistedMessages(messages: AgentMessage[]): ViewMessage[] {
     // Slash commands belong to the local UI, and tool-only/error assistant
     // records have no chat body. Older MVP sessions may contain both.
     if (message.role === "user" && content.text.trimStart().startsWith("/")) return [];
+    if (message.role === "user" && content.text.trimStart().startsWith("<confirmed_plan_execution>")) {
+      content.text = "执行已确认计划";
+    }
     if (message.role === "assistant" && !content.text && !content.thinking) return [];
     return [{
       id: `persisted-${message.timestamp ?? index}-${index}`,
@@ -84,6 +101,21 @@ function persistedMessages(messages: AgentMessage[]): ViewMessage[] {
       thinking: content.thinking,
       status: message.stop_reason,
     } as ViewMessage];
+  });
+}
+
+function persistedCompactions(messages: AgentMessage[]): CompactionView[] {
+  return messages.flatMap((message, index) => {
+    if (message.role !== "compactionSummary") return [];
+    const tokensBefore = message.tokens_before ?? message.tokensBefore;
+    return [{
+      id: `persisted-compaction-${message.timestamp ?? index}-${index}`,
+      order: index,
+      status: "completed",
+      reason: "persisted",
+      summary: message.summary ?? "",
+      tokensBefore: typeof tokensBefore === "number" ? tokensBefore : undefined,
+    } as CompactionView];
   });
 }
 
@@ -116,6 +148,7 @@ export function App() {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [messages, setMessages] = useState<ViewMessage[]>([]);
   const [tools, setTools] = useState<ToolView[]>([]);
+  const [compactions, setCompactions] = useState<CompactionView[]>([]);
   const [commandOptions, setCommandOptions] = useState<CommandOption[]>([]);
   const [commandMenuOpen, setCommandMenuOpen] = useState(false);
   const [selectedCommandIndex, setSelectedCommandIndex] = useState(0);
@@ -124,15 +157,21 @@ export function App() {
   const [modelQuery, setModelQuery] = useState("");
   const [input, setInput] = useState("");
   const [running, setRunning] = useState(false);
+  const [compacting, setCompacting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [customPlanAnswer, setCustomPlanAnswer] = useState("");
+  const [supplementingPlanDigest, setSupplementingPlanDigest] = useState<string | null>(null);
   const timelineRef = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
   const didBootstrap = useRef(false);
   const rafQueue = useRef<RuntimeEvent[]>([]);
   const rafId = useRef<number | null>(null);
   const activeAssistantIds = useRef(new Map<string, string>());
   const assistantSequence = useRef(0);
   const timelineSequence = useRef(0);
+  const activeCompactionId = useRef<string | null>(null);
+  const compactingRef = useRef(false);
 
   const refreshSessions = async () => {
     try {
@@ -154,13 +193,52 @@ export function App() {
     timelineSequence.current = payload.messages.length;
     setWorkspace(payload);
     setMessages(persistedMessages(payload.messages));
+    setCompactions(persistedCompactions(payload.messages));
     setTools([]);
     setCommandMenuOpen(false);
     setModelPickerOpen(false);
+    setCustomPlanAnswer("");
+    setSupplementingPlanDigest(null);
     activeAssistantIds.current.clear();
+    activeCompactionId.current = null;
+    compactingRef.current = false;
+    setCompacting(false);
     setError(null);
     void refreshSessions();
     void refreshCommands();
+  };
+
+  const beginCompaction = (reason: string): string => {
+    if (compactingRef.current && activeCompactionId.current) {
+      return activeCompactionId.current;
+    }
+    const order = ++timelineSequence.current;
+    const id = `compaction-${Date.now()}-${order}`;
+    activeCompactionId.current = id;
+    compactingRef.current = true;
+    setCompacting(true);
+    setCompactions((current) => [...current, {
+      id,
+      order,
+      status: "running",
+      reason,
+      summary: "",
+    }]);
+    return id;
+  };
+
+  const finishCompaction = (
+    status: Exclude<CompactionStatus, "running">,
+    summary = "",
+    detail?: string,
+  ) => {
+    const id = activeCompactionId.current;
+    if (!id) return;
+    compactingRef.current = false;
+    setCompacting(false);
+    setCompactions((current) => current.map((item) => item.id === id
+      ? { ...item, status, summary: summary || item.summary, detail }
+      : item));
   };
 
   const openWorkspace = async (path: string, resume = true) => {
@@ -177,6 +255,13 @@ export function App() {
   useEffect(() => {
     const unsubscribeStatus = window.agent.onStatus(setSidecarStatus);
     const unsubscribeEvents = window.agent.onEvent((event) => {
+      // Compaction lifecycle events are sparse and user-visible. Process them
+      // before the animation-frame stream queue so the RPC response cannot race
+      // ahead of its start/end status in the renderer.
+      if (event.event.type === "compaction_start" || event.event.type === "compaction_end") {
+        handleRuntimeEvent(event);
+        return;
+      }
       rafQueue.current.push(event);
       if (rafId.current !== null) return;
       rafId.current = requestAnimationFrame(() => {
@@ -201,7 +286,7 @@ export function App() {
   useEffect(() => {
     const timeline = timelineRef.current;
     if (timeline) timeline.scrollTop = timeline.scrollHeight;
-  }, [messages, tools, running]);
+  }, [messages, tools, compactions, running, compacting]);
 
   const handleRuntimeEvent = (envelope: RuntimeEvent) => {
     const { type, payload } = envelope.event;
@@ -214,6 +299,23 @@ export function App() {
       setRunning(false);
       activeAssistantIds.current.delete(runKey);
       if (type === "run.failed") setError(String(payload.message ?? "运行失败"));
+      void refreshSessions();
+      return;
+    }
+    if (type === "compaction_start") {
+      beginCompaction(String(payload.reason ?? "automatic"));
+      return;
+    }
+    if (type === "compaction_end") {
+      const failed = typeof payload.error === "string" && payload.error.length > 0;
+      const status: Exclude<CompactionStatus, "running"> = failed
+        ? "failed"
+        : payload.aborted ? "aborted" : "completed";
+      finishCompaction(
+        status,
+        String(payload.summary_preview ?? ""),
+        failed ? String(payload.error) : undefined,
+      );
       void refreshSessions();
       return;
     }
@@ -268,6 +370,7 @@ export function App() {
       return;
     }
     if (type === "tool_execution_start") {
+      if (payload.tool_name === "request_user_input") return;
       const id = String(payload.tool_call_id);
       const order = ++timelineSequence.current;
       setTools((current) => {
@@ -288,6 +391,7 @@ export function App() {
       return;
     }
     if (type === "tool_execution_end") {
+      if (payload.tool_name === "request_user_input") return;
       const id = String(payload.tool_call_id);
       setTools((current) => current.map((item) => item.id === id
         ? {
@@ -334,6 +438,57 @@ export function App() {
       const model = payload as unknown as WorkspacePayload["model"];
       setWorkspace((current) => current ? { ...current, model } : current);
     }
+    if (type === "collaboration_mode_changed") {
+      const mode = payload.mode === "plan" ? "plan" : "default";
+      setWorkspace((current) => current ? {
+        ...current,
+        collaborationMode: mode,
+        planState: {
+          ...current.planState,
+          phase: String(payload.phase ?? (mode === "plan" ? "drafting" : "cancelled")) as WorkspacePayload["planState"]["phase"],
+          activePlanId: String(payload.plan_id ?? current.planState.activePlanId ?? "") || null,
+          pendingQuestion: mode === "default" ? null : current.planState.pendingQuestion,
+        },
+      } : current);
+    }
+    if (type === "plan_question_requested") {
+      const question = payload.question as PlanQuestionPayload;
+      setWorkspace((current) => current ? {
+        ...current,
+        collaborationMode: "plan",
+        planState: { ...current.planState, phase: "awaiting_answer", pendingQuestion: question },
+      } : current);
+    }
+    if (type === "plan_question_answered") {
+      setWorkspace((current) => current ? {
+        ...current,
+        planState: { ...current.planState, phase: "drafting", pendingQuestion: null },
+      } : current);
+    }
+    if (type === "plan_ready") {
+      const plan = payload.plan as PlanRevisionPayload;
+      setSupplementingPlanDigest(null);
+      setWorkspace((current) => current ? {
+        ...current,
+        collaborationMode: "plan",
+        planState: { ...current.planState, phase: "ready", pendingQuestion: null, latestRevision: plan },
+      } : current);
+    }
+    if (type === "plan_execution_started") {
+      setWorkspace((current) => current ? {
+        ...current,
+        collaborationMode: "default",
+        planState: { ...current.planState, phase: "executing", pendingQuestion: null },
+      } : current);
+    }
+    if (type === "plan_execution_completed" || type === "plan_execution_failed" || type === "plan_execution_aborted") {
+      const phase = type.replace("plan_execution_", "") as "completed" | "failed" | "aborted";
+      setWorkspace((current) => current ? {
+        ...current,
+        collaborationMode: "default",
+        planState: { ...current.planState, phase },
+      } : current);
+    }
   };
 
   const chooseWorkspace = async () => {
@@ -372,10 +527,30 @@ export function App() {
         return;
       }
       if (name === "compact") {
-        const result = await window.agent.request<Record<string, unknown>>("session.compact");
-        addNotice(result.performed
-          ? `上下文已压缩。${String(result.summary_preview ?? "")}`
-          : String(result.error ?? "当前无需压缩。"));
+        if (compactingRef.current) return;
+        beginCompaction("manual");
+        try {
+          const result = await window.agent.request<Record<string, unknown>>("session.compact");
+          if (result.performed) {
+            finishCompaction("completed", String(result.summary_preview ?? ""));
+          } else {
+            const detail = String(result.error ?? "当前没有可压缩的上下文");
+            const status: Exclude<CompactionStatus, "running" | "completed"> = detail === "Compaction aborted"
+              ? "aborted"
+              : detail === "Nothing to compact" || detail === "Already compacted"
+                ? "skipped"
+                : "failed";
+            const localizedDetail = detail === "Nothing to compact"
+              ? "当前没有足够的较早对话可供压缩"
+              : detail === "Already compacted"
+                ? "当前上下文已经压缩，无需重复执行"
+                : detail === "Compaction aborted" ? "压缩已取消" : detail;
+            finishCompaction(status, "", localizedDetail);
+          }
+        } catch (reason) {
+          finishCompaction("failed", "", reason instanceof Error ? reason.message : String(reason));
+          throw reason;
+        }
         return;
       }
       if (name === "clear") {
@@ -395,6 +570,18 @@ export function App() {
         ].join("\n"));
         return;
       }
+      if (name === "plan") {
+        await enterPlanMode();
+        return;
+      }
+      if (name === "cancel-plan") {
+        await cancelPlan();
+        return;
+      }
+      if (name === "execute-plan") {
+        await executePlan();
+        return;
+      }
       setError(`桌面端暂不支持命令：/${name}`);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
@@ -404,7 +591,7 @@ export function App() {
   const submit = async (event?: FormEvent) => {
     event?.preventDefault();
     const text = input.trim();
-    if (!text || !workspace || running) return;
+    if (!text || !workspace || running || compacting) return;
     if (text.startsWith("/")) {
       const [rawName, ...rest] = text.slice(1).split(/\s+/);
       const command = commandOptions.find((item) => item.name === rawName.toLocaleLowerCase());
@@ -429,6 +616,73 @@ export function App() {
       setRunning(false);
       setError(reason instanceof Error ? reason.message : String(reason));
     }
+  };
+
+  const enterPlanMode = async () => {
+    if (!workspace || running || compacting || workspace.collaborationMode === "plan") return;
+    try {
+      applyWorkspace(await window.agent.request<WorkspacePayload>("mode.enterPlan"));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  };
+
+  const cancelPlan = async () => {
+    const planId = workspace?.planState.activePlanId;
+    if (!planId || running || compacting) return;
+    try {
+      applyWorkspace(await window.agent.request<WorkspacePayload>("plan.cancel", { planId }));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  };
+
+  const answerPlanQuestion = async (answer: string) => {
+    const question = workspace?.planState.pendingQuestion;
+    if (!question || !answer.trim()) return;
+    setError(null);
+    try {
+      await window.agent.request("plan.answer", {
+        questionId: question.questionId,
+        answer: answer.trim(),
+      });
+      setCustomPlanAnswer("");
+      setWorkspace((current) => current ? {
+        ...current,
+        planState: { ...current.planState, phase: "drafting", pendingQuestion: null },
+      } : current);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  };
+
+  const executePlan = async () => {
+    const plan = workspace?.planState.latestRevision;
+    if (!plan || running || compacting || workspace?.planState.phase !== "ready") return;
+    setError(null);
+    setRunning(true);
+    setWorkspace((current) => current ? {
+      ...current,
+      collaborationMode: "default",
+      planState: { ...current.planState, phase: "executing", pendingQuestion: null },
+    } : current);
+    try {
+      await window.agent.request("plan.execute", {
+        planId: plan.planId,
+        revision: plan.revision,
+        digest: plan.digest,
+      });
+    } catch (reason) {
+      setRunning(false);
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  };
+
+  const supplementPlan = () => {
+    const plan = workspace?.planState.latestRevision;
+    if (!plan || running || compacting || workspace?.planState.phase !== "ready") return;
+    setSupplementingPlanDigest(plan.digest);
+    requestAnimationFrame(() => composerRef.current?.focus());
   };
 
   const selectModel = async (model: ModelOption) => {
@@ -461,6 +715,7 @@ export function App() {
     setInput(value);
     const isCommandSearch = Boolean(workspace)
       && !running
+      && !compacting
       && value.startsWith("/")
       && !/\s/.test(value);
     if (isCommandSearch) setModelPickerOpen(false);
@@ -519,13 +774,13 @@ export function App() {
   };
 
   const openSession = async (sessionId: string) => {
-    if (running || sessionId === workspace?.sessionId) return;
+    if (running || compacting || sessionId === workspace?.sessionId) return;
     const result = await window.agent.request<WorkspacePayload>("session.open", { sessionId });
     applyWorkspace(result);
   };
 
   const newSession = async () => {
-    if (running || !workspace) return;
+    if (running || compacting || !workspace) return;
     const result = await window.agent.request<WorkspacePayload>("session.new");
     applyWorkspace(result);
   };
@@ -535,11 +790,18 @@ export function App() {
     if (sidecarStatus === "starting") return "正在启动运行时";
     return sidecarStatus.startsWith("error:") ? "运行时异常" : "运行时已断开";
   }, [sidecarStatus]);
+  const readyPlan = workspace?.planState.phase === "ready"
+    ? workspace.planState.latestRevision
+    : null;
+  const awaitingPlanDecision = Boolean(
+    readyPlan && supplementingPlanDigest !== readyPlan.digest,
+  );
 
   const timelineItems = useMemo(() => [
     ...messages.map((value) => ({ kind: "message" as const, order: value.order, value })),
     ...tools.map((value) => ({ kind: "tool" as const, order: value.order, value })),
-  ].sort((left, right) => left.order - right.order), [messages, tools]);
+    ...compactions.map((value) => ({ kind: "compaction" as const, order: value.order, value })),
+  ].sort((left, right) => left.order - right.order), [messages, tools, compactions]);
 
   return (
     <div className="app-shell">
@@ -552,14 +814,14 @@ export function App() {
         <div className="titlebar-spacer" />
         <div className={`runtime-dot ${sidecarStatus === "ready" ? "online" : ""}`} />
         <span className="runtime-label">{statusLabel}</span>
-        <button className="ghost-button" onClick={chooseWorkspace}>打开项目</button>
+        <button className="ghost-button" onClick={chooseWorkspace} disabled={running || compacting}>打开项目</button>
       </header>
 
       <div className={`workspace-grid ${sidebarOpen ? "" : "sidebar-closed"}`}>
         <aside className="sidebar">
           <div className="sidebar-heading">
             <span>会话</span>
-            <button className="icon-button" onClick={newSession} title="新建会话">＋</button>
+            <button className="icon-button" onClick={newSession} title="新建会话" disabled={running || compacting}>＋</button>
           </div>
           <div className="session-list">
             {sessions.map((session) => (
@@ -567,6 +829,7 @@ export function App() {
                 key={session.id}
                 className={`session-item ${session.id === workspace?.sessionId ? "active" : ""}`}
                 onClick={() => openSession(session.id)}
+                disabled={running || compacting}
               >
                 <strong>{session.name || session.first_message || "新会话"}</strong>
                 <span>{session.message_count} 条消息</span>
@@ -589,7 +852,7 @@ export function App() {
             {sidebarOpen ? "‹" : "›"}
           </button>
           <div className="timeline" ref={timelineRef}>
-            {!messages.length && (
+            {!messages.length && !compactions.length && (
               <section className="welcome-card">
                 <span className="eyebrow">DESKTOP MVP</span>
                 <h1>把 Agent 放进一个真正的工作区</h1>
@@ -621,6 +884,44 @@ export function App() {
                 );
               }
 
+              if (item.kind === "compaction") {
+                const compaction = item.value;
+                const labels: Record<CompactionStatus, string> = {
+                  running: "正在压缩上下文…",
+                  completed: "上下文压缩完成",
+                  skipped: "未执行上下文压缩",
+                  failed: "上下文压缩失败",
+                  aborted: "上下文压缩已取消",
+                };
+                return (
+                  <section
+                    key={`compaction-${compaction.id}`}
+                    className={`compaction-card ${compaction.status}`}
+                    data-testid="compaction-card"
+                  >
+                    <div className="compaction-card-header">
+                      <span className="compaction-icon">⌁</span>
+                      <strong>{labels[compaction.status]}</strong>
+                      {compaction.status === "running" && <span className="compaction-spinner" aria-hidden="true" />}
+                    </div>
+                    {compaction.status === "running" && <p>正在整理较早的对话并生成可恢复摘要，请稍候。</p>}
+                    {compaction.summary && compaction.reason !== "persisted" && <p>{compaction.summary}</p>}
+                    {compaction.summary && compaction.reason === "persisted" && (
+                      <details>
+                        <summary>查看压缩摘要</summary>
+                        <div className="compaction-summary">
+                          <ReactMarkdown remarkPlugins={[remarkGfm]}>{compaction.summary}</ReactMarkdown>
+                        </div>
+                      </details>
+                    )}
+                    {typeof compaction.tokensBefore === "number" && (
+                      <span className="compaction-meta">压缩前约 {compaction.tokensBefore.toLocaleString()} tokens</span>
+                    )}
+                    {compaction.detail && <p className="compaction-detail">{compaction.detail}</p>}
+                  </section>
+                );
+              }
+
               const tool = item.value;
               const status = tool.status === "approval"
                 ? "等待确认"
@@ -647,9 +948,68 @@ export function App() {
                 </section>
               );
             })}
+            {workspace?.planState.phase === "ready" && workspace.planState.latestRevision && (
+              <section className="plan-card" data-testid="plan-card">
+                <div className="plan-card-header">
+                  <span className="plan-badge">PLAN</span>
+                  <strong>{workspace.planState.latestRevision.title}</strong>
+                  <span>revision {workspace.planState.latestRevision.revision} · {workspace.planState.latestRevision.digest.slice(0, 12)}</span>
+                </div>
+                <div className="plan-markdown">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{workspace.planState.latestRevision.markdown}</ReactMarkdown>
+                </div>
+              </section>
+            )}
           </div>
 
           <div className="composer-wrap">
+            {workspace?.planState.pendingQuestion && (
+              <section className="plan-question" data-testid="plan-question">
+                <div className="plan-question-header">
+                  <span className="plan-badge">PLAN</span>
+                  <strong>{workspace.planState.pendingQuestion.header}</strong>
+                </div>
+                <p>{workspace.planState.pendingQuestion.question}</p>
+                <div className="plan-options">
+                  {workspace.planState.pendingQuestion.options.map((option) => (
+                    <button key={option.label} onClick={() => void answerPlanQuestion(option.label)}>
+                      <strong>{option.label}</strong>
+                      <span>{option.description}</span>
+                    </button>
+                  ))}
+                </div>
+                {workspace.planState.pendingQuestion.allowCustom && (
+                  <div className="plan-custom-answer">
+                    <input
+                      value={customPlanAnswer}
+                      onChange={(event) => setCustomPlanAnswer(event.target.value)}
+                      placeholder="自定义回答"
+                    />
+                    <button onClick={() => void answerPlanQuestion(customPlanAnswer)} disabled={!customPlanAnswer.trim()}>提交</button>
+                  </div>
+                )}
+              </section>
+            )}
+            {readyPlan && awaitingPlanDecision && (
+              <section className="plan-question plan-decision" data-testid="plan-decision">
+                <div className="plan-question-header">
+                  <span className="plan-badge">PLAN</span>
+                  <strong>下一步</strong>
+                </div>
+                <p>计划已完成，下一步怎么做？</p>
+                <div className="plan-options">
+                  <button onClick={() => void executePlan()} disabled={running || compacting}>
+                    <strong>执行方案</strong>
+                    <span>确认 revision {readyPlan.revision} 并立即切回 Default 执行</span>
+                  </button>
+                  <button onClick={supplementPlan} disabled={running || compacting}>
+                    <strong>补充想法</strong>
+                    <span>保持 Plan Mode，在输入框中说明要补充或修改的内容</span>
+                  </button>
+                </div>
+                <button className="plan-decision-cancel" onClick={() => void cancelPlan()} disabled={running || compacting}>取消规划</button>
+              </section>
+            )}
             {commandMenuOpen && (
               <section className="command-palette" aria-label="斜杠命令">
                 <div className="command-palette-title">
@@ -698,19 +1058,45 @@ export function App() {
               </section>
             )}
             {error && <div className="error-banner">{error}<button onClick={() => setError(null)}>×</button></div>}
-            <form className="composer" onSubmit={submit}>
+            <form className={`composer ${workspace?.collaborationMode === "plan" ? "plan-mode" : ""}`} onSubmit={submit}>
               <textarea
+                ref={composerRef}
                 value={input}
                 onChange={(event) => onInputChange(event.target.value)}
                 onKeyDown={onInputKeyDown}
-                placeholder={workspace ? "描述你想完成的任务…" : "请先打开工作区"}
-                disabled={!workspace}
+                placeholder={compacting
+                  ? "正在压缩上下文，请稍候…"
+                  : !workspace
+                  ? "请先打开工作区"
+                  : supplementingPlanDigest === readyPlan?.digest
+                    ? "补充你的想法或修改要求…"
+                    : awaitingPlanDecision
+                      ? "请先选择执行方案或补充想法"
+                      : "描述你想完成的任务…"}
+                disabled={!workspace || awaitingPlanDecision || compacting}
                 rows={3}
               />
               <div className="composer-footer">
+                <div className="mode-switch" aria-label="协作模式">
+                  <button
+                    type="button"
+                    className={workspace?.collaborationMode === "default" ? "active" : ""}
+                    onClick={() => workspace?.collaborationMode === "plan" ? void cancelPlan() : undefined}
+                    disabled={!workspace || running || compacting}
+                  >Default</button>
+                  <button
+                    type="button"
+                    className={workspace?.collaborationMode === "plan" ? "active" : ""}
+                    onClick={() => void enterPlanMode()}
+                    disabled={!workspace || running || compacting}
+                  >Plan</button>
+                  {workspace?.collaborationMode === "plan" && <span className="plan-badge">PLAN</span>}
+                </div>
                 <span>Enter 发送 · Shift+Enter 换行</span>
                 {running ? (
                   <button type="button" className="stop-button" onClick={() => window.agent.request("run.abort")}>■ 停止</button>
+                ) : compacting ? (
+                  <button type="button" className="send-button" disabled>压缩中…</button>
                 ) : (
                   <button type="submit" className="send-button" disabled={!input.trim() || !workspace}>发送 ↑</button>
                 )}

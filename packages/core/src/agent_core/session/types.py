@@ -14,7 +14,7 @@ from typing import Any, Literal
 
 from agent_llm import Message
 
-CURRENT_SESSION_VERSION = 3
+CURRENT_SESSION_VERSION = 4
 
 #: Discriminator values for entry types.
 EntryType = Literal[
@@ -24,6 +24,11 @@ EntryType = Literal[
     "thinking_level_change",
     "session_info",
     "leaf",
+    "collaboration_mode_change",
+    "plan_question",
+    "plan_question_answer",
+    "plan_revision",
+    "plan_run",
 ]
 
 
@@ -127,6 +132,64 @@ class LeafEntry(SessionEntry):
     """
     type: Literal["leaf"] = "leaf"
     target_id: "str | None" = None
+
+
+@dataclass(kw_only=True)
+class CollaborationModeChangeEntry(SessionEntry):
+    """Records an explicit Default/Plan collaboration-mode transition."""
+
+    type: Literal["collaboration_mode_change"] = "collaboration_mode_change"
+    mode: Literal["default", "plan"] = "default"
+    plan_id: str | None = None
+
+
+@dataclass(kw_only=True)
+class PlanQuestionEntry(SessionEntry):
+    """A single structured question requested during a Plan episode."""
+
+    type: Literal["plan_question"] = "plan_question"
+    plan_id: str = ""
+    question_id: str = ""
+    header: str = ""
+    question: str = ""
+    options: list[dict[str, str]] = field(default_factory=list)
+    allow_custom: bool = True
+
+
+@dataclass(kw_only=True)
+class PlanQuestionAnswerEntry(SessionEntry):
+    """The answer to the currently pending Plan question."""
+
+    type: Literal["plan_question_answer"] = "plan_question_answer"
+    plan_id: str = ""
+    question_id: str = ""
+    answer: str = ""
+
+
+@dataclass(kw_only=True)
+class PlanRevisionEntry(SessionEntry):
+    """An immutable, validated proposed-plan revision."""
+
+    type: Literal["plan_revision"] = "plan_revision"
+    plan_id: str = ""
+    revision: int = 0
+    title: str = ""
+    markdown: str = ""
+    digest: str = ""
+    source_message_id: str = ""
+
+
+@dataclass(kw_only=True)
+class PlanRunEntry(SessionEntry):
+    """Execution confirmation and terminal outcome for one exact revision."""
+
+    type: Literal["plan_run"] = "plan_run"
+    plan_id: str = ""
+    revision: int = 0
+    digest: str = ""
+    status: Literal["started", "completed", "failed", "aborted"] = "started"
+    run_id: str | None = None
+    error: str | None = None
 
 
 # ─── 会话树节点（供 UI 渲染） ──────────────────────────────────────────

@@ -47,6 +47,9 @@ class AgentToolResult:
 #: so a batch never mixes scheduling modes.
 ToolExecutionMode = Literal["sequential", "parallel"]
 
+#: Coarse side-effect classification used by collaboration-mode policy.
+ToolEffect = Literal["read", "write", "shell", "control", "unknown"]
+
 #: Queue drain policy. "all" drains every queued message in one
 #: drain call; "one-at-a-time" drains only the oldest, leaving the rest for a
 #: later drain. Both steering and follow-up queues default to "one-at-a-time".
@@ -83,6 +86,7 @@ class AgentTool(Protocol):
 
     prepare_arguments: Callable[[dict], dict]
     execution_mode: ToolExecutionMode
+    effect: ToolEffect
 
     async def execute(
         self,

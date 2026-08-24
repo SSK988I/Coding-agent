@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from agent_core import SessionManager
@@ -64,7 +65,10 @@ def test_agent_session_threads_desktop_tool_hooks() -> None:
         before_tool_call=before,
         after_tool_call=after,
     ))
-    assert session.agent.before_tool_call is before
+    # AgentSession owns the outer policy gate; the desktop hook is chained
+    # behind it so Plan-blocked tools never reach approval.
+    assert session.agent.before_tool_call is not before
+    assert session._config.before_tool_call is before
     assert session.agent.after_tool_call is after
 
 
@@ -92,7 +96,51 @@ def test_desktop_command_catalog_only_exposes_supported_commands() -> None:
 
     assert [command["name"] for command in commands] == [
         "help", "clear", "model", "compact", "session", "new",
+        "plan", "cancel-plan", "execute-plan",
     ]
+
+
+def test_manual_compaction_rehydrates_desktop_with_persisted_summary(tmp_path: Path) -> None:
+    import asyncio
+
+    events: list[dict] = []
+    runtime = DesktopRuntime(events.append)
+    summary = SimpleNamespace(
+        role="compactionSummary",
+        summary="durable compacted context",
+        tokens_before=8120,
+        timestamp=1724470000,
+    )
+    state = SimpleNamespace(messages=[])
+
+    async def compact(_reason: str) -> dict:
+        state.messages = [summary]
+        return {"performed": True, "summary_preview": "durable compacted context"}
+
+    runtime._workspace = tmp_path
+    runtime._session = SimpleNamespace(
+        compact=compact,
+        session_manager=SimpleNamespace(header=SimpleNamespace(id="session-compact")),
+        model=SimpleNamespace(id="m", name="Model", provider="test"),
+        thinking_level=None,
+        tools=[],
+        state=state,
+        collaboration_mode="default",
+        plan_state=SimpleNamespace(to_payload=lambda: {
+            "phase": "idle",
+            "activePlanId": None,
+            "latestRevision": None,
+            "pendingQuestion": None,
+        }),
+    )
+
+    result = asyncio.run(runtime._session_compact({}))
+
+    assert result["performed"] is True
+    changed = events[-1]["event"]
+    assert changed["type"] == "session.changed"
+    assert changed["payload"]["messages"][0]["role"] == "compactionSummary"
+    assert changed["payload"]["messages"][0]["summary"] == "durable compacted context"
 
 
 def test_opening_saved_session_does_not_persist_abandoned_empty_session(

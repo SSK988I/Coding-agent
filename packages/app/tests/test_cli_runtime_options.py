@@ -5,9 +5,11 @@ import io
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from agent_llm import Model, ModelCost
 
-from coding_agent.cli.args import Args, parse_args
+from coding_agent.cli.args import Args, parse_args, resolve_app_mode
 from coding_agent.cli.main import (
     _configure_output_encoding,
     _create_session_manager,
@@ -31,6 +33,24 @@ def test_session_selectors_are_mutually_exclusive():
         assert exc.code == 2
     else:
         raise AssertionError("expected conflicting session selectors to fail")
+
+
+def test_plan_controls_are_mutually_exclusive():
+    with pytest.raises(SystemExit) as exc:
+        parse_args(["--cancel-plan", "--execute-plan", "1"])
+    assert exc.value.code == 2
+
+
+def test_agent_mode_is_distinct_from_output_mode():
+    args = parse_args(["--mode", "json", "--agent-mode", "plan"])
+    assert args.output_mode == "json"
+    assert args.agent_mode == "plan"
+
+
+def test_plan_control_forces_non_interactive_mode(monkeypatch):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    assert resolve_app_mode(Args(cancel_plan=True)) == "print"
 
 
 def test_project_trust_flags_are_mutually_exclusive():

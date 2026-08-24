@@ -42,6 +42,7 @@ class LsTool:
     """
 
     name: str = "ls"
+    effect: str = "read"
     label: str = "ls"
     description: str = (
         f"List directory contents. Returns entries sorted alphabetically, with "

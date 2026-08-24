@@ -17,6 +17,8 @@ and occur on the session event path.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,8 +27,13 @@ from agent_core.session.serde import dict_to_message, message_to_dict
 from agent_core.session.types import (
     CompactionDetails,
     CompactionEntry,
+    CollaborationModeChangeEntry,
     LeafEntry,
     ModelChangeEntry,
+    PlanQuestionAnswerEntry,
+    PlanQuestionEntry,
+    PlanRevisionEntry,
+    PlanRunEntry,
     SessionEntry,
     SessionHeader,
     SessionInfo,
@@ -38,9 +45,11 @@ from agent_core.session.types import (
 __all__ = [
     "default_agent_dir",
     "session_dir_for_cwd",
+    "session_dirs_for_cwd",
     "session_file_path",
     "filename_for_session",
     "write_header_line",
+    "rewrite_header_line",
     "append_entry_line",
     "read_header",
     "read_entries",
@@ -74,6 +83,23 @@ def session_dir_for_cwd(
         base = agent_dir if agent_dir is not None else default_agent_dir()
         sessions_dir = base / "sessions"
     return sessions_dir / encode_cwd(cwd)
+
+
+def session_dirs_for_cwd(
+    cwd: str,
+    agent_dir: Path | None = None,
+    *,
+    sessions_dir: Path | None = None,
+) -> list[Path]:
+    """Return current and legacy per-cwd directories, current first."""
+    from agent_core.session.ids import encode_cwd_legacy
+
+    current = session_dir_for_cwd(
+        cwd, agent_dir, sessions_dir=sessions_dir,
+    )
+    base = current.parent
+    legacy = base / encode_cwd_legacy(cwd)
+    return [current] if legacy == current else [current, legacy]
 
 
 def filename_for_session(header: SessionHeader) -> str:
@@ -160,6 +186,43 @@ def entry_to_line_dict(entry: SessionEntry) -> dict:
             "id": entry.id, "parentId": entry.parent_id, "timestamp": entry.timestamp,
             "targetId": entry.target_id,
         }
+    if isinstance(entry, CollaborationModeChangeEntry):
+        return {
+            "type": "collaboration_mode_change",
+            "id": entry.id, "parentId": entry.parent_id, "timestamp": entry.timestamp,
+            "mode": entry.mode, "planId": entry.plan_id,
+        }
+    if isinstance(entry, PlanQuestionEntry):
+        return {
+            "type": "plan_question",
+            "id": entry.id, "parentId": entry.parent_id, "timestamp": entry.timestamp,
+            "planId": entry.plan_id, "questionId": entry.question_id,
+            "header": entry.header, "question": entry.question,
+            "options": list(entry.options), "allowCustom": entry.allow_custom,
+        }
+    if isinstance(entry, PlanQuestionAnswerEntry):
+        return {
+            "type": "plan_question_answer",
+            "id": entry.id, "parentId": entry.parent_id, "timestamp": entry.timestamp,
+            "planId": entry.plan_id, "questionId": entry.question_id,
+            "answer": entry.answer,
+        }
+    if isinstance(entry, PlanRevisionEntry):
+        return {
+            "type": "plan_revision",
+            "id": entry.id, "parentId": entry.parent_id, "timestamp": entry.timestamp,
+            "planId": entry.plan_id, "revision": entry.revision,
+            "title": entry.title, "markdown": entry.markdown,
+            "digest": entry.digest, "sourceMessageId": entry.source_message_id,
+        }
+    if isinstance(entry, PlanRunEntry):
+        return {
+            "type": "plan_run",
+            "id": entry.id, "parentId": entry.parent_id, "timestamp": entry.timestamp,
+            "planId": entry.plan_id, "revision": entry.revision,
+            "digest": entry.digest, "status": entry.status,
+            "runId": entry.run_id, "error": entry.error,
+        }
     raise TypeError(f"Cannot serialize entry of type {type(entry)!r}")
 
 
@@ -216,6 +279,51 @@ def line_dict_to_entry(d: dict) -> SessionEntry:
             target_id=d.get("targetId"), id=entry_id,
             parent_id=parent_id, timestamp=timestamp,
         )
+    if etype == "collaboration_mode_change":
+        mode = d.get("mode", "default")
+        if mode not in {"default", "plan"}:
+            raise ValueError(f"Invalid collaboration mode: {mode!r}")
+        return CollaborationModeChangeEntry(
+            mode=mode, plan_id=d.get("planId"), id=entry_id,
+            parent_id=parent_id, timestamp=timestamp,
+        )
+    if etype == "plan_question":
+        options = d.get("options") or []
+        if not isinstance(options, list):
+            raise ValueError("plan_question.options must be a list")
+        return PlanQuestionEntry(
+            plan_id=str(d.get("planId", "")),
+            question_id=str(d.get("questionId", "")),
+            header=str(d.get("header", "")), question=str(d.get("question", "")),
+            options=[dict(item) for item in options if isinstance(item, dict)],
+            allow_custom=bool(d.get("allowCustom", True)),
+            id=entry_id, parent_id=parent_id, timestamp=timestamp,
+        )
+    if etype == "plan_question_answer":
+        return PlanQuestionAnswerEntry(
+            plan_id=str(d.get("planId", "")),
+            question_id=str(d.get("questionId", "")),
+            answer=str(d.get("answer", "")), id=entry_id,
+            parent_id=parent_id, timestamp=timestamp,
+        )
+    if etype == "plan_revision":
+        return PlanRevisionEntry(
+            plan_id=str(d.get("planId", "")), revision=int(d.get("revision", 0) or 0),
+            title=str(d.get("title", "")), markdown=str(d.get("markdown", "")),
+            digest=str(d.get("digest", "")),
+            source_message_id=str(d.get("sourceMessageId", "")), id=entry_id,
+            parent_id=parent_id, timestamp=timestamp,
+        )
+    if etype == "plan_run":
+        status = d.get("status", "started")
+        if status not in {"started", "completed", "failed", "aborted"}:
+            raise ValueError(f"Invalid plan run status: {status!r}")
+        return PlanRunEntry(
+            plan_id=str(d.get("planId", "")), revision=int(d.get("revision", 0) or 0),
+            digest=str(d.get("digest", "")), status=status,
+            run_id=d.get("runId"), error=d.get("error"), id=entry_id,
+            parent_id=parent_id, timestamp=timestamp,
+        )
     raise ValueError(f"Unknown entry type in session file: {etype!r}")
 
 
@@ -249,6 +357,27 @@ def write_header_line(path: Path, header: SessionHeader) -> None:
     with open(path, "x", encoding="utf-8") as f:
         f.write(json.dumps(header_to_dict(header), ensure_ascii=False))
         f.write("\n")
+
+
+def rewrite_header_line(path: Path, header: SessionHeader) -> None:
+    """Atomically replace only the JSONL header while preserving entry bytes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "rb") as source:
+        source.readline()
+        remainder = source.read()
+    fd, raw_temp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temp_path = Path(raw_temp)
+    try:
+        with os.fdopen(fd, "wb") as target:
+            target.write(json.dumps(header_to_dict(header), ensure_ascii=False).encode("utf-8"))
+            target.write(b"\n")
+            target.write(remainder)
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
 
 
 def append_entry_line(path: Path, entry: SessionEntry) -> None:

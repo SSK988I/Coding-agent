@@ -12,6 +12,7 @@ Two distinct IDs:
 from __future__ import annotations
 
 import os
+import hashlib
 import random
 import re
 import threading
@@ -22,6 +23,7 @@ __all__ = [
     "create_session_id",
     "generate_entry_id",
     "encode_cwd",
+    "encode_cwd_legacy",
     "is_valid_session_id",
 ]
 
@@ -102,6 +104,17 @@ def encode_cwd(cwd: str) -> str:
     """
     resolved = os.path.normpath(cwd)
     # Strip one leading path separator before replacing reserved characters.
+    stripped = re.sub(r"^[/\\]", "", resolved)
+    safe = re.sub(r"[/\\:]", "-", stripped)
+    if len(safe) > 64:
+        digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:16]
+        safe = f"{safe[:40]}-{digest}"
+    return f"--{safe}--"
+
+
+def encode_cwd_legacy(cwd: str) -> str:
+    """Return the pre-hash directory name so long-path sessions stay discoverable."""
+    resolved = os.path.normpath(cwd)
     stripped = re.sub(r"^[/\\]", "", resolved)
     safe = re.sub(r"[/\\:]", "-", stripped)
     return f"--{safe}--"

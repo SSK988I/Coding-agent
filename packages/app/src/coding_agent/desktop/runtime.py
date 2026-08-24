@@ -4,8 +4,6 @@ from __future__ import annotations
 import asyncio
 import os
 from pathlib import Path
-import re
-import shlex
 import time
 from typing import Any, Awaitable, Callable, cast
 import uuid
@@ -20,23 +18,13 @@ from coding_agent.core.context_files import load_project_context_files
 from coding_agent.core.credentials import CredentialStore
 from coding_agent.core.providers import _all_providers, get_configured_models
 from coding_agent.core.retry import RetryPolicy
+from coding_agent.core.plan_mode import PlanModeError, is_plan_safe_shell_command
 from coding_agent.core.settings import SettingsManager
 from coding_agent.core.slash_commands import get_active_commands
 from coding_agent.desktop.protocol import PROTOCOL_VERSION, RpcError, to_jsonable
 
 EventEmitter = Callable[[dict[str, Any]], None]
 _APPROVAL_TOOLS = {"bash", "write", "edit"}
-_READ_ONLY_COMMANDS = {
-    "cat", "du", "file", "find", "grep", "head", "ls", "pwd", "rg",
-    "stat", "tail", "wc",
-}
-_READ_ONLY_GIT_SUBCOMMANDS = {
-    "diff", "grep", "log", "ls-files", "rev-parse", "show", "status",
-}
-_DANGEROUS_FIND_FLAGS = {
-    "-delete", "-exec", "-execdir", "-fls", "-fprint", "-fprintf", "-ok", "-okdir",
-}
-_SHELL_SPLIT_RE = re.compile(r"\s*(?:&&|\|)\s*")
 _DESKTOP_COMMANDS = {
     "help": ("帮助", "查看桌面端可用命令"),
     "new": ("新会话", "创建一个新的会话"),
@@ -44,6 +32,9 @@ _DESKTOP_COMMANDS = {
     "compact": ("压缩上下文", "立即压缩较早的会话内容"),
     "clear": ("清空对话", "清空当前窗口和 Agent 上下文"),
     "session": ("会话状态", "查看当前会话统计信息"),
+    "plan": ("计划模式", "进入 Plan Mode"),
+    "cancel-plan": ("取消规划", "退出 Plan Mode，不执行计划"),
+    "execute-plan": ("执行计划", "执行最新的 Plan revision"),
 }
 
 
@@ -78,6 +69,10 @@ class DesktopRuntime:
             "run.steer": self._run_steer,
             "run.followUp": self._run_follow_up,
             "approval.resolve": self._approval_resolve,
+            "mode.enterPlan": self._mode_enter_plan,
+            "plan.answer": self._plan_answer,
+            "plan.cancel": self._plan_cancel,
+            "plan.execute": self._plan_execute,
             "session.compact": self._session_compact,
             "runtime.dispose": self._dispose_command,
         }
@@ -88,7 +83,10 @@ class DesktopRuntime:
 
     async def _ping(self, params: dict[str, Any]) -> dict[str, Any]:
         del params
-        return {"protocolVersion": PROTOCOL_VERSION, "status": "ready"}
+        return {
+            "protocolVersion": PROTOCOL_VERSION, "status": "ready",
+            "capabilities": ["plan_mode_v1"],
+        }
 
     async def _workspace_open(self, params: dict[str, Any]) -> dict[str, Any]:
         raw_path = params.get("path")
@@ -176,6 +174,7 @@ class DesktopRuntime:
             ),
             settings_manager=settings_manager,
             theme_name=settings.theme,
+            question_behavior="interactive",
         )
         self._workspace = workspace
         self._session = AgentSession(config)
@@ -319,6 +318,110 @@ class DesktopRuntime:
         self._run_task = asyncio.create_task(self._drive_run(session, text, run_id))
         return {"accepted": True, "runId": run_id}
 
+    async def _mode_enter_plan(self, params: dict[str, Any]) -> dict[str, Any]:
+        del params
+        self._ensure_no_active_run("任务运行时不能切换协作模式")
+        try:
+            self._require_session().enter_plan_mode()
+        except PlanModeError as exc:
+            raise RpcError(exc.code, str(exc)) from exc
+        return self._workspace_payload()
+
+    async def _plan_answer(self, params: dict[str, Any]) -> dict[str, Any]:
+        question_id = params.get("questionId")
+        answer = params.get("answer")
+        if not isinstance(question_id, str) or not isinstance(answer, str):
+            raise RpcError("INVALID_PARAMS", "plan.answer 需要 questionId 和 answer")
+        session = self._require_session()
+        try:
+            if self._run_task is not None and not self._run_task.done():
+                await session.answer_plan_question(question_id, answer)
+                return self._workspace_payload()
+            run_id = uuid.uuid4().hex
+            self._run_id = run_id
+            self._run_task = asyncio.create_task(
+                self._drive_plan_answer(session, question_id, answer, run_id)
+            )
+            return {"accepted": True, "runId": run_id}
+        except PlanModeError as exc:
+            raise RpcError(exc.code, str(exc)) from exc
+
+    async def _drive_plan_answer(
+        self, session: AgentSession, question_id: str, answer: str, run_id: str,
+    ) -> None:
+        self._publish("run.started", {"planAnswer": True}, run_id=run_id)
+        try:
+            await session.answer_plan_question(question_id, answer)
+        except PlanModeError as exc:
+            self._publish("run.failed", {"code": exc.code, "message": str(exc)}, run_id=run_id)
+        except Exception as exc:  # noqa: BLE001 - runtime boundary
+            self._publish("run.failed", {"message": str(exc)}, run_id=run_id)
+        else:
+            self._publish("run.completed", {"stats": to_jsonable(session.get_stats())}, run_id=run_id)
+        finally:
+            if self._run_id == run_id:
+                self._run_id = None
+                self._run_task = None
+
+    async def _plan_cancel(self, params: dict[str, Any]) -> dict[str, Any]:
+        self._ensure_no_active_run("任务运行时不能取消规划")
+        plan_id = params.get("planId")
+        if not isinstance(plan_id, str) or not plan_id:
+            raise RpcError("INVALID_PARAMS", "plan.cancel 需要 planId")
+        try:
+            self._require_session().cancel_plan_mode(plan_id)
+        except PlanModeError as exc:
+            raise RpcError(exc.code, str(exc)) from exc
+        return self._workspace_payload()
+
+    async def _plan_execute(self, params: dict[str, Any]) -> dict[str, Any]:
+        self._ensure_no_active_run("任务运行时不能重复执行计划")
+        plan_id = params.get("planId")
+        revision = params.get("revision")
+        digest = params.get("digest")
+        if (
+            not isinstance(plan_id, str) or not isinstance(revision, int)
+            or not isinstance(digest, str)
+        ):
+            raise RpcError("INVALID_PARAMS", "plan.execute 需要 planId、revision 和 digest")
+        session = self._require_session()
+        latest = session.plan_state.latest_revision
+        if session.collaboration_mode != "plan" or session.plan_state.phase != "ready" or latest is None:
+            raise RpcError("PLAN_NOT_READY", "当前没有可执行的计划")
+        if plan_id != latest.plan_id or revision != latest.revision or digest != latest.digest:
+            raise RpcError("STALE_PLAN_REVISION", "只能执行最新的 Plan revision")
+        run_id = uuid.uuid4().hex
+        self._run_id = run_id
+        self._run_task = asyncio.create_task(
+            self._drive_plan_execution(session, plan_id, revision, digest, run_id)
+        )
+        return {"accepted": True, "runId": run_id}
+
+    async def _drive_plan_execution(
+        self, session: AgentSession, plan_id: str, revision: int,
+        digest: str, run_id: str,
+    ) -> None:
+        self._publish("run.started", {"planExecution": True}, run_id=run_id)
+        try:
+            await session.execute_plan(plan_id, revision, digest, run_id=run_id)
+        except PlanModeError as exc:
+            self._publish("run.failed", {"code": exc.code, "message": str(exc)}, run_id=run_id)
+        except asyncio.CancelledError:
+            self._publish("run.cancelled", {}, run_id=run_id)
+        except Exception as exc:  # noqa: BLE001 - runtime boundary
+            self._publish("run.failed", {"message": str(exc)}, run_id=run_id)
+        else:
+            if session.plan_state.phase == "aborted":
+                self._publish("run.cancelled", {}, run_id=run_id)
+            elif session.plan_state.phase == "failed":
+                self._publish("run.failed", {"message": "计划执行失败"}, run_id=run_id)
+            else:
+                self._publish("run.completed", {"stats": to_jsonable(session.get_stats())}, run_id=run_id)
+        finally:
+            if self._run_id == run_id:
+                self._run_id = None
+                self._run_task = None
+
     async def _drive_run(self, session: AgentSession, text: str, run_id: str) -> None:
         self._publish("run.started", {"text": text}, run_id=run_id)
         try:
@@ -368,8 +471,9 @@ class DesktopRuntime:
     ) -> BeforeToolCallResult | None:
         if context.tool_call.name not in _APPROVAL_TOOLS:
             return None
-        if context.tool_call.name == "bash" and _is_read_only_bash_command(
+        if context.tool_call.name == "bash" and is_plan_safe_shell_command(
             str(context.args.get("command", "")),
+            str(self._workspace or Path.cwd()),
         ):
             return None
         approval_id = uuid.uuid4().hex
@@ -419,7 +523,14 @@ class DesktopRuntime:
 
     async def _session_compact(self, params: dict[str, Any]) -> dict[str, Any]:
         del params
-        return await self._require_session().compact("manual")
+        self._ensure_no_active_run("任务运行时不能手动压缩上下文")
+        result = await self._require_session().compact("manual")
+        if result.get("performed"):
+            # Rehydrate the renderer from the same persisted context it will see
+            # after a session switch. This replaces the transient progress card
+            # with the durable compactionSummary record immediately.
+            self._publish("session.changed", self._workspace_payload())
+        return result
 
     async def _dispose_command(self, params: dict[str, Any]) -> dict[str, Any]:
         del params
@@ -504,7 +615,13 @@ class DesktopRuntime:
             "thinkingLevel": session.thinking_level,
             "tools": [tool.name for tool in session.tools],
             "messages": to_jsonable(session.state.messages),
+            "collaborationMode": session.collaboration_mode,
+            "planState": session.plan_state.to_payload(),
         }
+
+    def _ensure_no_active_run(self, message: str) -> None:
+        if self._run_task is not None and not self._run_task.done():
+            raise RpcError("RUN_IN_PROGRESS", message)
 
     def _require_workspace(self) -> Path:
         if self._workspace is None:
@@ -518,69 +635,5 @@ class DesktopRuntime:
 
 
 def _is_read_only_bash_command(command: str) -> bool:
-    """Conservatively recognize shell pipelines that cannot mutate state.
-
-    This is intentionally an allowlist, not a complete shell parser. Anything
-    involving redirection, substitution, alternate control flow, absolute
-    paths, parent traversal, or an unknown executable still requires approval.
-    """
-    command = command.strip()
-    if not command or any(
-        token in command
-        for token in (";", "||", "`", "$(", ">", "<", "\n", "\r")
-    ):
-        return False
-    if re.search(r"(?:^|\s)\.\.(?:[\\/]|(?:\s|$))", command):
-        return False
-
-    segments = _SHELL_SPLIT_RE.split(command)
-    if not segments or any(not segment.strip() for segment in segments):
-        return False
-
-    for segment in segments:
-        try:
-            tokens = shlex.split(segment, posix=True)
-        except ValueError:
-            return False
-        if not tokens:
-            return False
-        executable = tokens[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
-        if executable.endswith(".exe"):
-            executable = executable[:-4]
-
-        if executable == "cd":
-            if len(tokens) != 2 or not _is_workspace_relative_token(tokens[1]):
-                return False
-            continue
-        if executable == "git":
-            if len(tokens) < 2 or tokens[1].lower() not in _READ_ONLY_GIT_SUBCOMMANDS:
-                return False
-            if any(
-                token in {"-c", "-o", "--paginate"}
-                or token.startswith(("--exec-path", "--output", "--open-files-in-pager"))
-                for token in tokens[2:]
-            ):
-                return False
-        elif executable not in _READ_ONLY_COMMANDS:
-            return False
-
-        if executable == "find" and any(token.lower() in _DANGEROUS_FIND_FLAGS for token in tokens[1:]):
-            return False
-        if executable == "rg" and any(token == "--pre" or token.startswith("--pre=") for token in tokens[1:]):
-            return False
-        if any(not _is_workspace_relative_token(token) for token in tokens[1:] if _looks_like_path(token)):
-            return False
-    return True
-
-
-def _looks_like_path(token: str) -> bool:
-    if token.startswith("-"):
-        return False
-    return "/" in token or "\\" in token or token in {".", ".."} or bool(re.match(r"^[A-Za-z]:", token))
-
-
-def _is_workspace_relative_token(token: str) -> bool:
-    normalized = token.replace("\\", "/")
-    if normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized):
-        return False
-    return ".." not in normalized.split("/")
+    """Compatibility alias for the shared Plan/safe-shell classifier."""
+    return is_plan_safe_shell_command(command, os.getcwd())

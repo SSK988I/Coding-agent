@@ -46,6 +46,7 @@ class WelcomeComponent(Component):
         if card_width >= self._WIDE_LAYOUT_WIDTH:
             metadata = (
                 f"MODEL  {self._model_id()}   "
+                f"MODE  {self._mode()}   "
                 f"THINKING  {self._thinking_level()}   "
                 f"TOOLS  {self._tool_count()}"
             )
@@ -53,7 +54,8 @@ class WelcomeComponent(Component):
         else:
             lines.append(
                 self._content_line(
-                    f"MODEL     {self._model_id()}", inner_width, self._style_metadata
+                    f"MODEL     {self._model_id()}   MODE  {self._mode()}",
+                    inner_width, self._style_metadata
                 )
             )
             lines.append(
@@ -72,7 +74,14 @@ class WelcomeComponent(Component):
         )
         lines.append(
             self._content_line(
-                "/help 命令  ·  /model 模型  ·  ! shell  ·  Esc 中断",
+                "/help 命令  ·  /model 模型  ·  Esc 中断",
+                inner_width,
+                self._style_shortcuts,
+            )
+        )
+        lines.append(
+            self._content_line(
+                "/plan 计划  ·  Shift+Tab 模式  ·  Alt+T 思考",
                 inner_width,
                 self._style_shortcuts,
             )
@@ -92,7 +101,7 @@ class WelcomeComponent(Component):
             self._theme.fg("text", "理解代码 · 修改项目 · 运行验证"),
             self._theme.fg("dim", metadata),
             self._style_primary_hint("输入任务并按 Enter 发送"),
-            self._style_shortcuts("/help · /model · ! shell"),
+            self._style_shortcuts("/help · /plan · Shift+Tab"),
             "",
         ]
         return [self._fit(line, width) for line in raw_lines]
@@ -122,7 +131,7 @@ class WelcomeComponent(Component):
         return f"{border} {content} {border}"
 
     def _style_metadata(self, text: str) -> str:
-        for label in ("MODEL", "THINKING", "TOOLS"):
+        for label in ("MODEL", "MODE", "THINKING", "TOOLS"):
             text = text.replace(label, self._theme.fg("muted", label))
         return text
 
@@ -130,7 +139,7 @@ class WelcomeComponent(Component):
         return text.replace("Enter", self._theme.bold(self._theme.fg("accent", "Enter")))
 
     def _style_shortcuts(self, text: str) -> str:
-        shortcuts = ("/help", "/model", "! shell", "Esc")
+        shortcuts = ("/help", "/model", "/plan", "Shift+Tab", "Alt+T", "! shell", "Esc")
         parts: list[str] = []
         remaining = text
         while remaining:
@@ -162,6 +171,9 @@ class WelcomeComponent(Component):
 
     def _thinking_level(self) -> str:
         return str(getattr(self._session, "thinking_level", None) or "off")
+
+    def _mode(self) -> str:
+        return str(getattr(self._session, "collaboration_mode", "default"))
 
     def _tool_count(self) -> int:
         return len(getattr(self._session, "tools", None) or [])

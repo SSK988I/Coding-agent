@@ -38,6 +38,12 @@ from coding_agent.core.agent_session import AgentSession
 from coding_agent.core.config import get_auth_path, VERSION
 from coding_agent.core.credentials import CredentialStore
 from coding_agent.core.retry import RetryPolicy
+from coding_agent.core.plan_mode import (
+    PlanModeError,
+    PlanQuestion,
+    PlanQuestionOption,
+    PlanRevision,
+)
 from coding_agent.core.slash_commands import (
     BUILTIN_SLASH_COMMANDS,
     BuiltinSlashCommand,
@@ -53,6 +59,8 @@ from coding_agent.modes.interactive.components.login_dialog import (
 from coding_agent.modes.interactive.components.model_selector import (
     ModelSelectorComponent,
 )
+from coding_agent.modes.interactive.components.plan_actions import PlanActionsComponent
+from coding_agent.modes.interactive.components.plan_question import PlanQuestionComponent
 from coding_agent.modes.interactive.components.status_indicator import (
     StatusIndicator,
     WorkingStatusIndicator,
@@ -188,7 +196,7 @@ class InteractiveMode:
         Command-name prefix matching only (``/`` → list commands, ``/th`` →
         filter). Per-command argument completion is NOT wired here:
         ``/model`` uses an inline selector (see :meth:`_open_model_selector`)
-        and ``/thinking`` was removed in favor of the Shift+Tab hotkey.
+        and ``/thinking`` was removed in favor of the Alt+T hotkey.
 
         Prompt templates (``/tplname args``) and skill invocations
         (``/skill:name``) are appended so they appear in completion and are
@@ -410,6 +418,21 @@ class InteractiveMode:
                 float(event.get("delay", 0)),
                 self.theme,
             ))
+        elif etype == "plan_question_requested":
+            self._open_plan_question(event)
+        elif etype == "plan_ready":
+            self._show_plan_ready(event)
+        elif etype == "plan_validation_failed":
+            self._add_system_message(
+                f"Plan 校验失败 [{event.get('code', 'INVALID_PLAN_SPEC')}]："
+                f"{event.get('message', '')}"
+            )
+        elif etype in {
+            "collaboration_mode_changed", "plan_execution_started",
+            "plan_execution_completed", "plan_execution_failed", "plan_execution_aborted",
+        }:
+            self._refresh_footer()
+            self._update_editor_border_color()
 
     # 16 ms matches the TUI render interval. Duplicated as a
     # literal to avoid a cross-package import for one constant; the value is
@@ -490,6 +513,8 @@ class InteractiveMode:
         # Surface tool-call blocks that are not tracked yet.
         for block in getattr(msg, "content", []) or []:
             if getattr(block, "type", None) == "toolCall":
+                if getattr(block, "name", "") == "request_user_input":
+                    continue
                 tc_id = getattr(block, "id", "") or ""
                 if tc_id and tc_id not in self._pending_tools:
                     card = ToolExecutionComponent(
@@ -526,6 +551,8 @@ class InteractiveMode:
 
     def _handle_tool_start(self, event: dict) -> None:
         """Create (or reuse) a tool card when tool execution begins."""
+        if event.get("tool_name") == "request_user_input":
+            return
         tc_id = event.get("tool_call_id", "")
         card = self._pending_tools.get(tc_id)
         if card is None:
@@ -541,6 +568,8 @@ class InteractiveMode:
 
     def _handle_tool_end(self, event: dict) -> None:
         """Update the tool card with the execution result."""
+        if event.get("tool_name") == "request_user_input":
+            return
         tc_id = event.get("tool_call_id", "")
         card = self._pending_tools.get(tc_id)
         if card is not None:
@@ -647,11 +676,11 @@ class InteractiveMode:
 
         cmd = next((c for c in BUILTIN_SLASH_COMMANDS if c.name == cmd_name), None)
         if cmd is None or not cmd.active:
-            # /thinking was removed in favor of the Shift+Tab hotkey — point
+            # /thinking was removed in favor of the Alt+T hotkey — point
             # users at the new path instead of reporting "unknown command".
             if cmd_name == "thinking":
                 self._add_system_message(
-                    "`/thinking` 已改为快捷键：按 **Shift+Tab** 循环切换思考级别。"
+                    "`/thinking` 已改为快捷键：按 **Alt+T** 循环切换思考级别。"
                 )
                 return True
             return False
@@ -676,6 +705,12 @@ class InteractiveMode:
             self._cmd_name(" ".join(parts[1:]) if len(parts) > 1 else "")
         elif cmd_name == "new":
             self._cmd_new()
+        elif cmd_name == "plan":
+            self._cmd_plan()
+        elif cmd_name == "cancel-plan":
+            self._cancel_plan()
+        elif cmd_name == "execute-plan":
+            await self._execute_latest_plan()
         elif cmd_name == "tree":
             self._cmd_tree()
         elif cmd_name == "export":
@@ -754,6 +789,16 @@ class InteractiveMode:
         self._tool_cards.clear()
         self._print_welcome()
         self._add_system_message("对话已清空。")
+
+    def _cmd_plan(self) -> None:
+        try:
+            self._session.enter_plan_mode()
+        except PlanModeError as exc:
+            self._add_system_message(f"切换失败 [{exc.code}]：{exc}")
+            return
+        self._refresh_footer()
+        self._update_editor_border_color()
+        self._add_system_message("已进入计划模式。")
 
     async def _cmd_compact(self) -> None:
         self._add_system_message("正在压缩上下文…")
@@ -943,7 +988,10 @@ class InteractiveMode:
             sm.set_leaf_id(entry_id)
             ctx = sm.build_session_context()
             self._session.agent.load_messages(ctx.messages)
+            self._session.refresh_plan_state_from_branch()
             self._rebuild_chat_from_messages()
+            self._refresh_footer()
+            self._update_editor_border_color()
             self._add_system_message("已切换到所选分支。")
         finally:
             self._restore_editor()
@@ -988,7 +1036,119 @@ class InteractiveMode:
         self.tui.set_focus(self.editor)
         self.tui.request_render()
 
-    # ── Thinking-level cycle (Shift+Tab) ───────────────────────────────────
+    def _open_plan_question(self, event: dict) -> None:
+        raw = event.get("question") or {}
+        try:
+            question = PlanQuestion(
+                question_id=str(raw["questionId"]),
+                header=str(raw["header"]), question=str(raw["question"]),
+                options=tuple(
+                    PlanQuestionOption(
+                        label=str(option["label"]),
+                        description=str(option["description"]),
+                    )
+                    for option in raw.get("options", [])
+                ),
+                allow_custom=bool(raw.get("allowCustom", True)),
+            )
+        except (KeyError, TypeError):
+            self._add_system_message("收到无效的 Plan 问题事件。")
+            return
+
+        def on_answer(answer: str) -> None:
+            self._restore_editor()
+            self._spawn(self._answer_plan_question(question.question_id, answer))
+
+        def on_cancel() -> None:
+            self._restore_editor()
+            self._spawn(self._session.abort())
+            self._add_system_message("已停止当前运行；Plan 问题已保留，可恢复后继续回答。")
+
+        self._swap_editor_for(
+            PlanQuestionComponent(self.theme, question, on_answer, on_cancel)
+        )
+
+    async def _answer_plan_question(self, question_id: str, answer: str) -> None:
+        try:
+            await self._session.answer_plan_question(question_id, answer)
+        except PlanModeError as exc:
+            self._add_system_message(f"回答失败 [{exc.code}]：{exc}")
+
+    def _show_plan_ready(self, event: dict) -> None:
+        raw = event.get("plan") or {}
+        try:
+            plan = PlanRevision(
+                plan_id=str(raw["planId"]), revision=int(raw["revision"]),
+                title=str(raw["title"]), markdown=str(raw["markdown"]),
+                digest=str(raw["digest"]),
+                source_message_id=str(raw.get("sourceMessageId", "")),
+            )
+        except (KeyError, TypeError, ValueError):
+            self._add_system_message("收到无效的 Plan revision 事件。")
+            return
+        self._add_assistant_text(
+            f"**PLAN · revision {plan.revision} · `{plan.digest[:12]}`**\n\n{plan.markdown}"
+        )
+
+        def on_action(action: str) -> None:
+            self._restore_editor()
+            if action == "supplement":
+                self._add_system_message("请补充你的想法或修改要求；当前方案不会自动执行。")
+            elif action == "cancel":
+                self._cancel_plan()
+            elif action == "execute":
+                self._spawn(self._execute_latest_plan())
+
+        self._swap_editor_for(
+            PlanActionsComponent(self.theme, plan, on_action, self._restore_editor)
+        )
+
+    def _cancel_plan(self) -> None:
+        try:
+            self._session.cancel_plan_mode(self._session.plan_state.active_plan_id)
+        except PlanModeError as exc:
+            self._add_system_message(f"取消失败 [{exc.code}]：{exc}")
+            return
+        self._refresh_footer()
+        self._update_editor_border_color()
+        self._add_system_message("已取消规划，未执行计划。")
+
+    async def _execute_latest_plan(self) -> None:
+        latest = self._session.plan_state.latest_revision
+        if latest is None:
+            self._add_system_message("当前没有可执行的 Plan revision。")
+            return
+        if self._is_responding:
+            self._add_system_message("任务运行中，请先按 Esc 停止。")
+            return
+        self._is_responding = True
+        self.editor.disable_submit = True
+        unsub = self._session.on_event(self._on_agent_event)
+        try:
+            await self._session.execute_plan(
+                latest.plan_id, latest.revision, latest.digest,
+            )
+        except PlanModeError as exc:
+            self._add_system_message(f"执行失败 [{exc.code}]：{exc}")
+        except Exception as exc:
+            self._add_system_message(f"执行失败：{exc}")
+        finally:
+            unsub()
+            self._is_responding = False
+            self.editor.disable_submit = False
+            self._refresh_footer()
+            self._update_editor_border_color()
+
+    # ── Collaboration / thinking cycles ────────────────────────────────────
+
+    def _cycle_collaboration_mode(self) -> None:
+        if self._is_responding:
+            self._add_system_message("任务运行中，请先按 Esc 停止。")
+            return
+        if self._session.collaboration_mode == "default":
+            self._cmd_plan()
+        else:
+            self._cancel_plan()
 
     def _cycle_thinking(self) -> None:
         """Advance to the next thinking level the current model supports."""
@@ -1492,6 +1652,8 @@ class InteractiveMode:
 
     def _border_color_fn(self) -> "Callable[[str], str]":
         """The border-color closure for the current thinking level."""
+        if self._session.collaboration_mode == "plan":
+            return lambda s: self.theme.fg("warning", s)
         level = self._session.thinking_level or "off"
         token = self._THINKING_COLOR_TOKEN.get(level, "thinkingOff")
         return lambda s: self.theme.fg(token, s)
@@ -1563,8 +1725,8 @@ class InteractiveMode:
              within 500ms quits.
           2. Ctrl+D (app.exit): on an empty editor, exits immediately; on a
              non-empty editor, falls through so the editor forward-deletes.
-          3. Shift+Tab (app.thinking.cycle): cycles thinking level when no
-             selector is open.
+          3. Shift+Tab / Alt+M (app.mode.cycle): cycles collaboration mode.
+          4. Alt+T (app.thinking.cycle): cycles thinking level.
         """
         from coding_agent.core.keybindings import get_keybinding
 
@@ -1605,9 +1767,22 @@ class InteractiveMode:
 
         self.tui.add_input_listener(on_exit)
 
-        # ── 3. Shift+Tab: cycle thinking level ──────────────────────────
+        # ── 3. Shift+Tab / Alt+M: cycle collaboration mode ──────────────
         # Only active when no selector is open (otherwise the selector owns
         # nav keys).
+        mode_keys = get_keybinding("app.mode.cycle")
+
+        def on_mode_cycle(data: str) -> dict | None:
+            if getattr(self, "_current_selector", None) is not None:
+                return None
+            if mode_keys and matches_key(data, mode_keys):  # type: ignore[arg-type]
+                self._cycle_collaboration_mode()
+                return {"consume": True}
+            return None
+
+        self.tui.add_input_listener(on_mode_cycle)
+
+        # ── 4. Alt+T: cycle thinking level ───────────────────────────────
         cycle_keys = get_keybinding("app.thinking.cycle")
 
         def on_thinking_cycle(data: str) -> dict | None:

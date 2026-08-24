@@ -88,6 +88,7 @@ class BashTool:
     """
 
     name: str = "bash"
+    effect: str = "shell"
     label: str = "bash"
     description: str = (
         f"Execute a bash command in the current working directory. Returns "

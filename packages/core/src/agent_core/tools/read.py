@@ -46,6 +46,7 @@ class ReadTool:
     """
 
     name: str = "read"
+    effect: str = "read"
     label: str = "read"
     description: str = "Read the contents of a file."
     parameters: dict = READ_SCHEMA

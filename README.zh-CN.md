@@ -18,6 +18,7 @@ Coding Agent 是一个面向本地开发工作的编程 Agent。项目以 Python
 - **项目上下文**：支持发现 `AGENTS.md`、`CLAUDE.md`、Skills 和提示词模板。
 - **终端界面**：支持 Markdown、流式内容、工具卡片、模型选择和按行差分渲染。
 - **桌面端 MVP**：支持项目选择、会话列表、流式消息、工具审批、模型切换和斜杠命令面板。
+- **跨端 Plan Mode**：CLI 与桌面端共享只读探索、结构化问题、不可变计划 revision 和显式执行确认。
 
 ## 界面形态
 
@@ -36,7 +37,7 @@ Coding Agent 是一个面向本地开发工作的编程 Agent。项目以 Python
 - 展示工具调用状态和执行结果
 - 对 `bash`、`write`、`edit` 请求执行确认
 - 输入 `/` 打开命令面板
-- `/help`、`/new`、`/model`、`/compact`、`/clear`、`/session`
+- `/help`、`/new`、`/model`、`/compact`、`/clear`、`/session`、`/plan`、`/cancel-plan`、`/execute-plan`
 
 ## 环境要求
 
@@ -152,6 +153,21 @@ uv run coding-agent --session <路径或会话ID>
 uv run coding-agent --no-session
 ```
 
+### Plan Mode
+
+交互模式可通过 `/plan`、`Shift+Tab` 或 `Alt+M` 进入 Plan Mode。再次按 `Shift+Tab`/`Alt+M` 只会取消规划，不会执行计划。思考级别循环迁移到 `Alt+T`；`Ctrl+T` 仍只展开或折叠 thinking block。
+
+非交互模式使用可恢复控制参数：
+
+```powershell
+uv run coding-agent --agent-mode plan -p "规划这项改动"
+uv run coding-agent --session <会话ID> --answer-plan-question <问题ID> "回答"
+uv run coding-agent --session <会话ID> --execute-plan <revision>
+uv run coding-agent --session <会话ID> --cancel-plan
+```
+
+Plan State 使用 JSONL v4 持久化，可由 CLI 或桌面端交叉恢复。revision 就绪后，交互端会要求选择“执行方案”或“补充想法”；补充内容会回到 drafting，且绝不会构成执行授权。完整约束见 [Plan Mode 规范](docs/specs/plan-mode.md)。
+
 ### 选择 Provider 和模型
 
 ```powershell
@@ -208,6 +224,7 @@ uv run coding-agent --provider zhipu --model glm-5v-turbo `
 | `/model` | 选择已配置 Provider 的模型 |
 | `/login`、`/logout` | 管理 Provider 凭据 |
 | `/new` | 创建新会话 |
+| `/plan`、`/cancel-plan`、`/execute-plan` | 进入、取消或显式执行 Plan Mode |
 | `/session` | 查看会话信息和统计数据 |
 | `/tree` | 查看并切换会话分支 |
 | `/compact` | 手动压缩上下文 |
