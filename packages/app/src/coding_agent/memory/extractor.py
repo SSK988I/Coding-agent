@@ -1,4 +1,4 @@
-"""LLM-backed extraction with strict application-side validation."""
+"""Isolated LLM pass that extracts evidence-backed atomic memories."""
 from __future__ import annotations
 
 import json
@@ -10,15 +10,15 @@ from agent_llm import Context, UserMessage
 from coding_agent.memory.prompts import EXTRACTION_SYSTEM_PROMPT
 from coding_agent.memory.types import (
     CompletedTask,
-    MemoryCandidate,
+    ExtractedMemory,
     MemoryEvidence,
     contains_sensitive_data,
     contains_sensitive_key,
+    validate_extracted_memory,
 )
 
-_KINDS = {"preference", "decision", "constraint", "convention"}
+_KINDS = {"preference", "decision", "constraint", "convention", "fact", "lesson"}
 _SCOPES = {"global", "project"}
-_OPERATIONS = {"upsert", "retract", "noop"}
 _SOURCE_KINDS = {
     "explicit_correction", "explicit_user", "accepted_plan", "inferred_user",
 }
@@ -41,7 +41,7 @@ def _text_from_message(message: Any) -> str:
     return "".join(chunks)
 
 
-def _parse_object(text: str) -> dict[str, Any]:
+def _parse_object(text: str, *, label: str = "extractor") -> dict[str, Any]:
     value = text.strip()
     if value.startswith("```"):
         lines = value.splitlines()
@@ -51,14 +51,11 @@ def _parse_object(text: str) -> dict[str, Any]:
             lines = lines[:-1]
         value = "\n".join(lines).strip()
     try:
-        payload = json.loads(
-            value,
-            parse_constant=_reject_json_constant,
-        )
+        payload = json.loads(value, parse_constant=_reject_json_constant)
     except (json.JSONDecodeError, ValueError) as exc:
-        raise MemoryExtractionError(f"invalid extractor JSON: {exc}") from exc
+        raise MemoryExtractionError(f"invalid {label} JSON: {exc}") from exc
     if not isinstance(payload, dict):
-        raise MemoryExtractionError("extractor JSON root must be an object")
+        raise MemoryExtractionError(f"{label} JSON root must be an object")
     return payload
 
 
@@ -71,54 +68,49 @@ def validate_extraction_payload(
     task: CompletedTask,
     *,
     max_candidates: int = 8,
-) -> list[MemoryCandidate]:
-    if set(payload) != {"operations"}:
-        raise MemoryExtractionError("extractor root must contain only operations")
-    operations = payload.get("operations")
-    if not isinstance(operations, list):
-        raise MemoryExtractionError("operations must be an array")
-    if len(operations) > max_candidates:
-        raise MemoryExtractionError(f"too many memory candidates: {len(operations)}")
+) -> list[ExtractedMemory]:
+    if set(payload) != {"memories"}:
+        raise MemoryExtractionError("extractor root must contain only memories")
+    memories = payload.get("memories")
+    if not isinstance(memories, list):
+        raise MemoryExtractionError("memories must be an array")
+    if len(memories) > max_candidates:
+        raise MemoryExtractionError(f"too many extracted memories: {len(memories)}")
 
     evidence_by_id = {item.id: item for item in task.evidence}
-    result: list[MemoryCandidate] = []
     required = {
-        "operation", "kind", "scope", "key", "value", "summary",
-        "confidence", "sourceKind", "evidenceEntryIds",
+        "kind", "scope", "content", "value", "relationKey", "confidence",
+        "sourceKind", "evidenceEntryIds",
     }
-    for index, raw in enumerate(operations):
+    result: list[ExtractedMemory] = []
+    for index, raw in enumerate(memories):
         if not isinstance(raw, dict) or set(raw) != required:
-            raise MemoryExtractionError(f"operation {index} has invalid fields")
-        operation = raw["operation"]
-        if operation not in _OPERATIONS:
-            raise MemoryExtractionError(f"operation {index} has invalid operation")
-        if operation == "noop":
-            continue
+            raise MemoryExtractionError(f"memory {index} has invalid fields")
         kind = raw["kind"]
         scope = raw["scope"]
         source_kind = raw["sourceKind"]
         if kind not in _KINDS or scope not in _SCOPES or source_kind not in _SOURCE_KINDS:
-            raise MemoryExtractionError(f"operation {index} has invalid enum value")
-        if operation == "retract" and source_kind not in {"explicit_correction", "explicit_user"}:
-            raise MemoryExtractionError(
-                f"operation {index} cannot retract memory without direct user authority"
-            )
+            raise MemoryExtractionError(f"memory {index} has invalid enum value")
         if scope == "project" and not task.identity.project_id:
-            raise MemoryExtractionError(f"operation {index} uses project scope without project_id")
-        key = raw["key"]
-        summary = raw["summary"]
-        if not isinstance(key, str) or len(key) > 120 or not _KEY_RE.fullmatch(key):
-            raise MemoryExtractionError(f"operation {index} has invalid canonical key")
-        if contains_sensitive_key(key):
+            raise MemoryExtractionError(f"memory {index} uses project scope without project_id")
+        content = raw["content"]
+        if not isinstance(content, str) or not content.strip() or len(content) > 300:
+            raise MemoryExtractionError(f"memory {index} has invalid content")
+        relation_key = raw["relationKey"]
+        if relation_key is not None and (
+            not isinstance(relation_key, str)
+            or len(relation_key) > 120
+            or not _KEY_RE.fullmatch(relation_key)
+        ):
+            raise MemoryExtractionError(f"memory {index} has invalid relation key")
+        if relation_key is not None and contains_sensitive_key(relation_key):
             continue
-        if not isinstance(summary, str) or not summary.strip() or len(summary) > 300:
-            raise MemoryExtractionError(f"operation {index} has invalid summary")
         confidence = raw["confidence"]
         if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
-            raise MemoryExtractionError(f"operation {index} has invalid confidence")
+            raise MemoryExtractionError(f"memory {index} has invalid confidence")
         confidence = float(confidence)
         if not 0 <= confidence <= 1:
-            raise MemoryExtractionError(f"operation {index} confidence is out of range")
+            raise MemoryExtractionError(f"memory {index} confidence is out of range")
         if source_kind == "inferred_user" and confidence < 0.85:
             continue
         evidence_ids = raw["evidenceEntryIds"]
@@ -127,41 +119,43 @@ def validate_extraction_payload(
             or not 1 <= len(evidence_ids) <= 12
             or any(not isinstance(item, str) or item not in evidence_by_id for item in evidence_ids)
         ):
-            raise MemoryExtractionError(f"operation {index} has invalid evidence IDs")
+            raise MemoryExtractionError(f"memory {index} has invalid evidence IDs")
         selected = [evidence_by_id[item] for item in evidence_ids]
         if source_kind == "accepted_plan":
             if not any(item.source_kind in {"accepted_plan", "plan_completed"} for item in selected):
-                raise MemoryExtractionError(f"operation {index} claims unaccepted Plan evidence")
+                raise MemoryExtractionError(f"memory {index} claims unaccepted Plan evidence")
         elif any(item.source_kind != "user" for item in selected):
-            raise MemoryExtractionError(f"operation {index} must use user-authored evidence")
+            raise MemoryExtractionError(f"memory {index} must use user-authored evidence")
         value = raw["value"]
         try:
-            serialized = json.dumps(
-                value, ensure_ascii=False, sort_keys=True, allow_nan=False,
-            )
+            serialized = json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False)
         except (TypeError, ValueError) as exc:
-            raise MemoryExtractionError(f"operation {index} value is not JSON serializable") from exc
+            raise MemoryExtractionError(f"memory {index} value is not JSON serializable") from exc
         if len(serialized) > 2000:
-            raise MemoryExtractionError(f"operation {index} value is too large")
-        if contains_sensitive_data({"value": value, "summary": summary}):
+            raise MemoryExtractionError(f"memory {index} value is too large")
+        if contains_sensitive_data({"content": content, "value": value}):
             continue
-        result.append(MemoryCandidate(
-            operation=operation,
+        memory = ExtractedMemory(
             kind=kind,
             scope=scope,
-            key=key,
+            content=content.strip(),
             value=value,
-            summary=summary.strip(),
+            relation_key=relation_key,
             confidence=confidence,
             source_kind=source_kind,
             evidence_entry_ids=list(dict.fromkeys(evidence_ids)),
             source_timestamp=_latest_timestamp(selected) or task.ended_at,
-        ))
+        )
+        try:
+            validate_extracted_memory(memory)
+        except ValueError as exc:
+            raise MemoryExtractionError(f"memory {index} is invalid: {exc}") from exc
+        result.append(memory)
     return result
 
 
 class LLMMemoryExtractor:
-    """Use the session's current model and provider stream for extraction."""
+    """Run memory extraction with an isolated context and configurable model."""
 
     def __init__(
         self,
@@ -178,11 +172,9 @@ class LLMMemoryExtractor:
         self._get_reasoning = get_reasoning
         self.max_candidates = max_candidates
 
-    async def extract(self, task: CompletedTask) -> list[MemoryCandidate]:
+    async def extract(self, task: CompletedTask) -> list[ExtractedMemory]:
         selected_evidence = (
-            task.evidence
-            if len(task.evidence) <= 12
-            else [task.evidence[0], *task.evidence[-11:]]
+            task.evidence if len(task.evidence) <= 12 else [task.evidence[0], *task.evidence[-11:]]
         )
         evidence: list[dict[str, Any]] = []
         remaining_chars = 24_000
@@ -236,7 +228,5 @@ class LLMMemoryExtractor:
 
 
 __all__ = [
-    "LLMMemoryExtractor",
-    "MemoryExtractionError",
-    "validate_extraction_payload",
+    "LLMMemoryExtractor", "MemoryExtractionError", "validate_extraction_payload",
 ]

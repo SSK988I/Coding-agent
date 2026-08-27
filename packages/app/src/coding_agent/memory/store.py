@@ -38,6 +38,10 @@ class MemoryStoreError(RuntimeError):
     pass
 
 
+class StaleMemoryStoreWriteError(MemoryStoreError):
+    """Raised when a consolidation target changed before its write committed."""
+
+
 _EVENT_TYPES = {
     "candidate_rejected",
     "memory_created",
@@ -55,7 +59,7 @@ def _validate_event(event: dict[str, Any], path: Path, line_number: int) -> None
     event_type = event.get("type")
     revision = event.get("revision")
     schema_version = event.get("schema_version")
-    if isinstance(schema_version, bool) or schema_version != 1:
+    if isinstance(schema_version, bool) or schema_version not in {1, 2}:
         raise MemoryStoreError(f"unsupported memory event schema at {label}")
     if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
         raise MemoryStoreError(f"invalid memory event revision at {label}")
@@ -205,6 +209,7 @@ def _apply_event(snapshot: MemorySnapshot, event: dict[str, Any]) -> MemorySnaps
     source_hash = str(event.get("source_hash", ""))
     if source_hash and source_hash not in result.applied_source_hashes:
         result.applied_source_hashes.append(source_hash)
+    result.schema_version = max(result.schema_version, int(event.get("schema_version", 1)))
     result.revision = int(event.get("revision", result.revision))
     result.updated_at = str(event.get("timestamp", result.updated_at))
     result.content_hash = _canonical_hash(result)
@@ -227,8 +232,15 @@ class FileMemoryStore:
         candidate: MemoryCandidate,
         *,
         session_id: str,
+        expected_record_id: str | None = None,
     ) -> ApplyResult:
-        return await asyncio.to_thread(self._apply_with_lock, identity, candidate, session_id)
+        return await asyncio.to_thread(
+            self._apply_with_lock,
+            identity,
+            candidate,
+            session_id,
+            expected_record_id,
+        )
 
     async def forget(
         self,
@@ -302,6 +314,7 @@ class FileMemoryStore:
         identity: MemoryIdentity,
         candidate: MemoryCandidate,
         session_id: str,
+        expected_record_id: str | None,
     ) -> ApplyResult:
         validate_candidate(candidate, require_source_hash=True)
         if candidate.scope not in {"global", "project"}:
@@ -309,14 +322,29 @@ class FileMemoryStore:
         scope = candidate.scope
         paths = paths_for(identity, scope, root=self.root)
         with self._with_lock(paths):
+            # A crash can leave an incomplete final JSON object. Repair it
+            # while holding the same lock used by append, otherwise the next
+            # event would be joined to that fragment and corrupt the log.
+            self._repair_event_tail(paths.events)
             snapshot = self._load_locked(identity, scope, paths)
+            if expected_record_id is not None:
+                active = snapshot.memories.get(candidate.key)
+                conflict = snapshot.conflicts.get(candidate.key)
+                target_ids = {active.id} if active is not None else set()
+                if conflict is not None:
+                    target_ids.update(item.id for item in conflict.candidates)
+                if expected_record_id not in target_ids:
+                    raise StaleMemoryStoreWriteError(
+                        "memory consolidation target changed before apply: "
+                        f"{expected_record_id}"
+                    )
             resolution = resolve_candidate(snapshot, candidate, session_id=session_id)
             if resolution.event_type is None:
                 return resolution.result
             next_revision = snapshot.revision + 1
             timestamp = utc_now()
             event = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "revision": next_revision,
                 "type": resolution.event_type,
                 "timestamp": timestamp,
@@ -326,6 +354,7 @@ class FileMemoryStore:
             self._ensure_layout(paths)
             self._append_event(paths.events, event)
             updated = resolution.snapshot
+            updated.schema_version = 2
             updated.revision = next_revision
             updated.updated_at = timestamp
             updated.content_hash = _canonical_hash(updated)
@@ -344,8 +373,10 @@ class FileMemoryStore:
                 version = version_path.read_text(encoding="utf-8").strip()
             except OSError as exc:
                 raise MemoryStoreError(f"cannot read memory store version: {version_path}") from exc
-            if version != "1":
+            if version not in {"1", "2"}:
                 raise MemoryStoreError(f"unsupported memory store version: {version!r}")
+            if version == "1":
+                self._ensure_layout(paths)
         events = list(self._read_events(paths.events))
         snapshot: MemorySnapshot | None = None
         snapshot_existed = paths.snapshot.exists()
@@ -356,7 +387,7 @@ class FileMemoryStore:
                 if not isinstance(raw, dict):
                     raise ValueError("snapshot root must be a mapping")
                 candidate = MemorySnapshot.from_dict(raw)
-                if candidate.schema_version != 1:
+                if candidate.schema_version not in {1, 2}:
                     raise ValueError(f"unsupported memory schema: {candidate.schema_version}")
                 if candidate.user_id != identity.user_id or candidate.scope != scope:
                     raise ValueError("snapshot identity or scope mismatch")
@@ -393,6 +424,11 @@ class FileMemoryStore:
             )
             if valid_empty_snapshot:
                 assert snapshot is not None
+                if snapshot.schema_version == 1:
+                    snapshot.schema_version = 2
+                    snapshot.content_hash = _canonical_hash(snapshot)
+                    self._ensure_layout(paths)
+                    self._write_snapshot(paths.snapshot, snapshot)
                 return snapshot
             if snapshot is not None and not snapshot_invalid:
                 self._backup_corrupt(paths.snapshot)
@@ -409,6 +445,19 @@ class FileMemoryStore:
         ):
             return snapshot
 
+        if (
+            snapshot is not None
+            and snapshot.schema_version == 1
+            and snapshot.revision == authoritative.revision
+        ):
+            migrated = copy.deepcopy(snapshot)
+            migrated.schema_version = 2
+            migrated.content_hash = _canonical_hash(migrated)
+            if migrated.content_hash == authoritative.content_hash:
+                self._ensure_layout(paths)
+                self._write_snapshot(paths.snapshot, authoritative)
+                return authoritative
+
         if snapshot is not None and not snapshot_invalid:
             self._backup_corrupt(paths.snapshot)
         authoritative.content_hash = _canonical_hash(authoritative)
@@ -420,11 +469,18 @@ class FileMemoryStore:
         paths.directory.mkdir(parents=True, exist_ok=True)
         self.root.mkdir(parents=True, exist_ok=True)
         version_path = self.root / "version"
-        if not version_path.exists():
+        current_version = None
+        if version_path.exists():
+            current_version = version_path.read_text(encoding="utf-8").strip()
+            if current_version not in {"1", "2"}:
+                raise MemoryStoreError(
+                    f"unsupported memory store version: {current_version!r}"
+                )
+        if current_version != "2":
             temporary = version_path.with_name(
                 f".{version_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
             )
-            temporary.write_text("1\n", encoding="utf-8")
+            temporary.write_text("2\n", encoding="utf-8")
             os.replace(temporary, version_path)
         if sys.platform != "win32":
             for path in (self.root, paths.directory):
@@ -440,6 +496,45 @@ class FileMemoryStore:
         ) + "\n"
         with path.open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(line)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    @staticmethod
+    def _repair_event_tail(path: Path) -> None:
+        """Make the final JSONL record append-safe after an interrupted write.
+
+        A syntactically complete event without its trailing newline is durable
+        data, so retain it and add the delimiter. A syntactically incomplete
+        tail is the only recoverable corruption and is truncated back to the
+        last newline. Structurally invalid complete events still fail closed.
+        """
+        if not path.exists():
+            return
+        with path.open("r+b") as handle:
+            data = handle.read()
+            if not data or data.endswith(b"\n"):
+                return
+            last_newline = data.rfind(b"\n")
+            tail_start = last_newline + 1
+            tail = data[tail_start:]
+            if not tail.strip():
+                handle.seek(tail_start)
+                handle.truncate()
+            else:
+                try:
+                    value = json.loads(tail.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    handle.seek(tail_start)
+                    handle.truncate()
+                else:
+                    line_number = data[:tail_start].count(b"\n") + 1
+                    if not isinstance(value, dict):
+                        raise MemoryStoreError(
+                            f"memory event must be an object at {path}:{line_number}"
+                        )
+                    _validate_event(value, path, line_number)
+                    handle.seek(0, os.SEEK_END)
+                    handle.write(b"\n")
             handle.flush()
             os.fsync(handle.fileno())
 
@@ -495,4 +590,6 @@ class FileMemoryStore:
             return None
 
 
-__all__ = ["FileMemoryStore", "MemoryStoreError"]
+__all__ = [
+    "FileMemoryStore", "MemoryStoreError", "StaleMemoryStoreWriteError",
+]

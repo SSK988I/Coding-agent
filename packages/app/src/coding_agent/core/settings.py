@@ -27,6 +27,7 @@ class Settings:
     retry_initial_delay: float = 1.0
     retry_max_delay: float = 8.0
     memory_enabled: bool = True
+    memory_auto_extract: bool = True
     memory_user_id: str = "local-user"
     memory_max_records: int = 8
     memory_token_budget: int = 800
@@ -114,6 +115,8 @@ class SettingsManager:
             raise ValueError("retry_max_delay must be >= retry_initial_delay")
         if not isinstance(settings.memory_enabled, bool):
             raise ValueError("memory_enabled must be a boolean")
+        if not isinstance(settings.memory_auto_extract, bool):
+            raise ValueError("memory_auto_extract must be a boolean")
         if not isinstance(settings.memory_user_id, str) or not settings.memory_user_id.strip():
             raise ValueError("memory_user_id must be a non-empty string")
         settings.memory_user_id = settings.memory_user_id.strip()

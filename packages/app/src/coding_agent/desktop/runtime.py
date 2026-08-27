@@ -35,7 +35,7 @@ _DESKTOP_COMMANDS = {
     "plan": ("计划模式", "进入 Plan Mode"),
     "cancel-plan": ("取消规划", "退出 Plan Mode，不执行计划"),
     "execute-plan": ("执行计划", "执行最新的 Plan revision"),
-    "memory": ("长期记忆", "查看和管理用户画像与项目决策"),
+    "memory": ("长期记忆", "查看和管理长期偏好、事实与项目经验"),
 }
 
 
@@ -78,8 +78,10 @@ class DesktopRuntime:
             "memory.list": self._memory_list,
             "memory.conflicts": self._memory_conflicts,
             "memory.forget": self._memory_forget,
+            "memory.remember": self._memory_remember,
             "memory.clear": self._memory_clear,
             "memory.setEnabled": self._memory_set_enabled,
+            "memory.setAutoExtract": self._memory_set_auto_extract,
             "session.compact": self._session_compact,
             "runtime.dispose": self._dispose_command,
         }
@@ -92,7 +94,7 @@ class DesktopRuntime:
         del params
         return {
             "protocolVersion": PROTOCOL_VERSION, "status": "ready",
-            "capabilities": ["plan_mode_v1", "memory_v1"],
+            "capabilities": ["plan_mode_v1", "memory_v1", "memory_v2"],
         }
 
     async def _workspace_open(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -105,7 +107,7 @@ class DesktopRuntime:
         session_id = params.get("sessionId")
         resume = bool(params.get("resume", True))
         await self._replace_session(workspace, session_id=session_id, resume=resume)
-        return self._workspace_payload()
+        return await self._workspace_payload_with_memory()
 
     async def _replace_session(
         self,
@@ -115,7 +117,7 @@ class DesktopRuntime:
         resume: bool = False,
     ) -> None:
         await self._stop_active_run()
-        self._dispose_session()
+        await self._dispose_session()
 
         settings_manager = SettingsManager()
         settings = settings_manager.load()
@@ -184,6 +186,7 @@ class DesktopRuntime:
             question_behavior="interactive",
             memory_configured=True,
             memory_enabled=settings.memory_enabled,
+            memory_auto_extract=settings.memory_auto_extract,
             memory_user_id=settings.memory_user_id,
             memory_max_records=settings.memory_max_records,
             memory_token_budget=settings.memory_token_budget,
@@ -222,8 +225,9 @@ class DesktopRuntime:
         del params
         workspace = self._require_workspace()
         await self._replace_session(workspace, resume=False)
-        self._publish("session.changed", self._workspace_payload())
-        return self._workspace_payload()
+        payload = await self._workspace_payload_with_memory()
+        self._publish("session.changed", payload)
+        return payload
 
     async def _session_open(self, params: dict[str, Any]) -> dict[str, Any]:
         session_id = params.get("sessionId")
@@ -231,8 +235,9 @@ class DesktopRuntime:
             raise RpcError("INVALID_PARAMS", "session.open 需要 sessionId")
         workspace = self._require_workspace()
         await self._replace_session(workspace, session_id=session_id)
-        self._publish("session.changed", self._workspace_payload())
-        return self._workspace_payload()
+        payload = await self._workspace_payload_with_memory()
+        self._publish("session.changed", payload)
+        return payload
 
     async def _session_snapshot(self, params: dict[str, Any]) -> dict[str, Any]:
         del params
@@ -248,7 +253,7 @@ class DesktopRuntime:
         if self._run_task is not None and not self._run_task.done():
             raise RpcError("RUN_IN_PROGRESS", "任务运行时不能清空会话")
         self._require_session().agent.reset()
-        payload = self._workspace_payload()
+        payload = await self._workspace_payload_with_memory()
         self._publish("session.changed", payload)
         return payload
 
@@ -337,7 +342,7 @@ class DesktopRuntime:
             self._require_session().enter_plan_mode()
         except PlanModeError as exc:
             raise RpcError(exc.code, str(exc)) from exc
-        return self._workspace_payload()
+        return await self._workspace_payload_with_memory()
 
     async def _plan_answer(self, params: dict[str, Any]) -> dict[str, Any]:
         question_id = params.get("questionId")
@@ -348,7 +353,7 @@ class DesktopRuntime:
         try:
             if self._run_task is not None and not self._run_task.done():
                 await session.answer_plan_question(question_id, answer)
-                return self._workspace_payload()
+                return await self._workspace_payload_with_memory()
             run_id = uuid.uuid4().hex
             self._run_id = run_id
             self._run_task = asyncio.create_task(
@@ -384,7 +389,7 @@ class DesktopRuntime:
             self._require_session().cancel_plan_mode(plan_id)
         except PlanModeError as exc:
             raise RpcError(exc.code, str(exc)) from exc
-        return self._workspace_payload()
+        return await self._workspace_payload_with_memory()
 
     async def _plan_execute(self, params: dict[str, Any]) -> dict[str, Any]:
         self._ensure_no_active_run("任务运行时不能重复执行计划")
@@ -541,7 +546,8 @@ class DesktopRuntime:
             # Rehydrate the renderer from the same persisted context it will see
             # after a session switch. This replaces the transient progress card
             # with the durable compactionSummary record immediately.
-            self._publish("session.changed", self._workspace_payload())
+            payload = await self._workspace_payload_with_memory()
+            self._publish("session.changed", payload)
         return result
 
     async def _memory_status(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -549,13 +555,23 @@ class DesktopRuntime:
         overview = await self._require_session().memory_overview()
         if overview is None:
             raise RpcError("MEMORY_UNAVAILABLE", "当前运行未配置长期记忆")
+        return self._memory_overview_payload(overview)
+
+    @staticmethod
+    def _memory_overview_payload(overview: Any) -> dict[str, Any]:
         return {
             "enabled": overview.enabled,
+            "autoExtractEnabled": overview.auto_extract_enabled,
             "userId": overview.user_id,
             "projectId": overview.project_id,
             "globalCount": overview.global_count,
             "projectCount": overview.project_count,
             "conflictCount": overview.conflict_count,
+            "pendingCount": overview.pending_count,
+            "processingCount": overview.processing_count,
+            "readyCount": overview.ready_count,
+            "failedCount": overview.failed_count,
+            "lastError": overview.last_error,
             "root": overview.root,
         }
 
@@ -594,6 +610,24 @@ class DesktopRuntime:
         self._publish("memory.changed", memory)
         return {"removed": removed, "memory": memory}
 
+    async def _memory_remember(self, params: dict[str, Any]) -> dict[str, Any]:
+        self._ensure_no_active_run("任务运行时不能修改长期记忆")
+        content = params.get("content")
+        scope = params.get("scope", "global")
+        if not isinstance(content, str) or not content.strip():
+            raise RpcError("INVALID_PARAMS", "memory.remember 需要 content")
+        if scope not in {"global", "project"}:
+            raise RpcError("INVALID_PARAMS", "scope 必须是 global 或 project")
+        try:
+            record = await self._require_session().memory_remember(
+                content.strip(), scope=scope,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            raise RpcError("MEMORY_REMEMBER_FAILED", str(exc)) from exc
+        memory = await self._memory_status({})
+        self._publish("memory.changed", memory)
+        return {"record": to_jsonable(record), "memory": memory}
+
     async def _memory_clear(self, params: dict[str, Any]) -> dict[str, Any]:
         self._ensure_no_active_run("任务运行时不能清空长期记忆")
         all_scopes = params.get("allScopes")
@@ -621,6 +655,23 @@ class DesktopRuntime:
         self._publish("memory.changed", payload)
         return payload
 
+    async def _memory_set_auto_extract(self, params: dict[str, Any]) -> dict[str, Any]:
+        self._ensure_no_active_run("任务运行时不能切换自动提取")
+        enabled = params.get("enabled")
+        if not isinstance(enabled, bool):
+            raise RpcError("INVALID_PARAMS", "memory.setAutoExtract 需要 enabled")
+        session = self._require_session()
+        manager = session.settings_manager
+        try:
+            if manager is not None:
+                manager.set_value("memory_auto_extract", "true" if enabled else "false")
+            session.set_memory_auto_extract(enabled)
+        except (OSError, TypeError, ValueError) as exc:
+            raise RpcError("MEMORY_SETTINGS_FAILED", str(exc)) from exc
+        payload = await self._memory_status({})
+        self._publish("memory.changed", payload)
+        return payload
+
     async def _dispose_command(self, params: dict[str, Any]) -> dict[str, Any]:
         del params
         await self.dispose()
@@ -632,7 +683,7 @@ class DesktopRuntime:
             if not future.done():
                 future.set_result(False)
         self._approvals.clear()
-        self._dispose_session()
+        await self._dispose_session()
 
     async def _stop_active_run(self) -> None:
         if self._session is not None and self._run_task is not None and not self._run_task.done():
@@ -659,16 +710,27 @@ class DesktopRuntime:
             except asyncio.CancelledError:
                 pass
 
-    def _dispose_session(self) -> None:
+    async def _dispose_session(self) -> None:
         if self._unsubscribe is not None:
             self._unsubscribe()
             self._unsubscribe = None
         if self._session is not None:
-            self._session.dispose()
+            await self._session.aclose()
             self._session = None
 
     def _on_session_event(self, event: dict[str, Any]) -> None:
         event_type = str(event.get("type", "agent.event"))
+        if event_type == "memory_queue_changed":
+            payload = {
+                "pendingCount": event.get("pending_count", 0),
+                "processingCount": event.get("processing_count", 0),
+                "failedCount": event.get("failed_count", 0),
+                "lastError": event.get("last_error"),
+            }
+            if "ready_count" in event:
+                payload["readyCount"] = event["ready_count"]
+            self._publish("memory.changed", payload)
+            return
         if event_type == "message_update":
             raw = event.get("event") or {}
             payload = {
@@ -699,6 +761,9 @@ class DesktopRuntime:
         session = self._require_session()
         memory = {
             "enabled": bool(getattr(session, "memory_enabled", False)),
+            "autoExtractEnabled": bool(
+                getattr(getattr(session, "memory_service", None), "auto_extract", False)
+            ),
             "userId": getattr(getattr(session, "memory_identity", None), "user_id", None),
             "projectId": getattr(getattr(session, "memory_identity", None), "project_id", None),
         }
@@ -713,6 +778,21 @@ class DesktopRuntime:
             "planState": session.plan_state.to_payload(),
             "memory": memory,
         }
+
+    async def _workspace_payload_with_memory(self) -> dict[str, Any]:
+        """Return a workspace snapshot with authoritative persisted memory counts."""
+        payload = self._workspace_payload()
+        session = self._require_session()
+        overview_fn = cast(
+            Callable[[], Awaitable[Any]] | None,
+            getattr(session, "memory_overview", None),
+        )
+        if not callable(overview_fn):
+            return payload
+        overview = await overview_fn()
+        if overview is not None:
+            payload["memory"] = self._memory_overview_payload(overview)
+        return payload
 
     def _ensure_no_active_run(self, message: str) -> None:
         if self._run_task is not None and not self._run_task.done():

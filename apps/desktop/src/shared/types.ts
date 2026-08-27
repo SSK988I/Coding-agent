@@ -39,11 +39,17 @@ export interface WorkspacePayload {
 
 export interface MemoryStatePayload {
   enabled: boolean;
+  autoExtractEnabled?: boolean;
   userId: string | null;
   projectId: string | null;
   globalCount?: number;
   projectCount?: number;
   conflictCount?: number;
+  pendingCount?: number;
+  processingCount?: number;
+  readyCount?: number;
+  failedCount?: number;
+  lastError?: string | null;
   root?: string;
 }
 

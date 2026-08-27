@@ -65,6 +65,8 @@ def _new_record(candidate: MemoryCandidate, session_id: str, now: str) -> Memory
         source_entry_ids=list(dict.fromkeys(candidate.evidence_entry_ids)),
         source_hash=candidate.source_hash,
         source_timestamp=candidate.source_timestamp,
+        relation_key=candidate.relation_key,
+        fingerprint=candidate.fingerprint,
         created_at=now,
         updated_at=now,
     )
@@ -73,6 +75,39 @@ def _new_record(candidate: MemoryCandidate, session_id: str, now: str) -> Memory
 def _mark_applied(snapshot: MemorySnapshot, source_hash: str) -> None:
     if source_hash and source_hash not in snapshot.applied_source_hashes:
         snapshot.applied_source_hashes.append(source_hash)
+
+
+def _newest(records: list[MemoryRecord]) -> MemoryRecord | None:
+    newest: MemoryRecord | None = None
+    for record in records:
+        if newest is None or _after(record.source_timestamp, newest.source_timestamp):
+            newest = record
+    return newest
+
+
+def _reject_if_stale(
+    snapshot: MemorySnapshot,
+    candidate: MemoryCandidate,
+    records: list[MemoryRecord],
+) -> Resolution | None:
+    newest = _newest(records)
+    if newest is None or not _after(newest.source_timestamp, candidate.source_timestamp):
+        return None
+    _mark_applied(snapshot, candidate.source_hash)
+    return Resolution(
+        snapshot,
+        "candidate_rejected",
+        {
+            "key": candidate.key,
+            "reason": "stale_source_timestamp",
+            "active_record_id": newest.id,
+        },
+        ApplyResult(
+            action="rejected",
+            record=newest,
+            reason="stale_source_timestamp",
+        ),
+    )
 
 
 def resolve_candidate(
@@ -136,6 +171,9 @@ def resolve_candidate(
     incoming = _new_record(candidate, session_id, timestamp)
     open_conflict = snapshot.conflicts.get(key)
     if open_conflict is not None:
+        stale = _reject_if_stale(snapshot, candidate, list(open_conflict.candidates))
+        if stale is not None:
+            return stale
         highest = max((AUTHORITY[item.authority] for item in open_conflict.candidates), default=0)
         matching = next(
             (
@@ -148,6 +186,11 @@ def resolve_candidate(
             "explicit_correction", "explicit_user",
         }
         if direct_choice or AUTHORITY[candidate.source_kind] > highest:
+            matching_entry_ids = (
+                list(dict.fromkeys(matching.source_entry_ids + candidate.evidence_entry_ids))
+                if matching is not None and matching.source_session_id == session_id
+                else list(dict.fromkeys(candidate.evidence_entry_ids))
+            )
             chosen = incoming if matching is None else replace(
                 matching,
                 status="active",
@@ -155,9 +198,11 @@ def resolve_candidate(
                 confidence=max(matching.confidence, candidate.confidence),
                 summary=candidate.summary or matching.summary,
                 source_session_id=session_id,
-                source_entry_ids=list(dict.fromkeys(matching.source_entry_ids + candidate.evidence_entry_ids)),
+                source_entry_ids=matching_entry_ids,
                 source_hash=candidate.source_hash,
                 source_timestamp=candidate.source_timestamp,
+                relation_key=candidate.relation_key or matching.relation_key,
+                fingerprint=candidate.fingerprint or matching.fingerprint,
                 updated_at=timestamp,
             )
             snapshot.conflicts.pop(key, None)
@@ -192,6 +237,10 @@ def resolve_candidate(
             ApplyResult(action="created", record=incoming),
         )
 
+    stale = _reject_if_stale(snapshot, candidate, [existing])
+    if stale is not None:
+        return stale
+
     if existing.kind != incoming.kind:
         incoming.status = "conflicted"
         current = replace(existing, status="conflicted")
@@ -213,17 +262,30 @@ def resolve_candidate(
 
     if _normalized_value(existing.value) == _normalized_value(incoming.value):
         incoming_is_stronger = AUTHORITY[incoming.authority] >= AUTHORITY[existing.authority]
+        same_source_session = existing.source_session_id == incoming.source_session_id
+        if incoming_is_stronger:
+            source_entry_ids = (
+                list(dict.fromkeys(existing.source_entry_ids + incoming.source_entry_ids))
+                if same_source_session else list(incoming.source_entry_ids)
+            )
+        else:
+            source_entry_ids = (
+                list(dict.fromkeys(existing.source_entry_ids + incoming.source_entry_ids))
+                if same_source_session else list(existing.source_entry_ids)
+            )
         reinforced = replace(
             existing,
             summary=incoming.summary or existing.summary,
             authority=incoming.authority if incoming_is_stronger else existing.authority,
             confidence=max(existing.confidence, incoming.confidence),
             source_session_id=incoming.source_session_id if incoming_is_stronger else existing.source_session_id,
-            source_entry_ids=list(dict.fromkeys(existing.source_entry_ids + incoming.source_entry_ids)),
+            source_entry_ids=source_entry_ids,
             source_hash=incoming.source_hash if incoming_is_stronger else existing.source_hash,
             source_timestamp=(
                 incoming.source_timestamp if incoming_is_stronger else existing.source_timestamp
             ),
+            relation_key=incoming.relation_key or existing.relation_key,
+            fingerprint=incoming.fingerprint or existing.fingerprint,
             updated_at=timestamp,
         )
         snapshot.memories[key] = reinforced

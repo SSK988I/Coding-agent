@@ -262,22 +262,56 @@ describe("desktop long-term memory", () => {
       if (method === "workspace.open") return workspace({
         collaborationMode: "default",
         planState: { phase: "idle", activePlanId: null, latestRevision: null, pendingQuestion: null },
+        memory: {
+          enabled: true,
+          autoExtractEnabled: true,
+          userId: "local-user",
+          projectId: "sha256:test",
+          pendingCount: 5,
+          processingCount: 1,
+          readyCount: 8,
+          failedCount: 2,
+        },
       });
       if (method === "session.list") return [];
       if (method === "command.list") return [memoryCommand];
       if (method === "memory.status") return {
         enabled: true,
+        autoExtractEnabled: true,
         userId: "local-user",
         projectId: "sha256:test",
         globalCount: 2,
         projectCount: 3,
         conflictCount: 1,
+        pendingCount: 2,
+        processingCount: 1,
+        readyCount: 4,
+        failedCount: 1,
+        lastError: "extract failed",
         root: "C:\\memory",
       };
       if (method === "memory.setEnabled") return {
         enabled: false,
+        autoExtractEnabled: true,
         userId: "local-user",
         projectId: "sha256:test",
+      };
+      if (method === "memory.setAutoExtract") return {
+        enabled: true,
+        autoExtractEnabled: false,
+        userId: "local-user",
+        projectId: "sha256:test",
+      };
+      if (method === "memory.remember") return {
+        record: { id: "mem_manual_01" },
+        memory: {
+          enabled: true,
+          autoExtractEnabled: true,
+          userId: "local-user",
+          projectId: "sha256:test",
+          globalCount: 3,
+          projectCount: 3,
+        },
       };
       if (method === "memory.forget") return {
         removed: true,
@@ -317,6 +351,14 @@ describe("desktop long-term memory", () => {
     expect(screen.getByText("长期记忆已关闭。")).toBeInTheDocument();
   });
 
+  it("renders the authoritative memory overview returned while opening a workspace", async () => {
+    render(<App />);
+
+    expect(await screen.findByText(
+      /待处理 5 · 处理中 1 · 已完成 8 · 失败 2/
+    )).toBeInTheDocument();
+  });
+
   it("shows status without sending the slash command to the model", async () => {
     render(<App />);
     const composer = await screen.findByPlaceholderText("描述你想完成的任务…");
@@ -325,7 +367,59 @@ describe("desktop long-term memory", () => {
 
     await waitFor(() => expect(requests).toHaveBeenCalledWith("memory.status"));
     expect(await screen.findByText("长期记忆状态")).toBeInTheDocument();
+    expect(screen.getByText(/待处理.*2.*处理中.*1.*已完成.*4.*失败.*1/)).toBeInTheDocument();
+    expect(screen.getByText(/extract failed/)).toBeInTheDocument();
     expect(requests).not.toHaveBeenCalledWith("run.start", expect.anything());
+  });
+
+  it("toggles automatic extraction independently", async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "自动提取开启" }));
+
+    await waitFor(() => expect(requests).toHaveBeenCalledWith("memory.setAutoExtract", {
+      enabled: false,
+    }));
+    expect(await screen.findByRole("button", { name: "自动提取关闭" })).toBeInTheDocument();
+    expect(screen.getByText("长期记忆自动提取已关闭。")).toBeInTheDocument();
+  });
+
+  it("writes an explicit memory without sending it to the main model", async () => {
+    render(<App />);
+    const composer = await screen.findByPlaceholderText("描述你想完成的任务…");
+    fireEvent.change(composer, { target: { value: "/memory remember 偏好中文回答 --project" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送 ↑" }));
+
+    await waitFor(() => expect(requests).toHaveBeenCalledWith("memory.remember", {
+      content: "偏好中文回答", scope: "project",
+    }));
+    expect((await screen.findAllByText(/mem_manual_01/)).length).toBeGreaterThan(0);
+    expect(requests).not.toHaveBeenCalledWith("run.start", expect.anything());
+  });
+
+  it("keeps flag-shaped text before a trailing remember scope", async () => {
+    render(<App />);
+    const composer = await screen.findByPlaceholderText("描述你想完成的任务…");
+    fireEvent.change(composer, {
+      target: { value: "/memory remember 项目安装必须使用 --frozen-lockfile --project" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "发送 ↑" }));
+
+    await waitFor(() => expect(requests).toHaveBeenCalledWith("memory.remember", {
+      content: "项目安装必须使用 --frozen-lockfile", scope: "project",
+    }));
+  });
+
+  it("treats remember arguments after the terminator as literal content", async () => {
+    render(<App />);
+    const composer = await screen.findByPlaceholderText("描述你想完成的任务…");
+    fireEvent.change(composer, {
+      target: { value: "/memory remember \"保留字面参数\" -- --project" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "发送 ↑" }));
+
+    await waitFor(() => expect(requests).toHaveBeenCalledWith("memory.remember", {
+      content: "保留字面参数 --project", scope: "global",
+    }));
   });
 
   it("requires explicit confirmation before forgetting a memory", async () => {

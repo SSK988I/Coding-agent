@@ -5,6 +5,7 @@ assistant, resume via open(), and the compaction-aware context rebuild.
 """
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 from agent_llm import AssistantMessage, TextContent, ToolResultMessage, UserMessage
@@ -45,6 +46,17 @@ def test_in_memory_entries_get_ids_and_parent_chain():
     assert e2.parent_id == e1.id
     assert sm.leaf_id == e2.id
     assert len({e.id for e in sm.entries}) == len(sm.entries)  # unique ids
+
+
+def test_new_session_timestamps_are_iso_8601_but_filename_is_safe(tmp_path: Path):
+    sm = SessionManager.create(cwd="/test/proj", agent_dir=tmp_path)
+    entry = sm.append_message(_msg_user("hello"))
+
+    for timestamp in (sm.header.timestamp, entry.timestamp):
+        datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        assert ":" in timestamp
+    assert sm.path is not None
+    assert ":" not in sm.path.name
 
 
 # ─── JSONL file persistence ───────────────────────────────────────────

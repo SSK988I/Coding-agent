@@ -26,8 +26,15 @@ class _MemoryService:
         self.enabled = True
         self.queries: list[str] = []
         self.tasks: list[object] = []
+        self.pending_tasks: list[object] = []
+        self.processed_tasks: list[object] = []
+        self.flush_count = 0
+        self.stop_requested = False
+        self.closed = False
+        self.worker_task: asyncio.Task[None] | None = None
 
-    async def before_task(self, _identity, query: str) -> MemoryContext:
+    async def before_task(self, identity, query: str) -> MemoryContext:
+        await self.flush_pending(identity)
         self.queries.append(query)
         return MemoryContext(
             records=[],
@@ -37,13 +44,37 @@ class _MemoryService:
 
     async def after_task(self, task) -> SimpleNamespace:
         self.tasks.append(task)
-        return SimpleNamespace()
+        self.pending_tasks.append(task)
+        return SimpleNamespace(queued=1)
+
+    async def flush_pending(self, _identity, *, max_jobs=None) -> SimpleNamespace:
+        self.flush_count += 1
+        limit = len(self.pending_tasks) if max_jobs is None else max_jobs
+        selected = self.pending_tasks[:limit]
+        del self.pending_tasks[:limit]
+        self.processed_tasks.extend(selected)
+        return SimpleNamespace(accepted=len(selected))
 
     def set_enabled(self, enabled: bool) -> None:
         self.enabled = enabled
 
+    def request_stop(self) -> None:
+        self.stop_requested = True
+        if self.worker_task is not None and not self.worker_task.done():
+            self.worker_task.cancel()
 
-def test_prompt_retrieves_transient_context_and_extracts_user_evidence(tmp_path: Path) -> None:
+    async def close(self, *, grace_seconds: float = 0.25) -> None:
+        del grace_seconds
+        self.closed = True
+        self.request_stop()
+        if self.worker_task is not None:
+            try:
+                await self.worker_task
+            except asyncio.CancelledError:
+                pass
+
+
+def test_prompt_retrieves_transient_context_and_queues_user_evidence(tmp_path: Path) -> None:
     manager = SessionManager.create(cwd=str(tmp_path), in_memory=True)
     memory = _MemoryService()
     session = AgentSession(AgentSessionConfig(
@@ -79,7 +110,7 @@ def test_prompt_retrieves_transient_context_and_extracts_user_evidence(tmp_path:
     assert task.final_response == "完成"
 
 
-def test_failed_task_does_not_extract(tmp_path: Path) -> None:
+def test_failed_task_does_not_enqueue_memory(tmp_path: Path) -> None:
     manager = SessionManager.create(cwd=str(tmp_path), in_memory=True)
     memory = _MemoryService()
     session = AgentSession(AgentSessionConfig(
@@ -104,11 +135,9 @@ def test_failed_task_does_not_extract(tmp_path: Path) -> None:
     assert memory.tasks == []
 
 
-def test_session_stays_busy_until_memory_extraction_finishes(tmp_path: Path) -> None:
+def test_prompt_returns_without_waiting_for_slow_memory_worker(tmp_path: Path) -> None:
     manager = SessionManager.create(cwd=str(tmp_path), in_memory=True)
     memory = _MemoryService()
-    memory.extraction_started = asyncio.Event()
-    memory.allow_extraction = asyncio.Event()
     session = AgentSession(AgentSessionConfig(
         model=_model(), cwd=str(tmp_path), session_manager=manager,
         memory_service=memory, memory_identity=MemoryIdentity("u", "p"),
@@ -123,26 +152,106 @@ def test_session_stays_busy_until_memory_extraction_finishes(tmp_path: Path) -> 
     async def no_compaction() -> SimpleNamespace:
         return SimpleNamespace(need_retry=False)
 
-    async def blocking_after_task(task) -> SimpleNamespace:
-        memory.tasks.append(task)
-        memory.extraction_started.set()
-        await memory.allow_extraction.wait()
-        return SimpleNamespace()
-
     session._agent.prompt = fake_prompt  # type: ignore[method-assign]
     session._compaction_orchestrator.check_compaction = no_compaction  # type: ignore[method-assign]
-    memory.after_task = blocking_after_task  # type: ignore[method-assign]
 
     async def scenario() -> None:
-        first = asyncio.create_task(session.prompt("first"))
-        await memory.extraction_started.wait()
-        with pytest.raises(RuntimeError, match="already processing"):
-            await session.prompt("second")
-        memory.allow_extraction.set()
-        await first
+        extraction_started = asyncio.Event()
+        allow_extraction = asyncio.Event()
+        enqueue = memory.after_task
+
+        async def slow_worker() -> None:
+            extraction_started.set()
+            await allow_extraction.wait()
+
+        async def enqueue_then_start_worker(task) -> SimpleNamespace:
+            result = await enqueue(task)
+            memory.worker_task = asyncio.create_task(slow_worker())
+            return result
+
+        memory.after_task = enqueue_then_start_worker  # type: ignore[method-assign]
+        await session.prompt("first")
+        await extraction_started.wait()
+
+        assert session.is_processing is False
+        assert memory.worker_task is not None
+        assert not memory.worker_task.done()
+        assert len(memory.pending_tasks) == 1
+
+        allow_extraction.set()
+        await memory.worker_task
 
     asyncio.run(scenario())
     assert session.is_processing is False
+
+
+def test_next_prompt_flushes_memory_queued_by_previous_task(tmp_path: Path) -> None:
+    manager = SessionManager.create(cwd=str(tmp_path), in_memory=True)
+    memory = _MemoryService()
+    session = AgentSession(AgentSessionConfig(
+        model=_model(), cwd=str(tmp_path), session_manager=manager,
+        memory_service=memory, memory_identity=MemoryIdentity("u", "p"),
+    ))
+
+    async def fake_prompt(message: str) -> None:
+        manager.append_message(UserMessage(content=message))
+        assistant = AssistantMessage(content=[TextContent(text="完成")], stop_reason="stop")
+        manager.append_message(assistant)
+        session._last_assistant_message = assistant
+
+    async def no_compaction() -> SimpleNamespace:
+        return SimpleNamespace(need_retry=False)
+
+    session._agent.prompt = fake_prompt  # type: ignore[method-assign]
+    session._compaction_orchestrator.check_compaction = no_compaction  # type: ignore[method-assign]
+
+    async def scenario() -> None:
+        await session.prompt("first")
+        assert len(memory.pending_tasks) == 1
+        assert memory.processed_tasks == []
+
+        await session.prompt("second")
+
+    asyncio.run(scenario())
+
+    assert memory.queries == ["first", "second"]
+    assert len(memory.processed_tasks) == 1
+    assert memory.processed_tasks[0].evidence[0].text == "first"
+    assert len(memory.pending_tasks) == 1
+    assert memory.pending_tasks[0].evidence[0].text == "second"
+
+
+def test_dispose_requests_worker_stop_and_aclose_waits_for_it(tmp_path: Path) -> None:
+    memory = _MemoryService()
+    session = AgentSession(AgentSessionConfig(
+        model=_model(), cwd=str(tmp_path),
+        memory_service=memory, memory_identity=MemoryIdentity("u", "p"),
+    ))
+
+    async def scenario() -> None:
+        worker_started = asyncio.Event()
+
+        async def worker() -> None:
+            worker_started.set()
+            await asyncio.Event().wait()
+
+        memory.worker_task = asyncio.create_task(worker())
+        await worker_started.wait()
+        await session.aclose(memory_grace_seconds=0)
+
+        assert memory.closed is True
+        assert memory.stop_requested is True
+        assert memory.worker_task.done()
+
+    asyncio.run(scenario())
+
+    other_memory = _MemoryService()
+    other_session = AgentSession(AgentSessionConfig(
+        model=_model(), cwd=str(tmp_path),
+        memory_service=other_memory, memory_identity=MemoryIdentity("u", "p"),
+    ))
+    other_session.dispose()
+    assert other_memory.stop_requested is True
 
 
 def test_concurrent_prompt_is_rejected_while_memory_is_loading(tmp_path: Path) -> None:

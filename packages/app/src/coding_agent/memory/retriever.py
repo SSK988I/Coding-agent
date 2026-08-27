@@ -19,6 +19,7 @@ def _terms(value: str) -> set[str]:
 def _record_text(record: MemoryRecord) -> str:
     return " ".join((
         record.key,
+        record.relation_key or "",
         record.kind,
         record.summary,
         json.dumps(record.value, ensure_ascii=False, sort_keys=True, allow_nan=False),
@@ -51,15 +52,23 @@ class MemoryRetriever:
             project_snapshot = None
 
         combined: dict[str, tuple[MemoryRecord, str]] = {
-            key: (record, "global") for key, record in global_snapshot.memories.items()
+            (record.relation_key or key): (record, "global")
+            for key, record in global_snapshot.memories.items()
         }
         if project_snapshot is not None:
             for key, record in project_snapshot.memories.items():
-                combined[key] = (record, "project")
+                combined[record.relation_key or key] = (record, "project")
             # An unresolved project-level conflict must not silently fall back
             # to a global value for the same canonical key.
-            for key in project_snapshot.conflicts:
-                combined.pop(key, None)
+            for key, conflict in project_snapshot.conflicts.items():
+                relation_key = next(
+                    (
+                        item.relation_key for item in conflict.candidates
+                        if item.relation_key is not None
+                    ),
+                    key,
+                )
+                combined.pop(relation_key, None)
 
         query_terms = _terms(query)
         ranked: list[tuple[int, str, str, MemoryRecord, str]] = []

@@ -507,6 +507,7 @@ def main(argv: list[str] | None = None) -> int:
         question_behavior="interactive" if app_mode == "interactive" else "deferred",
         memory_configured=True,
         memory_enabled=settings.memory_enabled,
+        memory_auto_extract=settings.memory_auto_extract,
         memory_user_id=settings.memory_user_id,
         memory_max_records=settings.memory_max_records,
         memory_token_budget=settings.memory_token_budget,
@@ -551,6 +552,16 @@ def main(argv: list[str] | None = None) -> int:
 # ─── Mode runners ────────────────────────────────────────────────────────
 
 
+async def _close_session(session: Any) -> None:
+    close = getattr(session, "aclose", None)
+    if callable(close):
+        await cast(Any, close())
+        return
+    dispose = getattr(session, "dispose", None)
+    if callable(dispose):
+        dispose()
+
+
 def _run_interactive(
     session: AgentSession,
     initial_prompt: Any,
@@ -563,12 +574,17 @@ def _run_interactive(
     from coding_agent.modes.interactive.interactive_mode import InteractiveMode
 
     mode = InteractiveMode(session)
+
+    async def _interactive() -> None:
+        try:
+            await mode.run(initial_prompt, initial_display_text)
+        finally:
+            await _close_session(session)
+
     try:
-        asyncio.run(mode.run(initial_prompt, initial_display_text))
+        asyncio.run(_interactive())
     except KeyboardInterrupt:
         return 130
-    finally:
-        session.dispose()
     return 0
 
 
@@ -672,12 +688,16 @@ def _run_print(
         _print_plan_resume_hint(session)
         return 1 if had_error else 0
 
+    async def _entry() -> int:
+        try:
+            return await _print()
+        finally:
+            await _close_session(session)
+
     try:
-        return asyncio.run(_print())
+        return asyncio.run(_entry())
     except KeyboardInterrupt:
         return 130
-    finally:
-        session.dispose()
 
 
 def _run_plan_control(
@@ -724,12 +744,16 @@ def _run_plan_control(
             _print_plan_resume_hint(session)
         return 1 if session.plan_state.phase in {"failed", "aborted"} else 0
 
+    async def _entry() -> int:
+        try:
+            return await _control()
+        finally:
+            await _close_session(session)
+
     try:
-        return asyncio.run(_control())
+        return asyncio.run(_entry())
     except KeyboardInterrupt:
         return 130
-    finally:
-        session.dispose()
 
 
 def _print_plan_resume_hint(session: AgentSession) -> None:

@@ -124,7 +124,9 @@ def session_file_path(
 
 def iso_now() -> str:
     """Return the current UTC time as ISO 8601 with millisecond precision."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S-%f")[:-3] + "Z"
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
+        "+00:00", "Z",
+    )
 
 
 # ─── serialization: SessionEntry <-> line dict ────────────────────────

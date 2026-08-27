@@ -70,6 +70,7 @@ from coding_agent.modes.interactive.components.status_indicator import (
 from coding_agent.modes.interactive.components.tool_execution import ToolExecutionComponent
 from coding_agent.modes.interactive.components.user_message import UserMessageComponent
 from coding_agent.modes.interactive.components.welcome import WelcomeComponent
+from coding_agent.memory.types import MemoryScope
 
 # ─── Authentication storage ───────────────────────────────────────────────
 
@@ -163,8 +164,27 @@ class InteractiveMode:
             return None
         task = loop.create_task(coro)
         self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        task.add_done_callback(self._on_background_task_done)
         return task
+
+    def _on_background_task_done(self, task: asyncio.Task[Any]) -> None:
+        """Release a fire-and-forget task and surface unexpected failures."""
+        self._background_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            return
+        if error is None:
+            return
+        try:
+            self._add_system_message(self.theme.fg("error", f"错误：{error}"))
+            self.tui.request_render()
+        except Exception:
+            # The UI may already be tearing down.  The exception was still
+            # retrieved above, so asyncio will not emit an orphan-task warning.
+            pass
 
     # ── Interrupt handling ─────────────────────────────────────────────────
 
@@ -1454,6 +1474,8 @@ class InteractiveMode:
             )
             if pieces[0] == "memory_enabled":
                 self._session.set_memory_enabled(settings.memory_enabled)
+            elif pieces[0] == "memory_auto_extract":
+                self._session.set_memory_auto_extract(settings.memory_auto_extract)
         except (OSError, TypeError, ValueError) as exc:
             self._add_system_message(f"设置更新失败：{exc}")
             return
@@ -1483,20 +1505,86 @@ class InteractiveMode:
             self._add_system_message(f"长期记忆已{'开启' if enabled else '关闭'}。")
             return
 
+        if action == "auto":
+            if len(parts) != 2 or parts[1].lower() not in {"on", "off"}:
+                self._add_system_message("用法：/memory auto on|off")
+                return
+            enabled = parts[1].lower() == "on"
+            try:
+                if manager is not None:
+                    manager.set_value(
+                        "memory_auto_extract", "true" if enabled else "false",
+                    )
+                self._session.set_memory_auto_extract(enabled)
+            except (OSError, TypeError, ValueError) as exc:
+                self._add_system_message(f"自动提取设置失败：{exc}")
+                return
+            self._add_system_message(f"长期记忆自动提取已{'开启' if enabled else '关闭'}。")
+            return
+
         if action == "status":
             overview = await self._session.memory_overview()
             if overview is None:
                 self._add_system_message("当前运行未配置长期记忆。")
                 return
-            self._add_assistant_text(
-                "**长期记忆状态**\n\n"
-                f"- 状态：`{'on' if overview.enabled else 'off'}`\n"
-                f"- 用户：`{overview.user_id}`\n"
-                f"- 项目：`{overview.project_id or 'none'}`\n"
-                f"- 全局记忆：`{overview.global_count}`\n"
-                f"- 项目记忆：`{overview.project_count}`\n"
-                f"- 待解决冲突：`{overview.conflict_count}`\n"
-                f"- 目录：`{overview.root}`"
+            lines = [
+                "**长期记忆状态**\n",
+                f"- 状态：`{'on' if overview.enabled else 'off'}`",
+                f"- 自动提取：`{'on' if overview.auto_extract_enabled else 'off'}`",
+                f"- 用户：`{overview.user_id}`",
+                f"- 项目：`{overview.project_id or 'none'}`",
+                f"- 全局记忆：`{overview.global_count}`",
+                f"- 项目记忆：`{overview.project_count}`",
+                f"- 待解决冲突：`{overview.conflict_count}`",
+                (
+                    "- 提取任务："
+                    f"待处理 `{overview.pending_count}` / "
+                    f"处理中 `{overview.processing_count}` / "
+                    f"已完成 `{overview.ready_count}` / "
+                    f"失败 `{overview.failed_count}`"
+                ),
+            ]
+            if overview.last_error:
+                lines.append(f"- 最近错误：`{overview.last_error}`")
+            lines.append(f"- 目录：`{overview.root}`")
+            self._add_assistant_text("\n".join(lines))
+            return
+
+        if action == "remember":
+            values = parts[1:]
+            delimiter = values.index("--") if "--" in values else len(values)
+            option_side = list(values[:delimiter])
+            literal_side = values[delimiter + 1:] if delimiter < len(values) else []
+            remember_scope: MemoryScope = "global"
+            scope_flags: dict[str, MemoryScope] = {
+                "--global": "global", "--project": "project",
+            }
+            if option_side and option_side[-1] in scope_flags:
+                remember_scope = scope_flags[option_side.pop()]
+                if option_side and option_side[-1] in scope_flags:
+                    self._add_system_message(
+                        "用法：/memory remember <内容> [--global|--project]"
+                    )
+                    return
+            content = " ".join([*option_side, *literal_side]).strip()
+            if not content:
+                self._add_system_message(
+                    "用法：/memory remember <内容> [--global|--project]"
+                )
+                return
+            try:
+                record = await self._session.memory_remember(
+                    content, scope=remember_scope,
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                self._add_system_message(f"记忆写入失败：{exc}")
+                return
+            if record is None:
+                self._add_system_message("该内容未产生新的长期记忆。")
+                return
+            self._add_system_message(
+                f"已记住（{remember_scope}）：`{record.id}`。"
+                f"可用 `/memory forget {record.id}` 遗忘。"
             )
             return
 
@@ -1572,7 +1660,7 @@ class InteractiveMode:
             return
 
         self._add_system_message(
-            "用法：/memory status|list|conflicts|forget|clear|on|off"
+            "用法：/memory status|list|conflicts|remember|forget|clear|auto|on|off"
         )
 
     def _cmd_export(self, arg: str) -> None:

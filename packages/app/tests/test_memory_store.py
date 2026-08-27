@@ -9,7 +9,12 @@ import pytest
 import yaml
 
 from coding_agent.memory.retriever import MemoryRetriever
-from coding_agent.memory.store import FileMemoryStore, MemoryStoreError, _canonical_hash
+from coding_agent.memory.store import (
+    FileMemoryStore,
+    MemoryStoreError,
+    StaleMemoryStoreWriteError,
+    _canonical_hash,
+)
 from coding_agent.memory.types import MemoryCandidate, MemoryIdentity, MemorySnapshot
 
 
@@ -70,14 +75,133 @@ def test_store_writes_fact_log_and_rebuildable_yaml(tmp_path: Path) -> None:
     yaml_path = project_dir / "memory.yaml"
     events_path = project_dir / "events.jsonl"
     assert yaml_path.exists() and events_path.exists()
-    assert yaml.safe_load(yaml_path.read_text(encoding="utf-8"))["content_hash"].startswith("sha256:")
-    assert "memory_created" in events_path.read_text(encoding="utf-8")
+    yaml_payload = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+    event_payload = json.loads(events_path.read_text(encoding="utf-8").splitlines()[0])
+    assert yaml_payload["schema_version"] == 2
+    assert yaml_payload["content_hash"].startswith("sha256:")
+    assert event_payload["schema_version"] == 2
+    assert event_payload["type"] == "memory_created"
+    assert (tmp_path / "memory" / "version").read_text(encoding="utf-8").strip() == "2"
 
     yaml_path.write_text("broken: [", encoding="utf-8")
     rebuilt = _run(store.load(identity, "project"))
     assert rebuilt.memories["tooling.package_manager"].value == "pnpm"
     assert yaml.safe_load(yaml_path.read_text(encoding="utf-8"))["revision"] == 1
     assert list(project_dir.glob("memory.corrupt-*.yaml"))
+
+
+def test_v1_store_is_migrated_to_v2_without_corrupt_backup(tmp_path: Path) -> None:
+    root = tmp_path / "memory"
+    store = FileMemoryStore(root)
+    identity = MemoryIdentity("user-a", "project-a")
+    _run(store.apply(
+        identity,
+        _candidate("tooling.package_manager", "pnpm", source_hash="source-1"),
+        session_id="session-1",
+    ))
+    project_dir = next((root / "users").glob("*/projects/*"))
+    snapshot_path = project_dir / "memory.yaml"
+    events_path = project_dir / "events.jsonl"
+
+    raw_snapshot = yaml.safe_load(snapshot_path.read_text(encoding="utf-8"))
+    raw_snapshot["schema_version"] = 1
+    legacy = MemorySnapshot.from_dict(raw_snapshot)
+    legacy.content_hash = _canonical_hash(legacy)
+    snapshot_path.write_text(
+        yaml.safe_dump(legacy.to_dict(), allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    legacy_events = []
+    for line in events_path.read_text(encoding="utf-8").splitlines():
+        event = json.loads(line)
+        event["schema_version"] = 1
+        legacy_events.append(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+    events_path.write_text("\n".join(legacy_events) + "\n", encoding="utf-8")
+    (root / "version").write_text("1\n", encoding="utf-8")
+
+    migrated = _run(FileMemoryStore(root).load(identity, "project"))
+
+    assert migrated.schema_version == 2
+    assert migrated.memories["tooling.package_manager"].value == "pnpm"
+    assert yaml.safe_load(snapshot_path.read_text(encoding="utf-8"))["schema_version"] == 2
+    assert (root / "version").read_text(encoding="utf-8").strip() == "2"
+    assert not list(project_dir.glob("memory.corrupt-*.yaml"))
+
+
+def test_missing_yaml_snapshot_is_rebuilt_from_jsonl(tmp_path: Path) -> None:
+    root = tmp_path / "memory"
+    store = FileMemoryStore(root)
+    identity = MemoryIdentity("user-a", "project-a")
+    _run(store.apply(
+        identity,
+        _candidate("tooling.package_manager", "pnpm", source_hash="source-1"),
+        session_id="s",
+    ))
+    project_dir = next((root / "users").glob("*/projects/*"))
+    snapshot_path = project_dir / "memory.yaml"
+    snapshot_path.unlink()
+
+    rebuilt = _run(FileMemoryStore(root).load(identity, "project"))
+
+    assert rebuilt.revision == 1
+    assert rebuilt.memories["tooling.package_manager"].value == "pnpm"
+    assert snapshot_path.exists()
+
+
+def test_apply_truncates_partial_jsonl_tail_before_append(tmp_path: Path) -> None:
+    root = tmp_path / "memory"
+    store = FileMemoryStore(root)
+    identity = MemoryIdentity("user-a", "project-a")
+    _run(store.apply(
+        identity,
+        _candidate("tooling.package_manager", "pnpm", source_hash="source-1"),
+        session_id="s",
+    ))
+    project_dir = next((root / "users").glob("*/projects/*"))
+    events_path = project_dir / "events.jsonl"
+    with events_path.open("ab") as handle:
+        handle.write(b'{"schema_version":1,"revision":2')
+    (project_dir / "memory.yaml").unlink()
+
+    result = _run(store.apply(
+        identity,
+        _candidate("tooling.runtime", "python", source_hash="source-2"),
+        session_id="s",
+    ))
+    rebuilt = _run(FileMemoryStore(root).load(identity, "project"))
+
+    assert result.action == "created"
+    assert rebuilt.revision == 2
+    assert set(rebuilt.memories) == {"tooling.package_manager", "tooling.runtime"}
+    lines = events_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    assert [json.loads(line)["revision"] for line in lines] == [1, 2]
+
+
+def test_apply_preserves_complete_json_event_without_trailing_newline(tmp_path: Path) -> None:
+    root = tmp_path / "memory"
+    store = FileMemoryStore(root)
+    identity = MemoryIdentity("user-a", "project-a")
+    _run(store.apply(
+        identity,
+        _candidate("tooling.package_manager", "pnpm", source_hash="source-1"),
+        session_id="s",
+    ))
+    project_dir = next((root / "users").glob("*/projects/*"))
+    events_path = project_dir / "events.jsonl"
+    events_path.write_bytes(events_path.read_bytes().rstrip(b"\n"))
+    (project_dir / "memory.yaml").unlink()
+
+    _run(store.apply(
+        identity,
+        _candidate("tooling.runtime", "python", source_hash="source-2"),
+        session_id="s",
+    ))
+
+    raw = events_path.read_bytes()
+    assert raw.endswith(b"\n")
+    events = [json.loads(line) for line in raw.decode("utf-8").splitlines()]
+    assert [event["revision"] for event in events] == [1, 2]
 
 
 def test_duplicate_conflict_correction_and_tombstone(tmp_path: Path) -> None:
@@ -122,6 +246,29 @@ def test_duplicate_conflict_correction_and_tombstone(tmp_path: Path) -> None:
     snapshot = _run(store.load(identity, "project"))
     assert "tooling.package_manager" not in snapshot.memories
     assert "tooling.package_manager" in snapshot.tombstones
+
+
+def test_explicit_forget_is_not_blocked_by_source_clock_skew(tmp_path: Path) -> None:
+    store = FileMemoryStore(tmp_path / "memory")
+    identity = MemoryIdentity("user-a", "project-a")
+    future = _candidate(
+        "tooling.package_manager",
+        "pnpm",
+        source_hash="future-source",
+        timestamp="2099-01-01T00:00:00Z",
+    )
+    assert _run(store.apply(identity, future, session_id="future")).action == "created"
+
+    result = _run(store.forget(
+        identity,
+        scope="project",
+        key="tooling.package_manager",
+        kind="decision",
+        session_id="current-user",
+        source_hash="explicit-forget",
+    ))
+
+    assert result.action == "tombstoned"
 
 
 def test_global_project_precedence_and_user_isolation(tmp_path: Path) -> None:
@@ -324,6 +471,190 @@ def test_same_value_reinforcement_upgrades_authority_and_source(tmp_path: Path) 
     assert record.authority == "explicit_user"
     assert record.source_hash == "explicit"
     assert record.source_session_id == "explicit-session"
+    assert record.source_entry_ids == ["entry-explicit"]
+
+
+def test_reinforcement_only_merges_evidence_from_the_current_source_session(
+    tmp_path: Path,
+) -> None:
+    store = FileMemoryStore(tmp_path / "memory")
+    identity = MemoryIdentity("user-a", "project-a")
+    explicit = _candidate(
+        "tooling.package_manager", "pnpm", source_hash="explicit",
+        authority="explicit_user", timestamp="2026-08-24T10:00:00Z",
+    )
+    inferred_other_session = _candidate(
+        "tooling.package_manager", "pnpm", source_hash="other",
+        authority="inferred_user", timestamp="2026-08-24T11:00:00Z",
+    )
+    inferred_same_session = _candidate(
+        "tooling.package_manager", "pnpm", source_hash="same",
+        authority="inferred_user", timestamp="2026-08-24T12:00:00Z",
+    )
+
+    _run(store.apply(identity, explicit, session_id="source-session"))
+    _run(store.apply(identity, inferred_other_session, session_id="other-session"))
+    after_other = _run(store.load(identity, "project")).memories["tooling.package_manager"]
+    assert after_other.source_session_id == "source-session"
+    assert after_other.source_entry_ids == ["entry-explicit"]
+
+    _run(store.apply(identity, inferred_same_session, session_id="source-session"))
+    after_same = _run(store.load(identity, "project")).memories["tooling.package_manager"]
+    assert after_same.source_session_id == "source-session"
+    assert after_same.source_entry_ids == ["entry-explicit", "entry-same"]
+
+
+def test_apply_expected_record_id_rejects_stale_active_target(tmp_path: Path) -> None:
+    store = FileMemoryStore(tmp_path / "memory")
+    identity = MemoryIdentity("user-a", "project-a")
+    first = _run(store.apply(
+        identity,
+        _candidate(
+            "tooling.package_manager", "npm", source_hash="first",
+            timestamp="2026-08-24T10:00:00Z",
+        ),
+        session_id="s",
+    )).record
+    assert first is not None
+    _run(store.apply(
+        identity,
+        _candidate(
+            "tooling.package_manager", "pnpm", source_hash="newer-correction",
+            authority="explicit_correction", timestamp="2026-08-24T12:00:00Z",
+        ),
+        session_id="s",
+        expected_record_id=first.id,
+    ))
+
+    with pytest.raises(StaleMemoryStoreWriteError, match="target changed"):
+        _run(store.apply(
+            identity,
+            _candidate(
+                "tooling.package_manager", "yarn", source_hash="stale-write",
+                authority="explicit_correction", timestamp="2026-08-24T13:00:00Z",
+            ),
+            session_id="s",
+            expected_record_id=first.id,
+        ))
+
+    snapshot = _run(store.load(identity, "project"))
+    assert snapshot.revision == 2
+    assert snapshot.memories["tooling.package_manager"].value == "pnpm"
+
+
+def test_apply_expected_record_id_accepts_open_conflict_candidate(tmp_path: Path) -> None:
+    store = FileMemoryStore(tmp_path / "memory")
+    identity = MemoryIdentity("user-a", "project-a")
+    _run(store.apply(
+        identity,
+        _candidate(
+            "tooling.package_manager", "npm", source_hash="first",
+            timestamp="2026-08-24T10:00:00Z",
+        ),
+        session_id="s",
+    ))
+    _run(store.apply(
+        identity,
+        _candidate(
+            "tooling.package_manager", "pnpm", source_hash="second",
+            timestamp="2026-08-24T11:00:00Z",
+        ),
+        session_id="s",
+    ))
+    conflict = _run(store.load(identity, "project")).conflicts["tooling.package_manager"]
+    target = next(item for item in conflict.candidates if item.value == "pnpm")
+
+    result = _run(store.apply(
+        identity,
+        _candidate(
+            "tooling.package_manager", "pnpm", source_hash="choice",
+            timestamp="2026-08-24T12:00:00Z",
+        ),
+        session_id="choice-session",
+        expected_record_id=target.id,
+    ))
+
+    assert result.action == "conflict_resolved"
+    assert result.record is not None
+    assert result.record.source_session_id == "choice-session"
+    assert result.record.source_entry_ids == ["entry-choice"]
+
+
+def test_older_correction_cannot_roll_back_newer_active_value(tmp_path: Path) -> None:
+    store = FileMemoryStore(tmp_path / "memory")
+    identity = MemoryIdentity("user-a", "project-a")
+    _run(store.apply(
+        identity,
+        _candidate(
+            "tooling.package_manager", "pnpm", source_hash="newer",
+            timestamp="2026-08-24T12:00:00Z",
+        ),
+        session_id="newer-session",
+    ))
+
+    result = _run(store.apply(
+        identity,
+        _candidate(
+            "tooling.package_manager", "npm", source_hash="older-correction",
+            authority="explicit_correction", timestamp="2026-08-24T11:00:00Z",
+        ),
+        session_id="older-session",
+    ))
+
+    assert result.action == "rejected"
+    assert result.reason == "stale_source_timestamp"
+    record = _run(store.load(identity, "project")).memories["tooling.package_manager"]
+    assert record.value == "pnpm"
+    assert record.source_timestamp == "2026-08-24T12:00:00Z"
+
+
+def test_older_correction_cannot_resolve_open_conflict_to_stale_value(
+    tmp_path: Path,
+) -> None:
+    store = FileMemoryStore(tmp_path / "memory")
+    identity = MemoryIdentity("user-a", "project-a")
+    _run(store.apply(
+        identity,
+        _candidate(
+            "tooling.package_manager", "npm", source_hash="old-option",
+            timestamp="2026-08-24T10:00:00Z",
+        ),
+        session_id="s",
+    ))
+    _run(store.apply(
+        identity,
+        _candidate(
+            "tooling.package_manager", "pnpm", source_hash="new-option",
+            timestamp="2026-08-24T12:00:00Z",
+        ),
+        session_id="s",
+    ))
+
+    stale = _run(store.apply(
+        identity,
+        _candidate(
+            "tooling.package_manager", "npm", source_hash="old-choice",
+            authority="explicit_correction", timestamp="2026-08-24T11:00:00Z",
+        ),
+        session_id="s",
+    ))
+
+    assert stale.action == "rejected"
+    assert stale.reason == "stale_source_timestamp"
+    conflicted = _run(store.load(identity, "project"))
+    assert "tooling.package_manager" in conflicted.conflicts
+    assert "tooling.package_manager" not in conflicted.memories
+
+    resolved = _run(store.apply(
+        identity,
+        _candidate(
+            "tooling.package_manager", "npm", source_hash="new-choice",
+            authority="explicit_correction", timestamp="2026-08-24T13:00:00Z",
+        ),
+        session_id="s",
+    ))
+    assert resolved.action == "conflict_resolved"
+    assert resolved.record is not None and resolved.record.value == "npm"
 
 
 def test_retrieval_estimate_respects_multilingual_token_budget(tmp_path: Path) -> None:

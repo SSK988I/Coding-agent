@@ -126,10 +126,13 @@ class AgentSessionConfig:
     # CLI/Desktop pass their persisted settings explicitly.
     memory_configured: bool = False
     memory_enabled: bool = False
+    memory_auto_extract: bool = True
     memory_user_id: str = "local-user"
     memory_root: Path | None = None
     memory_max_records: int = 8
     memory_token_budget: int = 800
+    memory_extract_model: Model | None = None
+    memory_consolidation_model: Model | None = None
     memory_service: Any = None
     memory_identity: Any = None
 
@@ -323,6 +326,7 @@ class AgentSession:
     def _initialize_memory(self) -> None:
         """Build the default file-backed memory service for application hosts."""
         from coding_agent.core.config import get_memory_dir
+        from coding_agent.memory.consolidator import LLMMemoryConsolidator
         from coding_agent.memory.extractor import LLMMemoryExtractor
         from coding_agent.memory.paths import resolve_project_id
         from coding_agent.memory.service import MemoryService
@@ -335,16 +339,27 @@ class AgentSession:
                 project_id=resolve_project_id(self.cwd),
             )
         store = FileMemoryStore(self._config.memory_root or get_memory_dir())
+        extraction_model = self._config.memory_extract_model or self._model
+        consolidation_model = self._config.memory_consolidation_model or self._model
+        memory_reasoning = self._config.reasoning
         extractor = LLMMemoryExtractor(
-            get_model=lambda: self._model,
+            get_model=lambda: extraction_model,
             get_stream_fn=lambda: self._agent.stream_fn,
             get_api_key=self._config.get_api_key,
-            get_reasoning=lambda: self._agent.reasoning,
+            get_reasoning=lambda: memory_reasoning,
+        )
+        consolidator = LLMMemoryConsolidator(
+            get_model=lambda: consolidation_model,
+            get_stream_fn=lambda: self._agent.stream_fn,
+            get_api_key=self._config.get_api_key,
+            get_reasoning=lambda: memory_reasoning,
         )
         self.memory_service = MemoryService(
             store=store,
             extractor=extractor,
+            consolidator=consolidator,
             enabled=self._config.memory_enabled,
+            auto_extract=self._config.memory_auto_extract,
             max_records=self._config.memory_max_records,
             token_budget=self._config.memory_token_budget,
             event_sink=self._emit_event,
@@ -857,6 +872,13 @@ class AgentSession:
         if self.memory_service is not None:
             self.memory_service.set_enabled(enabled)
 
+    def set_memory_auto_extract(self, enabled: bool) -> None:
+        self._config.memory_auto_extract = enabled
+        if self.memory_service is None and enabled:
+            self._initialize_memory()
+        if self.memory_service is not None:
+            self.memory_service.set_auto_extract(enabled)
+
     async def memory_overview(self) -> Any:
         if self.memory_service is None or self.memory_identity is None:
             return None
@@ -879,6 +901,27 @@ class AgentSession:
             self.memory_identity,
             key,
             scope=scope,
+            session_id=self.session_manager.header.id,
+        )
+
+    async def memory_remember(
+        self,
+        content: str,
+        *,
+        scope: MemoryScope = "global",
+        relation_key: str | None = None,
+        kind: str = "fact",
+        correction: bool = False,
+    ) -> Any:
+        if self.memory_service is None or self.memory_identity is None:
+            return None
+        return await self.memory_service.remember(
+            self.memory_identity,
+            content,
+            scope=scope,
+            relation_key=relation_key,
+            kind=kind,
+            correction=correction,
             session_id=self.session_manager.header.id,
         )
 
@@ -1107,8 +1150,16 @@ class AgentSession:
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
+    async def aclose(self, *, memory_grace_seconds: float = 0.25) -> None:
+        """Stop background memory work safely, then flush session persistence."""
+        if self.memory_service is not None:
+            await self.memory_service.close(grace_seconds=memory_grace_seconds)
+        self.dispose()
+
     def dispose(self) -> None:
         """Clean up resources, persisting only sessions that contain entries."""
+        if self.memory_service is not None:
+            self.memory_service.request_stop()
         if (
             self.session_manager is not None
             and not self.session_manager.in_memory

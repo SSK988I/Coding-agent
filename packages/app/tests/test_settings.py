@@ -35,6 +35,7 @@ def test_set_value_validates_and_persists(tmp_path: Path):
     manager.set_value("auto_retry", "false")
     manager.set_value("max_retries", "3")
     manager.set_value("memory_enabled", "off")
+    manager.set_value("memory_auto_extract", "false")
     manager.set_value("memory_max_records", "12")
     manager.set_value("memory_token_budget", "1200")
 
@@ -42,6 +43,7 @@ def test_set_value_validates_and_persists(tmp_path: Path):
     assert loaded.auto_retry is False
     assert loaded.max_retries == 3
     assert loaded.memory_enabled is False
+    assert loaded.memory_auto_extract is False
     assert loaded.memory_max_records == 12
     assert loaded.memory_token_budget == 1200
 

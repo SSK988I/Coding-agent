@@ -147,6 +147,99 @@ def test_memory_rpc_requires_confirmation_and_publishes_updated_status() -> None
     }
 
 
+def test_memory_v2_status_auto_extract_remember_and_queue_event() -> None:
+    import asyncio
+
+    class MemorySession:
+        memory_enabled = True
+        memory_identity = MemoryIdentity("local-user", "project-a")
+        memory_service = SimpleNamespace(auto_extract=True)
+        settings_manager = None
+        session_manager = SimpleNamespace(header=SimpleNamespace(id="memory-session"))
+        model = SimpleNamespace(id="model-a", name="Model A", provider="test")
+        thinking_level = None
+        tools: list = []
+        state = SimpleNamespace(messages=[])
+        collaboration_mode = "default"
+        plan_state = SimpleNamespace(to_payload=lambda: {
+            "phase": "idle", "activePlanId": None,
+            "latestRevision": None, "pendingQuestion": None,
+        })
+
+        def __init__(self) -> None:
+            self.auto_extract = True
+            self.remembered: list[tuple[str, str]] = []
+
+        async def memory_overview(self) -> MemoryOverview:
+            return MemoryOverview(
+                enabled=True,
+                auto_extract_enabled=self.auto_extract,
+                user_id="local-user",
+                project_id="project-a",
+                global_count=1,
+                project_count=2,
+                conflict_count=0,
+                pending_count=3,
+                processing_count=1,
+                ready_count=4,
+                failed_count=2,
+                last_error="extract failed",
+                root="memory-root",
+            )
+
+        def set_memory_auto_extract(self, enabled: bool) -> None:
+            self.auto_extract = enabled
+
+        async def memory_remember(self, content: str, *, scope: str) -> SimpleNamespace:
+            self.remembered.append((content, scope))
+            return SimpleNamespace(id="mem_manual_01", content=content)
+
+    events: list[dict] = []
+    runtime = DesktopRuntime(events.append)
+    session = MemorySession()
+    runtime._session = session  # type: ignore[assignment]
+    runtime._workspace = Path.cwd()
+
+    status = asyncio.run(runtime.dispatch("memory.status", {}))
+    assert status["autoExtractEnabled"] is True
+    assert status["pendingCount"] == 3
+    assert status["processingCount"] == 1
+    assert status["readyCount"] == 4
+    assert status["failedCount"] == 2
+    assert status["lastError"] == "extract failed"
+
+    workspace = asyncio.run(runtime._workspace_payload_with_memory())
+    assert workspace["memory"]["pendingCount"] == 3
+    assert workspace["memory"]["readyCount"] == 4
+
+    updated = asyncio.run(runtime.dispatch("memory.setAutoExtract", {"enabled": False}))
+    assert session.auto_extract is False
+    assert updated["autoExtractEnabled"] is False
+
+    remembered = asyncio.run(runtime.dispatch("memory.remember", {
+        "content": "偏好中文回答", "scope": "project",
+    }))
+    assert session.remembered == [("偏好中文回答", "project")]
+    assert remembered["record"]["id"] == "mem_manual_01"
+
+    runtime._on_session_event({
+        "type": "memory_queue_changed",
+        "pending_count": 2,
+        "processing_count": 1,
+        "failed_count": 0,
+        "last_error": None,
+    })
+    assert events[-1]["event"] == {
+        "type": "memory.changed",
+        "payload": {
+            "pendingCount": 2,
+            "processingCount": 1,
+            "failedCount": 0,
+            "lastError": None,
+        },
+    }
+
+
 def test_manual_compaction_rehydrates_desktop_with_persisted_summary(tmp_path: Path) -> None:
     import asyncio
 

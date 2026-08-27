@@ -143,6 +143,47 @@ function shortPath(value: string): string {
   return parts.slice(-2).join("/") || value;
 }
 
+function tokenizeCommandArguments(value: string): string[] {
+  const tokens: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | null = null;
+  let tokenStarted = false;
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    if (character === "\\" && quote !== "'") {
+      if (index + 1 >= value.length) throw new Error("命令参数不能以转义符结尾");
+      current += value[index + 1];
+      tokenStarted = true;
+      index += 1;
+      continue;
+    }
+    if (quote !== null) {
+      if (character === quote) quote = null;
+      else current += character;
+      tokenStarted = true;
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      tokenStarted = true;
+      continue;
+    }
+    if (/\s/.test(character)) {
+      if (tokenStarted) {
+        tokens.push(current);
+        current = "";
+        tokenStarted = false;
+      }
+      continue;
+    }
+    current += character;
+    tokenStarted = true;
+  }
+  if (quote !== null) throw new Error("记忆命令参数的引号未闭合");
+  if (tokenStarted) tokens.push(current);
+  return tokens;
+}
+
 export function App() {
   const [sidecarStatus, setSidecarStatus] = useState("starting");
   const [workspace, setWorkspace] = useState<WorkspacePayload | null>(null);
@@ -590,7 +631,7 @@ export function App() {
         return;
       }
       if (name === "memory") {
-        const parts = args.trim().split(/\s+/).filter(Boolean);
+        const parts = tokenizeCommandArguments(args);
         const action = parts[0]?.toLocaleLowerCase() || "status";
         if (action === "on" || action === "off") {
           const memory = await window.agent.request<WorkspacePayload["memory"]>("memory.setEnabled", {
@@ -600,19 +641,69 @@ export function App() {
           addNotice(`长期记忆已${action === "on" ? "开启" : "关闭"}。`);
           return;
         }
+        if (action === "auto") {
+          const enabled = parts[1]?.toLocaleLowerCase();
+          if (parts.length !== 2 || (enabled !== "on" && enabled !== "off")) {
+            addNotice("用法：`/memory auto on|off`");
+            return;
+          }
+          const memory = await window.agent.request<WorkspacePayload["memory"]>("memory.setAutoExtract", {
+            enabled: enabled === "on",
+          });
+          setWorkspace((current) => current ? { ...current, memory } : current);
+          addNotice(`长期记忆自动提取已${enabled === "on" ? "开启" : "关闭"}。`);
+          return;
+        }
         if (action === "status") {
           const memory = await window.agent.request<WorkspacePayload["memory"]>("memory.status");
           setWorkspace((current) => current ? { ...current, memory } : current);
           addNotice([
             "### 长期记忆状态", "",
             `- 状态：\`${memory.enabled ? "on" : "off"}\``,
+            `- 自动提取：\`${memory.autoExtractEnabled === false ? "off" : "on"}\``,
             `- 用户：\`${memory.userId ?? "none"}\``,
             `- 项目：\`${memory.projectId ?? "none"}\``,
             `- 全局记忆：\`${memory.globalCount ?? 0}\``,
             `- 项目记忆：\`${memory.projectCount ?? 0}\``,
             `- 待解决冲突：\`${memory.conflictCount ?? 0}\``,
+            `- 提取任务：待处理 \`${memory.pendingCount ?? 0}\` / 处理中 \`${memory.processingCount ?? 0}\` / 已完成 \`${memory.readyCount ?? 0}\` / 失败 \`${memory.failedCount ?? 0}\``,
+            ...(memory.lastError ? [`- 最近错误：\`${memory.lastError}\``] : []),
             `- 目录：\`${memory.root ?? ""}\``,
           ].join("\n"));
+          return;
+        }
+        if (action === "remember") {
+          const values = parts.slice(1);
+          const delimiter = values.indexOf("--");
+          const optionSide = delimiter >= 0 ? values.slice(0, delimiter) : [...values];
+          const literalSide = delimiter >= 0 ? values.slice(delimiter + 1) : [];
+          const scopeFlags: Record<string, "global" | "project"> = {
+            "--global": "global", "--project": "project",
+          };
+          let scope: "global" | "project" = "global";
+          const trailing = optionSide.at(-1);
+          if (trailing && trailing in scopeFlags) {
+            scope = scopeFlags[trailing];
+            optionSide.pop();
+            const preceding = optionSide.at(-1);
+            if (preceding && preceding in scopeFlags) {
+              addNotice("用法：`/memory remember <内容> [--global|--project]`");
+              return;
+            }
+          }
+          const content = [...optionSide, ...literalSide].join(" ").trim();
+          if (!content) {
+            addNotice("用法：`/memory remember <内容> [--global|--project]`");
+            return;
+          }
+          const result = await window.agent.request<{
+            record: Record<string, unknown> | null;
+            memory: WorkspacePayload["memory"];
+          }>("memory.remember", { content, scope });
+          setWorkspace((current) => current ? { ...current, memory: result.memory } : current);
+          addNotice(result.record
+            ? `已记住（${scope}）：\`${String(result.record.id)}\`。可用 \`/memory forget ${String(result.record.id)}\` 遗忘。`
+            : "该内容未产生新的长期记忆。");
           return;
         }
         if (action === "list") {
@@ -682,7 +773,7 @@ export function App() {
           addNotice(`已遗忘 ${result.count} 条记忆，并保留墓碑记录。`);
           return;
         }
-        addNotice("用法：`/memory status|list|conflicts|forget|clear|on|off`");
+        addNotice("用法：`/memory status|list|conflicts|remember|forget|clear|auto|on|off`");
         return;
       }
       setError(`桌面端暂不支持命令：/${name}`);
@@ -954,6 +1045,21 @@ export function App() {
               >
                 {workspace.memory.enabled ? "已开启" : "已关闭"}
               </button>
+              <span>自动提取</span>
+              <button
+                className={`memory-toggle ${workspace.memory.autoExtractEnabled === false ? "off" : "on"}`}
+                onClick={() => void executeSlashCommand(
+                  "memory", workspace.memory.autoExtractEnabled === false ? "auto on" : "auto off",
+                )}
+                disabled={running || compacting || !workspace.memory.enabled}
+              >
+                {workspace.memory.autoExtractEnabled === false ? "自动提取关闭" : "自动提取开启"}
+              </button>
+              <span>提取队列</span>
+              <strong>
+                待处理 {workspace.memory.pendingCount ?? 0} · 处理中 {workspace.memory.processingCount ?? 0}
+                {" · "}已完成 {workspace.memory.readyCount ?? 0} · 失败 {workspace.memory.failedCount ?? 0}
+              </strong>
             </div>
           )}
         </aside>
