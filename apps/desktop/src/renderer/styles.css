@@ -156,8 +156,17 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #8e8a82; outli
   height: 26px;
   color: #77736d;
 }
-.timeline { min-height: 0; overflow: auto; padding: 48px max(7vw, 34px) 30px; scroll-behavior: smooth; }
-.timeline > * { max-width: 820px; margin-left: auto; margin-right: auto; }
+.timeline {
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+.timeline-row { box-sizing: border-box; width: 100%; padding: 0 max(7vw, 34px); }
+.timeline-row > * { max-width: 820px; margin-left: auto; margin-right: auto; }
+.timeline-spacer--top { height: 34px; }
+.timeline-spacer--bottom { height: 22px; }
+.timeline-row--welcome { min-height: 100%; }
 .welcome-card { padding: 54px 0 30px; }
 .eyebrow { color: #807b73; font-size: 9px; font-weight: 750; letter-spacing: .14em; }
 .welcome-card h1 { color: #282623; font-size: clamp(29px, 4vw, 43px); font-weight: 620; line-height: 1.12; letter-spacing: -.04em; max-width: 640px; margin: 12px 0 14px; }
@@ -206,7 +215,7 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #8e8a82; outli
 .message-body table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 12px; }
 .message-body th, .message-body td { border-bottom: 1px solid var(--line); padding: 8px 9px; text-align: left; }
 .message-body th { color: #5b5751; background: #f7f6f3; font-weight: 650; }
-.message-body pre, .tool-card pre, .thinking-block pre {
+.message-body pre, .thinking-block pre {
   overflow: auto;
   padding: 12px;
   border: 1px solid var(--line);
@@ -221,29 +230,7 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #8e8a82; outli
 .thinking-block summary { cursor: pointer; font-size: 11px; }
 .thinking-block pre { white-space: pre-wrap; border: 0; background: transparent; padding: 7px 0 0; color: #77736c; }
 
-.tool-card {
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: #faf9f7;
-  padding: 12px 14px;
-  margin-top: 9px;
-  margin-bottom: 9px;
-}
-.tool-card.running { border-color: #b8b2a8; }
-.tool-card.approval { border-color: #ddcfad; background: #fffdf6; }
-.tool-card.error { border-color: #d7aaa8; background: #fff8f7; }
-.tool-card-header { display: flex; align-items: center; gap: 8px; }
-.tool-card-header strong { font-size: 11px; font-weight: 650; }
-.tool-card-header span:last-child { margin-left: auto; color: var(--muted); font-size: 9px; }
-.tool-card pre { max-height: 230px; white-space: pre-wrap; }
-.tool-icon { color: #79756e; }
-.tool-approval { display: flex; align-items: center; gap: 12px; padding-top: 9px; border-top: 1px solid #e8dcc0; color: #6a604c; font-size: 10px; }
-.tool-approval > span { flex: 1; }
-.approval-actions { display: flex; justify-content: flex-end; gap: 8px; }
-.primary-button, .danger-button { border: 1px solid transparent; border-radius: 8px; padding: 7px 12px; cursor: pointer; font-size: 11px; font-weight: 600; }
-.primary-button { background: #272623; color: #fff; }
-.primary-button:hover { background: #11110f; }
-.danger-button { border-color: #dedbd5; background: #fff; color: #79504e; }
+.timeline-row > .tool-card-view { margin-top: 9px; margin-bottom: 9px; }
 
 .compaction-card {
   border: 1px solid #d8d3c8;
@@ -334,6 +321,24 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #8e8a82; outli
   padding: 14px max(7vw, 34px) 18px;
   background: linear-gradient(to bottom, rgba(255, 255, 255, 0), #fff 20%);
 }
+.jump-latest {
+  position: absolute;
+  z-index: 8;
+  top: -33px;
+  left: 50%;
+  transform: translateX(-50%);
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, .96);
+  color: #595650;
+  padding: 7px 12px;
+  box-shadow: 0 8px 24px rgba(49, 44, 37, .12);
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 650;
+  backdrop-filter: blur(8px);
+}
+.jump-latest:hover { border-color: #b6b1a8; background: #fff; }
 .command-palette {
   position: absolute;
   z-index: 12;
@@ -469,6 +474,6 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #8e8a82; outli
 
 @media (max-width: 1050px) {
   .workspace-grid { grid-template-columns: 224px minmax(0, 1fr); }
-  .timeline, .composer-wrap { padding-left: 34px; padding-right: 24px; }
+  .timeline-row, .composer-wrap { padding-left: 34px; padding-right: 24px; }
   .command-list > button { grid-template-columns: 29px 120px minmax(0, 1fr); }
 }

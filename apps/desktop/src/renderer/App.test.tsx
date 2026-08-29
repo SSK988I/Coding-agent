@@ -1,8 +1,17 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { VirtuosoMockContext } from "react-virtuoso";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { AgentMessage, RuntimeEvent, WorkspacePayload } from "../shared/types";
 import { App } from "./App";
+
+function renderApp() {
+  return render(
+    <VirtuosoMockContext.Provider value={{ viewportHeight: 900, itemHeight: 120 }}>
+      <App />
+    </VirtuosoMockContext.Provider>,
+  );
+}
 
 const latestPlan = {
   planId: "plan-1",
@@ -60,7 +69,7 @@ describe("desktop Plan Mode", () => {
   });
 
   it("executes only the current revision and digest", async () => {
-    render(<App />);
+    renderApp();
     await screen.findByTestId("plan-card");
     const decision = await screen.findByTestId("plan-decision");
     expect(decision).toHaveTextContent("计划已完成，下一步怎么做？");
@@ -71,7 +80,7 @@ describe("desktop Plan Mode", () => {
   });
 
   it("lets the user supplement the ready plan from the composer", async () => {
-    render(<App />);
+    renderApp();
     await screen.findByTestId("plan-decision");
     fireEvent.click(screen.getByRole("button", { name: /补充想法/ }));
     const composer = screen.getByPlaceholderText("补充你的想法或修改要求…");
@@ -92,7 +101,7 @@ describe("desktop Plan Mode", () => {
       if (method === "session.list" || method === "command.list") return [];
       return {};
     });
-    render(<App />);
+    renderApp();
     await screen.findByText("把 Agent 放进一个真正的工作区");
 
     eventListener?.({
@@ -123,7 +132,7 @@ describe("desktop Plan Mode", () => {
       if (method === "session.list" || method === "command.list") return [];
       return {};
     });
-    render(<App />);
+    renderApp();
     await screen.findByTestId("plan-question");
     fireEvent.click(screen.getByRole("button", { name: /核心/ }));
     await waitFor(() => expect(requests).toHaveBeenCalledWith("plan.answer", {
@@ -132,7 +141,7 @@ describe("desktop Plan Mode", () => {
   });
 
   it("disables Plan actions while a run is active", async () => {
-    render(<App />);
+    renderApp();
     await screen.findByTestId("plan-card");
     eventListener?.({
       v: 1, type: "event", seq: 1, timestamp: Date.now(), sessionId: "session-1", runId: "run-1",
@@ -140,6 +149,33 @@ describe("desktop Plan Mode", () => {
     });
     await waitFor(() => expect(screen.getByRole("button", { name: /执行方案/ })).toBeDisabled());
     expect(screen.getByRole("button", { name: "取消规划" })).toBeDisabled();
+  });
+
+  it("keeps trailing stream events when a session snapshot arrives in the same frame", async () => {
+    renderApp();
+    await screen.findByTestId("plan-card");
+    const nextWorkspace = workspace({
+      sessionId: "session-2",
+      messages: [{ role: "user", content: "new session transcript", timestamp: 20 }],
+      collaborationMode: "default",
+      planState: { phase: "idle", activePlanId: null, latestRevision: null, pendingQuestion: null },
+    });
+
+    eventListener?.({
+      v: 1, type: "event", seq: 10, timestamp: 10, sessionId: "session-2", runId: null,
+      event: { type: "session.changed", payload: nextWorkspace as unknown as Record<string, unknown> },
+    });
+    eventListener?.({
+      v: 1, type: "event", seq: 11, timestamp: 11, sessionId: "session-2", runId: "run-2",
+      event: { type: "message_start", payload: { message: { role: "assistant", content: "" } } },
+    });
+    eventListener?.({
+      v: 1, type: "event", seq: 12, timestamp: 12, sessionId: "session-2", runId: "run-2",
+      event: { type: "message_update", payload: { kind: "text_delta", delta: "live response" } },
+    });
+
+    expect(await screen.findByText("new session transcript")).toBeInTheDocument();
+    expect(await screen.findByText("live response")).toBeInTheDocument();
   });
 });
 
@@ -182,7 +218,7 @@ describe("desktop context compaction", () => {
       return {};
     });
 
-    render(<App />);
+    renderApp();
     const composer = await screen.findByPlaceholderText("描述你想完成的任务…");
     fireEvent.change(composer, { target: { value: "/compact" } });
     fireEvent.click(await screen.findByRole("button", { name: /压缩上下文/ }));
@@ -215,7 +251,7 @@ describe("desktop context compaction", () => {
       return {};
     });
 
-    render(<App />);
+    renderApp();
 
     expect(await screen.findByText("上下文压缩完成")).toBeInTheDocument();
     expect(screen.getByText("此前已经完成桌面端压缩，并保留关键上下文。")).toBeInTheDocument();
@@ -231,7 +267,7 @@ describe("desktop context compaction", () => {
       if (method === "session.list" || method === "command.list") return [];
       return {};
     });
-    render(<App />);
+    renderApp();
     await screen.findByPlaceholderText("描述你想完成的任务…");
 
     eventListener?.({
@@ -343,7 +379,7 @@ describe("desktop long-term memory", () => {
   });
 
   it("toggles memory from the workspace sidebar", async () => {
-    render(<App />);
+    renderApp();
     fireEvent.click(await screen.findByRole("button", { name: "已开启" }));
 
     await waitFor(() => expect(requests).toHaveBeenCalledWith("memory.setEnabled", { enabled: false }));
@@ -352,7 +388,7 @@ describe("desktop long-term memory", () => {
   });
 
   it("renders the authoritative memory overview returned while opening a workspace", async () => {
-    render(<App />);
+    renderApp();
 
     expect(await screen.findByText(
       /待处理 5 · 处理中 1 · 已完成 8 · 失败 2/
@@ -360,7 +396,7 @@ describe("desktop long-term memory", () => {
   });
 
   it("shows status without sending the slash command to the model", async () => {
-    render(<App />);
+    renderApp();
     const composer = await screen.findByPlaceholderText("描述你想完成的任务…");
     fireEvent.change(composer, { target: { value: "/memory status" } });
     fireEvent.click(screen.getByRole("button", { name: "发送 ↑" }));
@@ -373,7 +409,7 @@ describe("desktop long-term memory", () => {
   });
 
   it("toggles automatic extraction independently", async () => {
-    render(<App />);
+    renderApp();
     fireEvent.click(await screen.findByRole("button", { name: "自动提取开启" }));
 
     await waitFor(() => expect(requests).toHaveBeenCalledWith("memory.setAutoExtract", {
@@ -384,7 +420,7 @@ describe("desktop long-term memory", () => {
   });
 
   it("writes an explicit memory without sending it to the main model", async () => {
-    render(<App />);
+    renderApp();
     const composer = await screen.findByPlaceholderText("描述你想完成的任务…");
     fireEvent.change(composer, { target: { value: "/memory remember 偏好中文回答 --project" } });
     fireEvent.click(screen.getByRole("button", { name: "发送 ↑" }));
@@ -397,7 +433,7 @@ describe("desktop long-term memory", () => {
   });
 
   it("keeps flag-shaped text before a trailing remember scope", async () => {
-    render(<App />);
+    renderApp();
     const composer = await screen.findByPlaceholderText("描述你想完成的任务…");
     fireEvent.change(composer, {
       target: { value: "/memory remember 项目安装必须使用 --frozen-lockfile --project" },
@@ -410,7 +446,7 @@ describe("desktop long-term memory", () => {
   });
 
   it("treats remember arguments after the terminator as literal content", async () => {
-    render(<App />);
+    renderApp();
     const composer = await screen.findByPlaceholderText("描述你想完成的任务…");
     fireEvent.change(composer, {
       target: { value: "/memory remember \"保留字面参数\" -- --project" },
@@ -423,7 +459,7 @@ describe("desktop long-term memory", () => {
   });
 
   it("requires explicit confirmation before forgetting a memory", async () => {
-    render(<App />);
+    renderApp();
     const composer = await screen.findByPlaceholderText("描述你想完成的任务…");
     fireEvent.change(composer, { target: { value: "/memory forget response.language" } });
     fireEvent.click(screen.getByRole("button", { name: "发送 ↑" }));

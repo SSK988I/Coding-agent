@@ -1,53 +1,28 @@
-import { FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, KeyboardEvent, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
+import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import remarkGfm from "remark-gfm";
 import type {
-  AgentMessage,
-  ContentBlock,
   RuntimeEvent,
   PlanQuestionPayload,
   PlanRevisionPayload,
   SessionInfo,
   WorkspacePayload,
 } from "../shared/types";
-
-interface ViewMessage {
-  id: string;
-  order: number;
-  role: "user" | "assistant";
-  text: string;
-  thinking: string;
-  status?: string;
-}
-
-interface ToolView {
-  id: string;
-  order: number;
-  name: string;
-  args: unknown;
-  result?: unknown;
-  status: "running" | "approval" | "done" | "error";
-  approval?: ApprovalView;
-}
-
-type CompactionStatus = "running" | "completed" | "skipped" | "failed" | "aborted";
-
-interface CompactionView {
-  id: string;
-  order: number;
-  status: CompactionStatus;
-  reason: string;
-  summary: string;
-  tokensBefore?: number;
-  detail?: string;
-}
-
-interface ApprovalView {
-  approvalId: string;
-  toolCallId: string;
-  toolName: string;
-  args: unknown;
-}
+import { ToolCard } from "./components/tool-card";
+import {
+  createTimelineState,
+  createTimelineStateFromMessages,
+  reduceRuntimeEventBatch,
+  selectTimelineItems,
+  type TimelineApproval,
+  type TimelineCompactionItem,
+  type TimelineCompactionStatus,
+  type TimelineItem,
+  type TimelineMessageItem,
+  type TimelineState,
+  type TimelineToolItem,
+} from "./timeline/timelineState";
 
 interface ModelOption {
   id: string;
@@ -72,76 +47,95 @@ const COMMAND_ICONS: Record<string, string> = {
   memory: "◎",
 };
 
-function messageText(message: AgentMessage): { text: string; thinking: string } {
-  if (typeof message.content === "string") return { text: message.content, thinking: "" };
-  let text = "";
-  let thinking = "";
-  for (const block of message.content as ContentBlock[]) {
-    if (block.type === "text") text += block.text ?? "";
-    if (block.type === "thinking") thinking += block.thinking ?? "";
-  }
-  return { text, thinking };
-}
-
-function persistedMessages(messages: AgentMessage[]): ViewMessage[] {
-  return messages.flatMap((message, index) => {
-    if (message.role !== "user" && message.role !== "assistant") return [];
-    const content = messageText(message);
-    // Slash commands belong to the local UI, and tool-only/error assistant
-    // records have no chat body. Older MVP sessions may contain both.
-    if (message.role === "user" && content.text.trimStart().startsWith("/")) return [];
-    if (message.role === "user" && content.text.trimStart().startsWith("<confirmed_plan_execution>")) {
-      content.text = "执行已确认计划";
-    }
-    if (message.role === "assistant" && !content.text && !content.thinking) return [];
-    return [{
-      id: `persisted-${message.timestamp ?? index}-${index}`,
-      order: index,
-      role: message.role,
-      text: content.text,
-      thinking: content.thinking,
-      status: message.stop_reason,
-    } as ViewMessage];
-  });
-}
-
-function persistedCompactions(messages: AgentMessage[]): CompactionView[] {
-  return messages.flatMap((message, index) => {
-    if (message.role !== "compactionSummary") return [];
-    const tokensBefore = message.tokens_before ?? message.tokensBefore;
-    return [{
-      id: `persisted-compaction-${message.timestamp ?? index}-${index}`,
-      order: index,
-      status: "completed",
-      reason: "persisted",
-      summary: message.summary ?? "",
-      tokensBefore: typeof tokensBefore === "number" ? tokensBefore : undefined,
-    } as CompactionView];
-  });
-}
-
-function toolOutput(value: unknown): string {
-  if (value && typeof value === "object" && "content" in value) {
-    const content = (value as { content?: unknown }).content;
-    if (Array.isArray(content)) {
-      const text = content
-        .flatMap((item) => item && typeof item === "object" && "text" in item
-          ? [String((item as { text?: unknown }).text ?? "")]
-          : [])
-        .filter(Boolean)
-        .join("\n");
-      if (text) return text;
-    }
-  }
-  if (typeof value === "string") return value;
-  return JSON.stringify(value, null, 2) ?? "";
-}
-
 function shortPath(value: string): string {
   const normalized = value.replaceAll("\\", "/");
   const parts = normalized.split("/").filter(Boolean);
   return parts.slice(-2).join("/") || value;
 }
+
+interface PlanTimelineItem {
+  id: string;
+  kind: "plan";
+  order: number;
+  plan: PlanRevisionPayload;
+}
+
+type RenderTimelineItem = TimelineItem | PlanTimelineItem;
+
+const COMPACTION_LABELS: Record<TimelineCompactionStatus, string> = {
+  running: "正在压缩上下文…",
+  completed: "上下文压缩完成",
+  skipped: "未执行上下文压缩",
+  failed: "上下文压缩失败",
+  aborted: "上下文压缩已取消",
+};
+
+const TimelineMessageCard = memo(function TimelineMessageCard({
+  message,
+}: { message: TimelineMessageItem }) {
+  return (
+    <article className={`message ${message.role}`}>
+      <div className="message-avatar">{message.role === "user" ? "你" : "AI"}</div>
+      <div className="message-body">
+        {message.thinking && (
+          <details className="thinking-block">
+            <summary>思考过程</summary>
+            <pre>{message.thinking}</pre>
+          </details>
+        )}
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+          {message.text || (message.status === "streaming" ? "正在思考…" : "")}
+        </ReactMarkdown>
+      </div>
+    </article>
+  );
+});
+
+const TimelineCompactionCard = memo(function TimelineCompactionCard({
+  compaction,
+}: { compaction: TimelineCompactionItem }) {
+  return (
+    <section
+      className={`compaction-card ${compaction.status}`}
+      data-testid="compaction-card"
+    >
+      <div className="compaction-card-header">
+        <span className="compaction-icon">⌁</span>
+        <strong>{COMPACTION_LABELS[compaction.status]}</strong>
+        {compaction.status === "running" && <span className="compaction-spinner" aria-hidden="true" />}
+      </div>
+      {compaction.status === "running" && <p>正在整理较早的对话并生成可恢复摘要，请稍候。</p>}
+      {compaction.summary && compaction.reason !== "persisted" && <p>{compaction.summary}</p>}
+      {compaction.summary && compaction.reason === "persisted" && (
+        <details>
+          <summary>查看压缩摘要</summary>
+          <div className="compaction-summary">
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{compaction.summary}</ReactMarkdown>
+          </div>
+        </details>
+      )}
+      {typeof compaction.tokensBefore === "number" && (
+        <span className="compaction-meta">压缩前约 {compaction.tokensBefore.toLocaleString()} tokens</span>
+      )}
+      {compaction.detail && <p className="compaction-detail">{compaction.detail}</p>}
+    </section>
+  );
+});
+
+const TimelinePlanCard = memo(function TimelinePlanCard({ plan }: { plan: PlanRevisionPayload }) {
+  return (
+    <section className="plan-card" data-testid="plan-card">
+      <div className="plan-card-header">
+        <span className="plan-badge">PLAN</span>
+        <strong>{plan.title}</strong>
+        <span>revision {plan.revision} · {plan.digest.slice(0, 12)}</span>
+      </div>
+      <div className="plan-markdown">
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>{plan.markdown}</ReactMarkdown>
+      </div>
+    </section>
+  );
+});
 
 function tokenizeCommandArguments(value: string): string[] {
   const tokens: string[] = [];
@@ -184,13 +178,48 @@ function tokenizeCommandArguments(value: string): string[] {
   return tokens;
 }
 
+function appendTimelineItem(
+  state: TimelineState,
+  createItem: (order: number) => TimelineItem,
+): TimelineState {
+  const order = state.lastOrder + 1;
+  const item = createItem(order);
+  const exists = Boolean(state.entities[item.id]);
+  return {
+    ...state,
+    entities: { ...state.entities, [item.id]: item },
+    orderedIds: exists ? state.orderedIds : [...state.orderedIds, item.id],
+    lastOrder: Math.max(order, item.order),
+    activeCompactionId: item.kind === "compaction" && item.status === "running"
+      ? item.id
+      : state.activeCompactionId,
+  };
+}
+
+function updateTimelineItem(
+  state: TimelineState,
+  id: string,
+  update: (item: TimelineItem) => TimelineItem,
+): TimelineState {
+  const item = state.entities[id];
+  if (!item) return state;
+  const next = update(item);
+  if (next === item) return state;
+  return {
+    ...state,
+    entities: { ...state.entities, [id]: next },
+    activeCompactionId: next.kind === "compaction" && next.status !== "running"
+      && state.activeCompactionId === id
+      ? null
+      : state.activeCompactionId,
+  };
+}
+
 export function App() {
   const [sidecarStatus, setSidecarStatus] = useState("starting");
   const [workspace, setWorkspace] = useState<WorkspacePayload | null>(null);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
-  const [messages, setMessages] = useState<ViewMessage[]>([]);
-  const [tools, setTools] = useState<ToolView[]>([]);
-  const [compactions, setCompactions] = useState<CompactionView[]>([]);
+  const [timelineState, setTimelineState] = useState<TimelineState>(() => createTimelineState());
   const [commandOptions, setCommandOptions] = useState<CommandOption[]>([]);
   const [commandMenuOpen, setCommandMenuOpen] = useState(false);
   const [selectedCommandIndex, setSelectedCommandIndex] = useState(0);
@@ -202,16 +231,15 @@ export function App() {
   const [compacting, setCompacting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [isAtBottom, setIsAtBottom] = useState(true);
   const [customPlanAnswer, setCustomPlanAnswer] = useState("");
   const [supplementingPlanDigest, setSupplementingPlanDigest] = useState<string | null>(null);
-  const timelineRef = useRef<HTMLDivElement>(null);
+  const virtuosoRef = useRef<VirtuosoHandle>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const didBootstrap = useRef(false);
   const rafQueue = useRef<RuntimeEvent[]>([]);
   const rafId = useRef<number | null>(null);
-  const activeAssistantIds = useRef(new Map<string, string>());
-  const assistantSequence = useRef(0);
-  const timelineSequence = useRef(0);
+  const localItemSequence = useRef(0);
   const activeCompactionId = useRef<string | null>(null);
   const compactingRef = useRef(false);
 
@@ -231,20 +259,19 @@ export function App() {
     }
   };
 
-  const applyWorkspace = (payload: WorkspacePayload) => {
-    timelineSequence.current = payload.messages.length;
+  const applyWorkspace = (payload: WorkspacePayload, restoreTimeline = true) => {
     setWorkspace(payload);
-    setMessages(persistedMessages(payload.messages));
-    setCompactions(persistedCompactions(payload.messages));
-    setTools([]);
+    if (restoreTimeline) {
+      setTimelineState(createTimelineStateFromMessages(payload.messages, payload.sessionId));
+    }
     setCommandMenuOpen(false);
     setModelPickerOpen(false);
     setCustomPlanAnswer("");
     setSupplementingPlanDigest(null);
-    activeAssistantIds.current.clear();
     activeCompactionId.current = null;
     compactingRef.current = false;
     setCompacting(false);
+    setIsAtBottom(true);
     setError(null);
     void refreshSessions();
     void refreshCommands();
@@ -254,23 +281,29 @@ export function App() {
     if (compactingRef.current && activeCompactionId.current) {
       return activeCompactionId.current;
     }
-    const order = ++timelineSequence.current;
-    const id = `compaction-${Date.now()}-${order}`;
+    const timestamp = Date.now();
+    const id = `compaction-${timestamp}-local-${++localItemSequence.current}`;
     activeCompactionId.current = id;
     compactingRef.current = true;
     setCompacting(true);
-    setCompactions((current) => [...current, {
+    setTimelineState((current) => appendTimelineItem(current, (order): TimelineCompactionItem => ({
       id,
+      kind: "compaction",
       order,
+      revision: 0,
+      sessionId: workspace?.sessionId ?? null,
+      runId: null,
+      createdAt: timestamp,
+      updatedAt: timestamp,
       status: "running",
       reason,
       summary: "",
-    }]);
+    })));
     return id;
   };
 
   const finishCompaction = (
-    status: Exclude<CompactionStatus, "running">,
+    status: Exclude<TimelineCompactionStatus, "running">,
     summary = "",
     detail?: string,
   ) => {
@@ -278,8 +311,15 @@ export function App() {
     if (!id) return;
     compactingRef.current = false;
     setCompacting(false);
-    setCompactions((current) => current.map((item) => item.id === id
-      ? { ...item, status, summary: summary || item.summary, detail }
+    setTimelineState((current) => updateTimelineItem(current, id, (item) => item.kind === "compaction"
+      ? {
+          ...item,
+          status,
+          summary: summary || item.summary,
+          detail,
+          revision: item.revision + 1,
+          updatedAt: Date.now(),
+        }
       : item));
   };
 
@@ -297,19 +337,33 @@ export function App() {
   useEffect(() => {
     const unsubscribeStatus = window.agent.onStatus(setSidecarStatus);
     const unsubscribeEvents = window.agent.onEvent((event) => {
-      // Compaction lifecycle events are sparse and user-visible. Process them
-      // before the animation-frame stream queue so the RPC response cannot race
-      // ahead of its start/end status in the renderer.
-      if (event.event.type === "compaction_start" || event.event.type === "compaction_end") {
-        handleRuntimeEvent(event);
-        return;
-      }
       rafQueue.current.push(event);
       if (rafId.current !== null) return;
       rafId.current = requestAnimationFrame(() => {
         const events = rafQueue.current.splice(0);
         rafId.current = null;
-        for (const item of events) handleRuntimeEvent(item);
+        // A session.changed snapshot is authoritative. Discard timeline events
+        // before the last snapshot in this frame, then reduce only events that
+        // belong to the newly selected session.
+        let sessionChangeIndex = -1;
+        for (let index = events.length - 1; index >= 0; index -= 1) {
+          if (events[index].event.type === "session.changed") {
+            sessionChangeIndex = index;
+            break;
+          }
+        }
+        if (sessionChangeIndex >= 0) {
+          const changed = events[sessionChangeIndex];
+          const snapshot = changed.event.payload as unknown as WorkspacePayload;
+          setTimelineState(createTimelineStateFromMessages(snapshot.messages, snapshot.sessionId));
+          const trailingEvents = events.slice(sessionChangeIndex + 1);
+          if (trailingEvents.length) {
+            setTimelineState((current) => reduceRuntimeEventBatch(current, trailingEvents));
+          }
+        } else {
+          setTimelineState((current) => reduceRuntimeEventBatch(current, events));
+        }
+        for (const item of events) handleRuntimeSideEffects(item);
       });
     });
     if (!didBootstrap.current) {
@@ -325,156 +379,38 @@ export function App() {
     };
   }, []);
 
-  useEffect(() => {
-    const timeline = timelineRef.current;
-    if (timeline) timeline.scrollTop = timeline.scrollHeight;
-  }, [messages, tools, compactions, running, compacting]);
-
-  const handleRuntimeEvent = (envelope: RuntimeEvent) => {
+  const handleRuntimeSideEffects = (envelope: RuntimeEvent) => {
     const { type, payload } = envelope.event;
-    const runKey = envelope.runId ?? `seq-${envelope.seq}`;
     if (type === "run.started") {
       setRunning(true);
       return;
     }
     if (type === "run.completed" || type === "run.cancelled" || type === "run.failed") {
       setRunning(false);
-      activeAssistantIds.current.delete(runKey);
       if (type === "run.failed") setError(String(payload.message ?? "运行失败"));
       void refreshSessions();
       return;
     }
     if (type === "compaction_start") {
-      beginCompaction(String(payload.reason ?? "automatic"));
+      compactingRef.current = true;
+      setCompacting(true);
       return;
     }
     if (type === "compaction_end") {
-      const failed = typeof payload.error === "string" && payload.error.length > 0;
-      const status: Exclude<CompactionStatus, "running"> = failed
-        ? "failed"
-        : payload.aborted ? "aborted" : "completed";
-      finishCompaction(
-        status,
-        String(payload.summary_preview ?? ""),
-        failed ? String(payload.error) : undefined,
-      );
+      compactingRef.current = false;
+      setCompacting(false);
       void refreshSessions();
       return;
     }
-    if (type === "message_start") {
-      const raw = payload.message as AgentMessage | undefined;
-      if (raw?.role !== "assistant") return;
-      const messageId = `${runKey}-assistant-${++assistantSequence.current}`;
-      const order = ++timelineSequence.current;
-      activeAssistantIds.current.set(runKey, messageId);
-      setMessages((current) => [
-        ...current,
-        {
-          id: messageId,
-          order,
-          role: "assistant",
-          text: "",
-          thinking: "",
-          status: "streaming",
-        },
-      ]);
-      return;
-    }
-    if (type === "message_update") {
-      const kind = String(payload.kind ?? "");
-      const delta = typeof payload.delta === "string" ? payload.delta : "";
-      if (!delta) return;
-      const messageId = activeAssistantIds.current.get(runKey);
-      if (!messageId) return;
-      setMessages((current) => current.map((item) => item.id === messageId
-        ? {
-            ...item,
-            text: kind === "text_delta" ? item.text + delta : item.text,
-            thinking: kind === "thinking_delta" ? item.thinking + delta : item.thinking,
-          }
-        : item));
-      return;
-    }
     if (type === "message_end") {
-      const raw = payload.message as AgentMessage | undefined;
-      if (raw?.role !== "assistant") return;
-      const content = messageText(raw);
-      const messageId = activeAssistantIds.current.get(runKey);
-      if (messageId) {
-        setMessages((current) => content.text || content.thinking
-          ? current.map((item) => item.id === messageId
-              ? { ...item, ...content, status: raw.stop_reason }
-              : item)
-          : current.filter((item) => item.id !== messageId));
-        activeAssistantIds.current.delete(runKey);
+      const message = payload.message;
+      if (message && typeof message === "object" && "error_message" in message) {
+        const errorMessage = (message as { error_message?: unknown }).error_message;
+        if (typeof errorMessage === "string" && errorMessage) setError(errorMessage);
       }
-      if (raw.error_message) setError(raw.error_message);
-      return;
-    }
-    if (type === "tool_execution_start") {
-      if (payload.tool_name === "request_user_input") return;
-      const id = String(payload.tool_call_id);
-      const order = ++timelineSequence.current;
-      setTools((current) => {
-        const existing = current.find((item) => item.id === id);
-        if (existing) {
-          return current.map((item) => item.id === id
-            ? { ...item, name: String(payload.tool_name), args: payload.args, status: "running" }
-            : item);
-        }
-        return [...current, {
-          id,
-          order,
-          name: String(payload.tool_name),
-          args: payload.args,
-          status: "running",
-        }];
-      });
-      return;
-    }
-    if (type === "tool_execution_end") {
-      if (payload.tool_name === "request_user_input") return;
-      const id = String(payload.tool_call_id);
-      setTools((current) => current.map((item) => item.id === id
-        ? {
-            ...item,
-            approval: undefined,
-            result: payload.result,
-            status: payload.is_error ? "error" : "done",
-          }
-        : item));
-      return;
-    }
-    if (type === "approval.requested") {
-      const approval = payload as unknown as ApprovalView;
-      const order = ++timelineSequence.current;
-      setTools((current) => {
-        const existing = current.find((item) => item.id === approval.toolCallId);
-        if (existing) {
-          return current.map((item) => item.id === approval.toolCallId
-            ? { ...item, approval, status: "approval" }
-            : item);
-        }
-        return [...current, {
-          id: approval.toolCallId,
-          order,
-          name: approval.toolName,
-          args: approval.args,
-          approval,
-          status: "approval",
-        }];
-      });
-      return;
-    }
-    if (type === "approval.expired") {
-      const toolCallId = String(payload.toolCallId);
-      setTools((current) => current.map((item) => item.id === toolCallId
-        ? { ...item, approval: undefined, result: "工具审批已超时", status: "error" }
-        : item));
-      return;
     }
     if (type === "session.changed") {
-      applyWorkspace(payload as unknown as WorkspacePayload);
+      applyWorkspace(payload as unknown as WorkspacePayload, false);
     }
     if (type === "model.changed") {
       const model = payload as unknown as WorkspacePayload["model"];
@@ -545,14 +481,21 @@ export function App() {
   };
 
   const addNotice = (text: string) => {
-    const order = ++timelineSequence.current;
-    setMessages((current) => [...current, {
-      id: `notice-${Date.now()}-${current.length}`,
+    const timestamp = Date.now();
+    const id = `notice-${timestamp}-${++localItemSequence.current}`;
+    setTimelineState((current) => appendTimelineItem(current, (order): TimelineMessageItem => ({
+      id,
+      kind: "message",
       order,
+      revision: 0,
+      sessionId: workspace?.sessionId ?? null,
+      runId: null,
+      createdAt: timestamp,
+      updatedAt: timestamp,
       role: "assistant",
       text,
       thinking: "",
-    }]);
+    })));
   };
 
   const openModelPicker = async (query = "") => {
@@ -583,7 +526,7 @@ export function App() {
             finishCompaction("completed", String(result.summary_preview ?? ""));
           } else {
             const detail = String(result.error ?? "当前没有可压缩的上下文");
-            const status: Exclude<CompactionStatus, "running" | "completed"> = detail === "Compaction aborted"
+            const status: Exclude<TimelineCompactionStatus, "running" | "completed"> = detail === "Compaction aborted"
               ? "aborted"
               : detail === "Nothing to compact" || detail === "Already compacted"
                 ? "skipped"
@@ -795,14 +738,21 @@ export function App() {
     }
     setInput("");
     setError(null);
-    const order = ++timelineSequence.current;
-    setMessages((current) => [...current, {
-      id: `user-${Date.now()}`,
+    const timestamp = Date.now();
+    const id = `user-${timestamp}-${++localItemSequence.current}`;
+    setTimelineState((current) => appendTimelineItem(current, (order): TimelineMessageItem => ({
+      id,
+      kind: "message",
       order,
+      revision: 0,
+      sessionId: workspace.sessionId,
+      runId: null,
+      createdAt: timestamp,
+      updatedAt: timestamp,
       role: "user",
       text,
       thinking: "",
-    }]);
+    })));
     setRunning(true);
     try {
       await window.agent.request("run.start", { text });
@@ -951,21 +901,29 @@ export function App() {
     }
   };
 
-  const resolveApproval = async (approval: ApprovalView, approved: boolean) => {
-    setTools((current) => current.map((item) => item.id === approval.toolCallId
-      ? {
-          ...item,
-          approval: undefined,
-          result: approved ? item.result : "用户拒绝了本次工具调用",
-          status: approved ? "running" : "error",
-        }
-      : item));
+  const resolveApproval = useCallback(async (approval: TimelineApproval, approved: boolean) => {
+    setTimelineState((current) => {
+      const item = Object.values(current.entities).find((candidate): candidate is TimelineToolItem => (
+        candidate.kind === "tool" && candidate.toolCallId === approval.toolCallId
+      ));
+      if (!item) return current;
+      return updateTimelineItem(current, item.id, (candidate) => candidate.kind === "tool"
+        ? {
+            ...candidate,
+            approval: undefined,
+            result: approved ? candidate.result : "用户拒绝了本次工具调用",
+            status: approved ? "running" : "error",
+            revision: candidate.revision + 1,
+            updatedAt: Date.now(),
+          }
+        : candidate);
+    });
     try {
       await window.agent.request("approval.resolve", { approvalId: approval.approvalId, approved });
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     }
-  };
+  }, []);
 
   const openSession = async (sessionId: string) => {
     if (running || compacting || sessionId === workspace?.sessionId) return;
@@ -991,11 +949,85 @@ export function App() {
     readyPlan && supplementingPlanDigest !== readyPlan.digest,
   );
 
-  const timelineItems = useMemo(() => [
-    ...messages.map((value) => ({ kind: "message" as const, order: value.order, value })),
-    ...tools.map((value) => ({ kind: "tool" as const, order: value.order, value })),
-    ...compactions.map((value) => ({ kind: "compaction" as const, order: value.order, value })),
-  ].sort((left, right) => left.order - right.order), [messages, tools, compactions]);
+  const timelineItems = useMemo(() => selectTimelineItems(timelineState), [timelineState]);
+  const renderTimelineItems = useMemo<RenderTimelineItem[]>(() => readyPlan
+    ? [
+        ...timelineItems,
+        {
+          id: `plan:${readyPlan.planId}:${readyPlan.revision}:${readyPlan.digest}`,
+          kind: "plan",
+          order: timelineState.lastOrder + 1,
+          plan: readyPlan,
+        },
+      ]
+    : timelineItems, [readyPlan, timelineItems, timelineState.lastOrder]);
+  const virtuosoComponents = useMemo(() => ({
+    Header: () => <div className="timeline-spacer timeline-spacer--top" aria-hidden="true" />,
+    Footer: () => <div className="timeline-spacer timeline-spacer--bottom" aria-hidden="true" />,
+    EmptyPlaceholder: () => (
+      <div className="timeline-row timeline-row--welcome">
+        <section className="welcome-card">
+          <span className="eyebrow">DESKTOP MVP</span>
+          <h1>把 Agent 放进一个真正的工作区</h1>
+          <p>当前版本已经接通流式响应、工具调用、会话恢复和危险工具审批。</p>
+          <div className="prompt-chips">
+            {["概览这个项目的架构", "找出最值得优化的模块", "运行测试并分析失败原因"].map((value) => (
+              <button key={value} onClick={() => setInput(value)}>{value}</button>
+            ))}
+          </div>
+        </section>
+      </div>
+    ),
+  }), []);
+  const renderTimelineItem = useCallback((_index: number, item: RenderTimelineItem) => {
+    if (item.kind === "plan") {
+      return (
+        <div className="timeline-row">
+          <TimelinePlanCard plan={item.plan} />
+        </div>
+      );
+    }
+    if (item.kind === "message") {
+      return (
+        <div className="timeline-row">
+          <TimelineMessageCard message={item} />
+        </div>
+      );
+    }
+    if (item.kind === "compaction") {
+      return (
+        <div className="timeline-row">
+          <TimelineCompactionCard compaction={item} />
+        </div>
+      );
+    }
+    return (
+      <div className="timeline-row">
+        <ToolCard
+          tool={item}
+          cwd={workspace?.path}
+          onResolveApproval={resolveApproval}
+        />
+      </div>
+    );
+  }, [resolveApproval, workspace?.path]);
+  const lastTimelineSignature = (() => {
+    const last = renderTimelineItems.at(-1);
+    if (!last) return "empty";
+    return last.kind === "plan" ? `${last.id}:${last.plan.digest}` : `${last.id}:${last.revision}`;
+  })();
+
+  useEffect(() => {
+    if (!isAtBottom || renderTimelineItems.length === 0) return;
+    const frame = requestAnimationFrame(() => {
+      virtuosoRef.current?.scrollToIndex({
+        index: renderTimelineItems.length - 1,
+        align: "end",
+        behavior: "auto",
+      });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [isAtBottom, lastTimelineSignature, renderTimelineItems.length, workspace?.sessionId]);
 
   return (
     <div className="app-shell">
@@ -1068,118 +1100,34 @@ export function App() {
           <button className="sidebar-toggle" onClick={() => setSidebarOpen((value) => !value)}>
             {sidebarOpen ? "‹" : "›"}
           </button>
-          <div className="timeline" ref={timelineRef}>
-            {!messages.length && !compactions.length && (
-              <section className="welcome-card">
-                <span className="eyebrow">DESKTOP MVP</span>
-                <h1>把 Agent 放进一个真正的工作区</h1>
-                <p>当前版本已经接通流式响应、工具调用、会话恢复和危险工具审批。</p>
-                <div className="prompt-chips">
-                  {["概览这个项目的架构", "找出最值得优化的模块", "运行测试并分析失败原因"].map((value) => (
-                    <button key={value} onClick={() => setInput(value)}>{value}</button>
-                  ))}
-                </div>
-              </section>
-            )}
-
-            {timelineItems.map((item) => {
-              if (item.kind === "message") {
-                const message = item.value;
-                return (
-                  <article key={`message-${message.id}`} className={`message ${message.role}`}>
-                    <div className="message-avatar">{message.role === "user" ? "你" : "AI"}</div>
-                    <div className="message-body">
-                      {message.thinking && (
-                        <details className="thinking-block">
-                          <summary>思考过程</summary>
-                          <pre>{message.thinking}</pre>
-                        </details>
-                      )}
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.text || (message.status === "streaming" ? "正在思考…" : "")}</ReactMarkdown>
-                    </div>
-                  </article>
-                );
-              }
-
-              if (item.kind === "compaction") {
-                const compaction = item.value;
-                const labels: Record<CompactionStatus, string> = {
-                  running: "正在压缩上下文…",
-                  completed: "上下文压缩完成",
-                  skipped: "未执行上下文压缩",
-                  failed: "上下文压缩失败",
-                  aborted: "上下文压缩已取消",
-                };
-                return (
-                  <section
-                    key={`compaction-${compaction.id}`}
-                    className={`compaction-card ${compaction.status}`}
-                    data-testid="compaction-card"
-                  >
-                    <div className="compaction-card-header">
-                      <span className="compaction-icon">⌁</span>
-                      <strong>{labels[compaction.status]}</strong>
-                      {compaction.status === "running" && <span className="compaction-spinner" aria-hidden="true" />}
-                    </div>
-                    {compaction.status === "running" && <p>正在整理较早的对话并生成可恢复摘要，请稍候。</p>}
-                    {compaction.summary && compaction.reason !== "persisted" && <p>{compaction.summary}</p>}
-                    {compaction.summary && compaction.reason === "persisted" && (
-                      <details>
-                        <summary>查看压缩摘要</summary>
-                        <div className="compaction-summary">
-                          <ReactMarkdown remarkPlugins={[remarkGfm]}>{compaction.summary}</ReactMarkdown>
-                        </div>
-                      </details>
-                    )}
-                    {typeof compaction.tokensBefore === "number" && (
-                      <span className="compaction-meta">压缩前约 {compaction.tokensBefore.toLocaleString()} tokens</span>
-                    )}
-                    {compaction.detail && <p className="compaction-detail">{compaction.detail}</p>}
-                  </section>
-                );
-              }
-
-              const tool = item.value;
-              const status = tool.status === "approval"
-                ? "等待确认"
-                : tool.status === "running"
-                  ? "执行中"
-                  : tool.status === "done" ? "已完成" : "失败";
-              return (
-                <section key={`tool-${tool.id}`} className={`tool-card ${tool.status}`}>
-                  <div className="tool-card-header">
-                    <span className="tool-icon">⌁</span>
-                    <strong>{tool.name}</strong>
-                    <span>{status}</span>
-                  </div>
-                  <pre>{toolOutput(tool.result ?? tool.args)}</pre>
-                  {tool.approval && (
-                    <div className="tool-approval">
-                      <span>此操作可能修改文件或系统状态，是否允许执行？</span>
-                      <div className="approval-actions">
-                        <button className="danger-button" onClick={() => resolveApproval(tool.approval!, false)}>拒绝</button>
-                        <button className="primary-button" onClick={() => resolveApproval(tool.approval!, true)}>允许一次</button>
-                      </div>
-                    </div>
-                  )}
-                </section>
-              );
-            })}
-            {workspace?.planState.phase === "ready" && workspace.planState.latestRevision && (
-              <section className="plan-card" data-testid="plan-card">
-                <div className="plan-card-header">
-                  <span className="plan-badge">PLAN</span>
-                  <strong>{workspace.planState.latestRevision.title}</strong>
-                  <span>revision {workspace.planState.latestRevision.revision} · {workspace.planState.latestRevision.digest.slice(0, 12)}</span>
-                </div>
-                <div className="plan-markdown">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{workspace.planState.latestRevision.markdown}</ReactMarkdown>
-                </div>
-              </section>
-            )}
-          </div>
-
+          <Virtuoso
+            ref={virtuosoRef}
+            className="timeline"
+            aria-label="对话时间线"
+            data={renderTimelineItems}
+            initialItemCount={Math.min(renderTimelineItems.length, 20)}
+            increaseViewportBy={{ top: 600, bottom: 800 }}
+            atBottomThreshold={72}
+            atBottomStateChange={setIsAtBottom}
+            followOutput={(atBottom) => atBottom ? "auto" : false}
+            computeItemKey={(_index, item) => item.id}
+            components={virtuosoComponents}
+            itemContent={renderTimelineItem}
+          />
           <div className="composer-wrap">
+            {!isAtBottom && renderTimelineItems.length > 0 && (
+              <button
+                className="jump-latest"
+                aria-label="回到最新消息"
+                onClick={() => virtuosoRef.current?.scrollToIndex({
+                  index: renderTimelineItems.length - 1,
+                  align: "end",
+                  behavior: "smooth",
+                })}
+              >
+                ↓ 最新消息
+              </button>
+            )}
             {workspace?.planState.pendingQuestion && (
               <section className="plan-question" data-testid="plan-question">
                 <div className="plan-question-header">
