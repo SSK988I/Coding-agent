@@ -13,13 +13,13 @@ def test_bash_on_path_rejects_legacy_wsl(monkeypatch) -> None:
 
 
 def test_windows_resolution_uses_fixed_git_bash_fallback(monkeypatch) -> None:
-    expected = shell_module.os.path.normpath(r"C:\Program Files\Git\usr\bin\bash.exe")
+    expected = r"C:\Program Files\Git\usr\bin\bash.exe"
     monkeypatch.setattr(shell_module.sys, "platform", "win32")
-    monkeypatch.delenv("ProgramFiles", raising=False)
-    monkeypatch.delenv("ProgramW6432", raising=False)
-    monkeypatch.delenv("ProgramFiles(x86)", raising=False)
-    monkeypatch.delenv("LOCALAPPDATA", raising=False)
-    monkeypatch.setenv("SystemDrive", "C:")
+    monkeypatch.setattr(
+        shell_module,
+        "_windows_git_bash_candidates",
+        lambda: [expected],
+    )
     monkeypatch.setattr(shell_module.os.path, "isfile", lambda path: path == expected)
 
     config = shell_module.get_shell_config()
