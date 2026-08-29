@@ -179,7 +179,8 @@ class BashTool:
         on_update: Callable[[AgentToolResult], None] | None = None,
     ) -> tuple[bytes, int]:
         """Read stdout incrementally while watching the Agent abort signal."""
-        if proc.stdout is None:
+        stdout = proc.stdout
+        if stdout is None:
             await proc.wait()
             return b"", 0
 
@@ -190,7 +191,7 @@ class BashTool:
         async def read_stream() -> None:
             nonlocal dropped_bytes, last_update
             while True:
-                chunk = await proc.stdout.read(8192)
+                chunk = await stdout.read(8192)
                 if not chunk:
                     return
                 retained.extend(chunk)
@@ -308,10 +309,13 @@ class BashTool:
                     except ProcessLookupError:
                         pass
         elif proc.pid:
-            try:
-                os.killpg(proc.pid, os_signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
+            killpg = getattr(os, "killpg", None)
+            sigkill = getattr(os_signal, "SIGKILL", None)
+            if killpg is not None and sigkill is not None:
+                try:
+                    killpg(proc.pid, sigkill)
+                except (ProcessLookupError, PermissionError):
+                    pass
         if proc.returncode is None:
             try:
                 proc.kill()
