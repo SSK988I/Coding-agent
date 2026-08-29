@@ -329,6 +329,7 @@ def test_opening_saved_session_does_not_persist_abandoned_empty_session(
         "find . -maxdepth 3 -type f | head -100",
         "rg --files packages/core | head -20",
         "git status --short",
+        "git log --oneline -20 --no-merges 2>&1 | head -30",
         "cd packages/core && git log --oneline -5",
     ],
 )
@@ -344,6 +345,7 @@ def test_read_only_bash_commands_skip_approval(command: str) -> None:
         "rm -rf build",
         "git checkout -- file.py",
         "cat file > copy",
+        "cat missing.txt 2> errors.txt",
         "cat $(pwd)/secret",
         "git branch new-feature",
         "git diff --output=changes.patch",

@@ -149,7 +149,12 @@ def build_system_prompt(
             if g and g not in seen:
                 seen.add(g)
                 guidelines.append(g)
-    for g in ("Be concise in your responses", "Show file paths clearly when working with files"):
+    for g in (
+        "Be concise in your responses",
+        "Show file paths clearly when working with files",
+        "Reply in the same language as the user; if the language is ambiguous, default to Simplified Chinese",
+        "Identify yourself only as Coding Agent; do not claim to be developed or operated by a model provider or another company",
+    ):
         if g not in seen:
             seen.add(g)
             guidelines.append(g)
@@ -160,7 +165,8 @@ def build_system_prompt(
         prompt = custom_prompt
     else:
         prompt = (
-            "You are an expert coding assistant. You help users by reading files, "
+            "You are an expert coding assistant operating inside Coding Agent, "
+            "a coding agent harness. You help users by reading files, "
             "executing commands, editing code, and writing new files.\n\n"
             "Available tools:\n"
             f"{tools_section}\n\n"

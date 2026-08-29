@@ -415,6 +415,7 @@ class RequestUserInputTool:
 
 _CONTROL_TOKENS = (";", "||", "`", "$(", ">", "<", "\n", "\r")
 _SHELL_SPLIT_RE = re.compile(r"\s*(?:\|\||&&|\|)\s*")
+_SAFE_FD_REDIRECTION_RE = re.compile(r"(?<!\S)(?:2>&1|1>&2)(?=\s|$)")
 _READ_COMMANDS = {
     "pwd", "ls", "dir", "cat", "head", "tail", "wc", "sort", "uniq",
     "cut", "grep", "rg", "fd", "find", "where", "which", "type",
@@ -432,11 +433,15 @@ _DANGEROUS_FIND_FLAGS = {"-delete", "-exec", "-execdir", "-ok", "-okdir"}
 def is_plan_safe_shell_command(command: str, cwd: str) -> bool:
     """Conservatively allow reads and recognized validation/build commands."""
     command = command.strip()
-    if not command or any(token in command for token in _CONTROL_TOKENS):
+    # Merging stderr/stdout does not write to disk. Models commonly append
+    # ``2>&1`` to read-only Git commands; strip only these exact FD-to-FD forms
+    # before rejecting real redirects such as ``> output.txt`` or ``2>file``.
+    policy_command = _SAFE_FD_REDIRECTION_RE.sub("", command)
+    if not policy_command or any(token in policy_command for token in _CONTROL_TOKENS):
         return False
-    if re.search(r"(?:^|\s)\.\.(?:[\\/]|(?:\s|$))", command):
+    if re.search(r"(?:^|\s)\.\.(?:[\\/]|(?:\s|$))", policy_command):
         return False
-    segments = _SHELL_SPLIT_RE.split(command)
+    segments = _SHELL_SPLIT_RE.split(policy_command)
     if not segments or any(not segment.strip() for segment in segments):
         return False
     for segment in segments:

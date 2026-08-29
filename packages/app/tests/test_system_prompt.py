@@ -22,10 +22,17 @@ from coding_agent.core.skills import Skill
 # ─── backward compatibility ────────────────────────────────────────────
 
 
-def test_defaults_unchanged_without_new_params():
-    """Calling without the new params behaves exactly like before."""
+def test_default_prompt_sets_product_identity_and_response_policy():
+    """The default prompt carries the product identity and response policy."""
     prompt = build_system_prompt(cwd="/proj", tools=[ReadTool(cwd="/proj")])
-    assert "You are an expert coding assistant" in prompt
+    assert prompt.startswith(
+        "You are an expert coding assistant operating inside Coding Agent, "
+        "a coding agent harness."
+    )
+    assert "Reply in the same language as the user" in prompt
+    assert "default to Simplified Chinese" in prompt
+    assert "Identify yourself only as Coding Agent" in prompt
+    assert "do not claim to be developed or operated by a model provider" in prompt
     assert "<project_context>" not in prompt
     assert "<available_skills>" not in prompt
     assert "Current working directory: /proj" in prompt

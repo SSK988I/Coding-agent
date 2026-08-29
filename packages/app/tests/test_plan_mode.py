@@ -123,12 +123,14 @@ A
     ("command", "allowed"),
     [
         ("git status --short", True),
+        ("git log --oneline -20 --no-merges 2>&1 | head -30", True),
         ("rg --files packages/app | head -20", True),
         ("uv run pytest -q", True),
         ("pnpm typecheck", True),
         ("git checkout -- file.py", False),
         ("python scripts/mutate.py", False),
         ("cat file > copy", False),
+        ("cat missing.txt 2> errors.txt", False),
         ("rg token ../private", False),
     ],
 )
