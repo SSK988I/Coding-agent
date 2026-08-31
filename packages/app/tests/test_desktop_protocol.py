@@ -2,15 +2,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from agent_core import SessionManager
+from agent_core import AgentContext, BeforeToolCallContext
 from agent_llm import AssistantMessage, Model, ModelCost, TextContent, ToolCall, UserMessage
 
 from coding_agent.core.agent_session import AgentSession, AgentSessionConfig
 from coding_agent.core.messages import convert_to_llm
 from coding_agent.desktop.protocol import RpcError, parse_request, to_jsonable
-from coding_agent.desktop.runtime import DesktopRuntime
+from coding_agent.desktop.runtime import DesktopRuntime, _is_read_only_bash_command
+from coding_agent.memory.types import MemoryIdentity, MemoryOverview
 
 
 @dataclass
@@ -63,7 +66,10 @@ def test_agent_session_threads_desktop_tool_hooks() -> None:
         before_tool_call=before,
         after_tool_call=after,
     ))
-    assert session.agent.before_tool_call is before
+    # AgentSession owns the outer policy gate; the desktop hook is chained
+    # behind it so Plan-blocked tools never reach approval.
+    assert session.agent.before_tool_call is not before
+    assert session._config.before_tool_call is before
     assert session.agent.after_tool_call is after
 
 
@@ -91,7 +97,190 @@ def test_desktop_command_catalog_only_exposes_supported_commands() -> None:
 
     assert [command["name"] for command in commands] == [
         "help", "clear", "model", "compact", "session", "new",
+        "plan", "cancel-plan", "execute-plan", "memory",
     ]
+
+
+def test_memory_rpc_requires_confirmation_and_publishes_updated_status() -> None:
+    import asyncio
+
+    class MemorySession:
+        memory_enabled = True
+        memory_identity = MemoryIdentity("local-user", "project-a")
+        settings_manager = None
+        session_manager = SimpleNamespace(header=SimpleNamespace(id="memory-session"))
+
+        async def memory_overview(self) -> MemoryOverview:
+            return MemoryOverview(
+                enabled=self.memory_enabled,
+                user_id="local-user",
+                project_id="project-a",
+                global_count=1,
+                project_count=2,
+                conflict_count=0,
+                root="memory-root",
+            )
+
+        async def memory_forget(self, key: str, scope: str | None) -> bool:
+            assert key == "response.language"
+            assert scope == "global"
+            return True
+
+    events: list[dict] = []
+    runtime = DesktopRuntime(events.append)
+    runtime._session = MemorySession()  # type: ignore[assignment]
+
+    with pytest.raises(RpcError, match="显式确认") as error:
+        asyncio.run(runtime.dispatch("memory.forget", {
+            "key": "response.language", "scope": "global",
+        }))
+    assert error.value.code == "CONFIRMATION_REQUIRED"
+
+    result = asyncio.run(runtime.dispatch("memory.forget", {
+        "key": "response.language", "scope": "global", "confirmed": True,
+    }))
+    assert result["removed"] is True
+    assert result["memory"]["projectCount"] == 2
+    assert events[-1]["event"] == {
+        "type": "memory.changed",
+        "payload": result["memory"],
+    }
+
+
+def test_memory_v2_status_auto_extract_remember_and_queue_event() -> None:
+    import asyncio
+
+    class MemorySession:
+        memory_enabled = True
+        memory_identity = MemoryIdentity("local-user", "project-a")
+        memory_service = SimpleNamespace(auto_extract=True)
+        settings_manager = None
+        session_manager = SimpleNamespace(header=SimpleNamespace(id="memory-session"))
+        model = SimpleNamespace(id="model-a", name="Model A", provider="test")
+        thinking_level = None
+        tools: list = []
+        state = SimpleNamespace(messages=[])
+        collaboration_mode = "default"
+        plan_state = SimpleNamespace(to_payload=lambda: {
+            "phase": "idle", "activePlanId": None,
+            "latestRevision": None, "pendingQuestion": None,
+        })
+
+        def __init__(self) -> None:
+            self.auto_extract = True
+            self.remembered: list[tuple[str, str]] = []
+
+        async def memory_overview(self) -> MemoryOverview:
+            return MemoryOverview(
+                enabled=True,
+                auto_extract_enabled=self.auto_extract,
+                user_id="local-user",
+                project_id="project-a",
+                global_count=1,
+                project_count=2,
+                conflict_count=0,
+                pending_count=3,
+                processing_count=1,
+                ready_count=4,
+                failed_count=2,
+                last_error="extract failed",
+                root="memory-root",
+            )
+
+        def set_memory_auto_extract(self, enabled: bool) -> None:
+            self.auto_extract = enabled
+
+        async def memory_remember(self, content: str, *, scope: str) -> SimpleNamespace:
+            self.remembered.append((content, scope))
+            return SimpleNamespace(id="mem_manual_01", content=content)
+
+    events: list[dict] = []
+    runtime = DesktopRuntime(events.append)
+    session = MemorySession()
+    runtime._session = session  # type: ignore[assignment]
+    runtime._workspace = Path.cwd()
+
+    status = asyncio.run(runtime.dispatch("memory.status", {}))
+    assert status["autoExtractEnabled"] is True
+    assert status["pendingCount"] == 3
+    assert status["processingCount"] == 1
+    assert status["readyCount"] == 4
+    assert status["failedCount"] == 2
+    assert status["lastError"] == "extract failed"
+
+    workspace = asyncio.run(runtime._workspace_payload_with_memory())
+    assert workspace["memory"]["pendingCount"] == 3
+    assert workspace["memory"]["readyCount"] == 4
+
+    updated = asyncio.run(runtime.dispatch("memory.setAutoExtract", {"enabled": False}))
+    assert session.auto_extract is False
+    assert updated["autoExtractEnabled"] is False
+
+    remembered = asyncio.run(runtime.dispatch("memory.remember", {
+        "content": "偏好中文回答", "scope": "project",
+    }))
+    assert session.remembered == [("偏好中文回答", "project")]
+    assert remembered["record"]["id"] == "mem_manual_01"
+
+    runtime._on_session_event({
+        "type": "memory_queue_changed",
+        "pending_count": 2,
+        "processing_count": 1,
+        "failed_count": 0,
+        "last_error": None,
+    })
+    assert events[-1]["event"] == {
+        "type": "memory.changed",
+        "payload": {
+            "pendingCount": 2,
+            "processingCount": 1,
+            "failedCount": 0,
+            "lastError": None,
+        },
+    }
+
+
+def test_manual_compaction_rehydrates_desktop_with_persisted_summary(tmp_path: Path) -> None:
+    import asyncio
+
+    events: list[dict] = []
+    runtime = DesktopRuntime(events.append)
+    summary = SimpleNamespace(
+        role="compactionSummary",
+        summary="durable compacted context",
+        tokens_before=8120,
+        timestamp=1724470000,
+    )
+    state = SimpleNamespace(messages=[])
+
+    async def compact(_reason: str) -> dict:
+        state.messages = [summary]
+        return {"performed": True, "summary_preview": "durable compacted context"}
+
+    runtime._workspace = tmp_path
+    runtime._session = SimpleNamespace(
+        compact=compact,
+        session_manager=SimpleNamespace(header=SimpleNamespace(id="session-compact")),
+        model=SimpleNamespace(id="m", name="Model", provider="test"),
+        thinking_level=None,
+        tools=[],
+        state=state,
+        collaboration_mode="default",
+        plan_state=SimpleNamespace(to_payload=lambda: {
+            "phase": "idle",
+            "activePlanId": None,
+            "latestRevision": None,
+            "pendingQuestion": None,
+        }),
+    )
+
+    result = asyncio.run(runtime._session_compact({}))
+
+    assert result["performed"] is True
+    changed = events[-1]["event"]
+    assert changed["type"] == "session.changed"
+    assert changed["payload"]["messages"][0]["role"] == "compactionSummary"
+    assert changed["payload"]["messages"][0]["summary"] == "durable compacted context"
 
 
 def test_opening_saved_session_does_not_persist_abandoned_empty_session(
@@ -132,3 +321,111 @@ def test_opening_saved_session_does_not_persist_abandoned_empty_session(
             await runtime.dispose()
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "find . -maxdepth 3 -type f | head -100",
+        "rg --files packages/core | head -20",
+        "git status --short",
+        "git log --oneline -20 --no-merges 2>&1 | head -30",
+        "cd packages/core && git log --oneline -5",
+    ],
+)
+def test_read_only_bash_commands_skip_approval(command: str) -> None:
+    assert _is_read_only_bash_command(command) is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "find . -delete",
+        "find . -exec rm {} ;",
+        "rm -rf build",
+        "git checkout -- file.py",
+        "cat file > copy",
+        "cat missing.txt 2> errors.txt",
+        "cat $(pwd)/secret",
+        "git branch new-feature",
+        "git diff --output=changes.patch",
+        "rg --pre 'touch marker' pattern .",
+        "sort input.txt -o output.txt",
+        "uniq input.txt output.txt",
+        "tree -o tree.txt",
+        "rg token ..\\private",
+        "bash -c 'pwd'",
+    ],
+)
+def test_mutating_or_ambiguous_bash_commands_still_require_approval(command: str) -> None:
+    assert _is_read_only_bash_command(command) is False
+
+
+def _tool_context(name: str, args: dict) -> BeforeToolCallContext:
+    tool_call = ToolCall(id="tool-call-1", name=name, arguments=args)
+    return BeforeToolCallContext(
+        assistant_message=AssistantMessage(content=[tool_call]),
+        tool_call=tool_call,
+        args=args,
+        context=AgentContext(),
+    )
+
+
+def test_read_only_bash_hook_does_not_wait_for_approval() -> None:
+    import asyncio
+
+    events: list[dict] = []
+    runtime = DesktopRuntime(events.append)
+    context = _tool_context(
+        "bash",
+        {"command": "find . -maxdepth 3 -type f | head -100"},
+    )
+
+    result = asyncio.run(runtime._before_tool_call(context, asyncio.Event()))
+
+    assert result is None
+    assert events == []
+
+
+def test_mutating_tool_waits_for_and_accepts_explicit_approval() -> None:
+    import asyncio
+
+    async def scenario() -> tuple[object, list[dict]]:
+        events: list[dict] = []
+        runtime = DesktopRuntime(events.append)
+        task = asyncio.create_task(runtime._before_tool_call(
+            _tool_context("write", {"path": "answer.txt", "content": "ok"}),
+            asyncio.Event(),
+        ))
+        await asyncio.sleep(0)
+        approval = events[0]["event"]["payload"]
+        await runtime._approval_resolve({
+            "approvalId": approval["approvalId"],
+            "approved": True,
+        })
+        return await task, events
+
+    result, events = asyncio.run(scenario())
+
+    assert result is None
+    assert [event["event"]["type"] for event in events] == ["approval.requested"]
+
+
+def test_unanswered_approval_expires_instead_of_waiting_forever() -> None:
+    import asyncio
+
+    events: list[dict] = []
+    runtime = DesktopRuntime(events.append, approval_timeout_seconds=0.001)
+
+    result = asyncio.run(runtime._before_tool_call(
+        _tool_context("bash", {"command": "rm -rf build"}),
+        asyncio.Event(),
+    ))
+
+    assert result is not None
+    assert result.block is True
+    assert result.reason == "工具审批已超时"
+    assert [event["event"]["type"] for event in events] == [
+        "approval.requested",
+        "approval.expired",
+    ]

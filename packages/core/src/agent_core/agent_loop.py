@@ -634,7 +634,10 @@ async def _execute_prepared_tool_call(
             "partial_result": partial_result,
         })
         if hasattr(fut, "__await__"):
-            update_futures.append(fut)
+            # Start delivery now. Merely storing the coroutine delays every
+            # partial update until execute() has already finished, which makes
+            # long-running shell commands look frozen in desktop/TUI clients.
+            update_futures.append(asyncio.create_task(fut))
 
     try:
         if _accepts_on_update(tool):

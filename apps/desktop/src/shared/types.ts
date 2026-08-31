@@ -32,11 +32,66 @@ export interface WorkspacePayload {
   thinkingLevel: string | null;
   tools: string[];
   messages: AgentMessage[];
+  collaborationMode: "default" | "plan";
+  planState: PlanStatePayload;
+  memory: MemoryStatePayload;
+}
+
+export interface MemoryStatePayload {
+  enabled: boolean;
+  autoExtractEnabled?: boolean;
+  userId: string | null;
+  projectId: string | null;
+  globalCount?: number;
+  projectCount?: number;
+  conflictCount?: number;
+  pendingCount?: number;
+  processingCount?: number;
+  readyCount?: number;
+  failedCount?: number;
+  lastError?: string | null;
+  root?: string;
+}
+
+export type PlanPhase =
+  | "idle" | "drafting" | "awaiting_answer" | "ready" | "executing"
+  | "completed" | "failed" | "aborted" | "cancelled";
+
+export interface PlanQuestionOptionPayload {
+  label: string;
+  description: string;
+}
+
+export interface PlanQuestionPayload {
+  questionId: string;
+  header: string;
+  question: string;
+  options: PlanQuestionOptionPayload[];
+  allowCustom: boolean;
+}
+
+export interface PlanRevisionPayload {
+  planId: string;
+  revision: number;
+  title: string;
+  markdown: string;
+  digest: string;
+  sourceMessageId: string;
+}
+
+export interface PlanStatePayload {
+  phase: PlanPhase;
+  activePlanId: string | null;
+  latestRevision: PlanRevisionPayload | null;
+  pendingQuestion: PlanQuestionPayload | null;
 }
 
 export interface AgentMessage {
   role: string;
   content: string | ContentBlock[];
+  summary?: string;
+  tokens_before?: number;
+  tokensBefore?: number;
   timestamp?: number;
   stop_reason?: string;
   error_message?: string | null;

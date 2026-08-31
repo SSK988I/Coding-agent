@@ -73,6 +73,11 @@ def get_prompts_dir() -> Path:
     return get_agent_dir() / "prompts"
 
 
+def get_memory_dir() -> Path:
+    """Long-term user memory: ~/.coding-agent/memory/."""
+    return get_agent_dir() / "memory"
+
+
 def get_debug_log_path() -> Path:
     """Debug log: ~/.coding-agent/coding-agent-debug.log."""
     return get_agent_dir() / f"{APP_NAME}-debug.log"

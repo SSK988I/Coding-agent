@@ -25,15 +25,22 @@ from agent_core.session.storage import (
     list_session_files,
     read_entries,
     read_header,
-    session_dir_for_cwd,
+    rewrite_header_line,
+    session_dirs_for_cwd,
     session_file_path,
     write_header_line,
 )
 from agent_core.session.types import (
     CompactionEntry,
     CompactionResult,
+    CollaborationModeChangeEntry,
+    CURRENT_SESSION_VERSION,
     LeafEntry,
     ModelChangeEntry,
+    PlanQuestionAnswerEntry,
+    PlanQuestionEntry,
+    PlanRevisionEntry,
+    PlanRunEntry,
     SessionContext,
     SessionEntry,
     SessionHeader,
@@ -157,10 +164,14 @@ class SessionManager:
         continueRecent.
         """
         cwd = cwd or os.getcwd()
-        project_sessions_dir = session_dir_for_cwd(
-            cwd, agent_dir, sessions_dir=sessions_dir,
-        )
-        files = list_session_files(project_sessions_dir)
+        files = [
+            path
+            for directory in session_dirs_for_cwd(
+                cwd, agent_dir, sessions_dir=sessions_dir,
+            )
+            for path in list_session_files(directory)
+        ]
+        files.sort(key=lambda path: path.stat().st_mtime, reverse=True)
         if not files:
             return None
         return cls.open(
@@ -177,11 +188,16 @@ class SessionManager:
     ) -> list[SessionInfo]:
         """List sessions for this cwd, newest first."""
         cwd = cwd or os.getcwd()
-        project_sessions_dir = session_dir_for_cwd(
-            cwd, agent_dir, sessions_dir=sessions_dir,
-        )
         infos: list[SessionInfo] = []
-        for p in list_session_files(project_sessions_dir):
+        files = [
+            path
+            for directory in session_dirs_for_cwd(
+                cwd, agent_dir, sessions_dir=sessions_dir,
+            )
+            for path in list_session_files(directory)
+        ]
+        files.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+        for p in files:
             info = build_session_info(p)
             if info is not None:
                 infos.append(info)
@@ -303,6 +319,69 @@ class SessionManager:
         self._commit(entry)
         return entry
 
+    def append_collaboration_mode_change(
+        self, mode: str, *, plan_id: str | None = None,
+    ) -> CollaborationModeChangeEntry:
+        if mode not in {"default", "plan"}:
+            raise ValueError(f"Invalid collaboration mode: {mode!r}")
+        entry = CollaborationModeChangeEntry(
+            id=self._next_entry_id(), parent_id=self._parent_for_new_entry(),
+            timestamp=iso_now(), mode=mode, plan_id=plan_id,  # type: ignore[arg-type]
+        )
+        self._commit_v4(entry)
+        return entry
+
+    def append_plan_question(
+        self, *, plan_id: str, question_id: str, header: str,
+        question: str, options: list[dict[str, str]], allow_custom: bool = True,
+    ) -> PlanQuestionEntry:
+        entry = PlanQuestionEntry(
+            id=self._next_entry_id(), parent_id=self._parent_for_new_entry(),
+            timestamp=iso_now(), plan_id=plan_id, question_id=question_id,
+            header=header, question=question, options=options,
+            allow_custom=allow_custom,
+        )
+        self._commit_v4(entry)
+        return entry
+
+    def append_plan_question_answer(
+        self, *, plan_id: str, question_id: str, answer: str,
+    ) -> PlanQuestionAnswerEntry:
+        entry = PlanQuestionAnswerEntry(
+            id=self._next_entry_id(), parent_id=self._parent_for_new_entry(),
+            timestamp=iso_now(), plan_id=plan_id, question_id=question_id,
+            answer=answer,
+        )
+        self._commit_v4(entry)
+        return entry
+
+    def append_plan_revision(
+        self, *, plan_id: str, revision: int, title: str, markdown: str,
+        digest: str, source_message_id: str,
+    ) -> PlanRevisionEntry:
+        entry = PlanRevisionEntry(
+            id=self._next_entry_id(), parent_id=self._parent_for_new_entry(),
+            timestamp=iso_now(), plan_id=plan_id, revision=revision,
+            title=title, markdown=markdown, digest=digest,
+            source_message_id=source_message_id,
+        )
+        self._commit_v4(entry)
+        return entry
+
+    def append_plan_run(
+        self, *, plan_id: str, revision: int, digest: str, status: str,
+        run_id: str | None = None, error: str | None = None,
+    ) -> PlanRunEntry:
+        if status not in {"started", "completed", "failed", "aborted"}:
+            raise ValueError(f"Invalid plan run status: {status!r}")
+        entry = PlanRunEntry(
+            id=self._next_entry_id(), parent_id=self._parent_for_new_entry(),
+            timestamp=iso_now(), plan_id=plan_id, revision=revision,
+            digest=digest, status=status, run_id=run_id, error=error,  # type: ignore[arg-type]
+        )
+        self._commit_v4(entry)
+        return entry
+
     # ─── commit: in-memory + on-disk ──────────────────────────────────
 
     def _commit(self, entry: SessionEntry) -> None:
@@ -330,6 +409,21 @@ class SessionManager:
             for buffered in self.entries[:-1]:
                 append_entry_line(self.path, buffered)
         append_entry_line(self.path, entry)
+
+    def _commit_v4(self, entry: SessionEntry) -> None:
+        """Commit a v4-only entry, upgrading an existing legacy header first."""
+        if self.header.version < CURRENT_SESSION_VERSION:
+            self.header.version = CURRENT_SESSION_VERSION
+            if self._flushed and self.path is not None and self.path.exists():
+                rewrite_header_line(self.path, self.header)
+        self._commit(entry)
+
+    def has_meaningful_activity(self) -> bool:
+        """Return False for a session containing only mode-switch bookkeeping."""
+        return any(
+            not isinstance(entry, (CollaborationModeChangeEntry, LeafEntry))
+            for entry in self.entries
+        )
 
     def flush(self) -> None:
         """Force-create the file even if no assistant message has landed yet.

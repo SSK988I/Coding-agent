@@ -27,6 +27,7 @@ from agent_core.types import (
     QueueMode,
     StreamFn,
     ToolExecutionMode,
+    ToolEffect,
 )
 from agent_core.tools.bash import BashRawResult, BashTool
 from agent_core.tools.edit import EditTool
@@ -58,6 +59,7 @@ __all__ = [
     "AgentMessage",
     "StreamFn",
     "ToolExecutionMode",
+    "ToolEffect",
     "QueueMode",
     "PendingMessageQueue",
     "BeforeToolCallContext",

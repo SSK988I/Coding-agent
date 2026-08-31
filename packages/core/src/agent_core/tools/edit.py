@@ -305,6 +305,7 @@ class EditTool:
     """
 
     name: str = "edit"
+    effect: str = "write"
     label: str = "edit"
     description: str = (
         "Edit a single file using exact text replacement. Every edits[].oldText "

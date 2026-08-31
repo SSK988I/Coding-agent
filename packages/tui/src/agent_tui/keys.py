@@ -133,7 +133,7 @@ def parse_key_id(key_id: str) -> "dict | None":
 
 # ─── Key matching ───────────────────────────────────
 
-def matches_key(data: str, key_id: str) -> bool:
+def matches_key(data: str, key_id: str | list[str]) -> bool:
     """Match raw input ``data`` against a key identifier.
 
     Supported key identifiers:
@@ -148,6 +148,8 @@ def matches_key(data: str, key_id: str) -> bool:
     Supports legacy escape sequences and Ctrl/Alt/Shift on printable characters.
     Kitty CSI-u and modifyOtherKeys sequences return ``False``.
     """
+    if isinstance(key_id, list):
+        return any(matches_key(data, candidate) for candidate in key_id)
     parsed = parse_key_id(key_id)
     if not parsed:
         return False

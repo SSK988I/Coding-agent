@@ -6,14 +6,14 @@ the system default shell (cmd.exe on Windows, where those commands fail).
 
 Resolution order:
   1. Git Bash in known locations          (Windows only)
-  2. ``bash`` / ``bash.exe`` on PATH      (where/which)
+  2. ``bash`` / ``bash.exe`` on PATH      (where/which, excluding legacy WSL)
   3. Fallback to the system shell         (cmd.exe on Windows, sh on Unix)
 
 When no bash is found we return ``shell_kind="system"`` so callers can inject
 platform hints into the system prompt (e.g. tell the model it's on cmd.exe and
-should use ``dir`` instead of ``ls``). On Windows legacy WSL ``bash.exe`` the
-command must be fed via stdin (``-s``) rather than argv (``-c``); we detect
-that path shape and switch transport accordingly.
+should use ``dir`` instead of ``ls``). The deprecated Windows/System32 WSL
+launcher is deliberately ignored: it may block while starting a distro and it
+does not understand native paths such as ``E:/code/project``.
 """
 from __future__ import annotations
 
@@ -51,17 +51,38 @@ def _is_legacy_wsl_bash(path: str) -> bool:
 
 
 def _bash_shell_config(shell: str) -> ShellConfig:
-    if _is_legacy_wsl_bash(shell):
-        return ShellConfig(shell, ("-s",), "stdin", "bash")
-    return ShellConfig(shell, ("-c",), "argv", "bash")
+    # Agent tools are never interactive. Ignoring profile/rc files prevents a
+    # user BASH_ENV or shell startup hook from blocking a desktop sidecar.
+    return ShellConfig(shell, ("--noprofile", "--norc", "-c"), "argv", "bash")
 
 
 def _find_bash_on_path() -> str | None:
     """Locate ``bash`` on PATH."""
     found = shutil.which("bash") or shutil.which("bash.exe")
-    if found and os.path.isfile(found):
+    if found and os.path.isfile(found) and not _is_legacy_wsl_bash(found):
         return found
     return None
+
+
+def _windows_git_bash_candidates() -> list[str]:
+    """Return stable Git Bash locations even in a sanitized GUI environment."""
+    roots = [
+        os.environ.get("ProgramFiles"),
+        os.environ.get("ProgramW6432"),
+        os.environ.get("ProgramFiles(x86)"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs"),
+        os.path.join(os.environ.get("SystemDrive", "C:"), os.sep, "Program Files"),
+        os.path.join(os.environ.get("SystemDrive", "C:"), os.sep, "Program Files (x86)"),
+    ]
+    candidates: list[str] = []
+    for root in roots:
+        if not root:
+            continue
+        for relative in (("Git", "usr", "bin", "bash.exe"), ("Git", "bin", "bash.exe")):
+            candidate = os.path.normpath(os.path.join(root, *relative))
+            if candidate not in candidates:
+                candidates.append(candidate)
+    return candidates
 
 
 def get_shell_config(custom_shell_path: str | None = None) -> ShellConfig:
@@ -75,23 +96,23 @@ def get_shell_config(custom_shell_path: str | None = None) -> ShellConfig:
     """
     if custom_shell_path:
         if os.path.isfile(custom_shell_path):
+            if _is_legacy_wsl_bash(custom_shell_path):
+                raise ValueError(
+                    "The legacy Windows/System32 WSL bash launcher is not supported; "
+                    "configure Git Bash instead"
+                )
             return _bash_shell_config(custom_shell_path)
         raise FileNotFoundError(f"Custom shell path not found: {custom_shell_path}")
 
     if sys.platform == "win32":
-        # 2. Git Bash in known locations.
-        candidates: list[str] = []
-        pf = os.environ.get("ProgramFiles")
-        if pf:
-            candidates.append(os.path.join(pf, "Git", "bin", "bash.exe"))
-        pf86 = os.environ.get("ProgramFiles(x86)")
-        if pf86:
-            candidates.append(os.path.join(pf86, "Git", "bin", "bash.exe"))
-        for path in candidates:
+        # 2. Git Bash in known locations. Include fixed fallbacks because GUI
+        # hosts occasionally launch sidecars with a reduced environment.
+        for path in _windows_git_bash_candidates():
             if os.path.isfile(path):
                 return _bash_shell_config(path)
 
-        # 3. bash on PATH (Cygwin, MSYS2, WSL).
+        # 3. bash on PATH (Cygwin/MSYS2). Legacy System32 WSL is rejected by
+        # _find_bash_on_path because it can hang and cannot use native cwd paths.
         on_path = _find_bash_on_path()
         if on_path:
             return _bash_shell_config(on_path)

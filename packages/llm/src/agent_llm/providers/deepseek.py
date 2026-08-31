@@ -1,6 +1,6 @@
 """DeepSeek provider 工厂。
 
-构造基于 OpenAI-completions stream 的 DeepSeek provider。
+构造基于 DeepSeek Responses API stream 的 provider。
 auth 为单个环境变量 ``DEEPSEEK_API_KEY``,通过 ``env_api_key_auth`` 读取。
 """
 from __future__ import annotations
@@ -18,8 +18,8 @@ _API_STREAMS = None  # type: ignore[var-annotated]
 def _get_api_streams():
     global _API_STREAMS
     if _API_STREAMS is None:
-        from agent_llm.api import openai_completions
-        _API_STREAMS = openai_completions
+        from agent_llm.api import deepseek_responses
+        _API_STREAMS = deepseek_responses
     return _API_STREAMS
 
 

@@ -123,12 +123,16 @@ def test_assistant_message_full_roundtrip():
         usage=Usage(input=1, output=2, total_tokens=3),
         stop_reason="tool_use",
         error_message=None,
+        provider_data={"response_items": [{"type": "web_search_call", "id": "ws-1"}]},
     )
     d = message_to_dict(m)
     out = dict_to_message(d)
     assert isinstance(out, AssistantMessage)
     assert out.provider == "deepseek" and out.model == "deepseek-v4-flash"
     assert out.response_id == "resp-1" and out.stop_reason == "tool_use"
+    assert out.provider_data == {
+        "response_items": [{"type": "web_search_call", "id": "ws-1"}],
+    }
     assert out.usage.total_tokens == 3
     # content block order and types preserved
     assert isinstance(out.content[0], ThinkingContent)

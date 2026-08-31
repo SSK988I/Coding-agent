@@ -39,8 +39,12 @@ DEFAULT_APP_KEYBINDINGS: dict[str, dict] = {
         "keys": [] if sys.platform == "win32" else "ctrl+z",
         "description": "Suspend to background",
     },
+    "app.mode.cycle": {
+        "keys": ["shift+tab", "alt+m"],
+        "description": "Cycle Default and Plan modes",
+    },
     "app.thinking.cycle": {
-        "keys": "shift+tab",
+        "keys": "alt+t",
         "description": "Cycle thinking level",
     },
     "app.thinking.toggle": {

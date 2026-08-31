@@ -78,6 +78,7 @@ class GrepTool:
     """
 
     name: str = "grep"
+    effect: str = "read"
     label: str = "grep"
     description: str = (
         f"Search file contents for a pattern. Returns matching lines with file "
@@ -117,9 +118,16 @@ class GrepTool:
         # Prefer ripgrep; fall back to pure Python.
         rg = find_in_path("rg")
         if rg:
-            text = await self._run_with_rg(
-                rg, pattern, full_path, glob_pat, ignore_case, literal, limit
-            )
+            try:
+                text = await self._run_with_rg(
+                    rg, pattern, full_path, glob_pat, ignore_case, literal, limit
+                )
+            except (OSError, RuntimeError):
+                # Microsoft Store/App aliases can be discoverable by PATH but
+                # not executable by child processes. Fall back deterministically.
+                text = self._run_with_python(
+                    pattern, full_path, glob_pat, ignore_case, literal, context, limit
+                )
         else:
             text = self._run_with_python(
                 pattern, full_path, glob_pat, ignore_case, literal, context, limit

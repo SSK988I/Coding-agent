@@ -11,13 +11,15 @@ It can read and modify project files, search code, execute shell commands, and s
 ## Features
 
 - **Streaming agent loop**: processes model output, tool calls, tool results, and subsequent reasoning, with abort, steering, and follow-up support.
-- **Seven built-in development tools**: `read`, `write`, `edit`, `grep`, `find`, `ls`, and `bash`.
+- **Built-in development and search tools**: `read`, `write`, `edit`, `grep`, `find`, `ls`, `bash`, plus optional `web_search`.
 - **Restorable sessions**: stores messages and settings changes in append-only JSONL and tracks the active branch through an entry tree.
 - **Context management**: includes token estimation, summary compaction, and compact-and-retry after context overflow.
+- **File-backed long-term memory**: extracts stable preferences and confirmed project decisions, retrieves them by user and project, and persists YAML snapshots backed by append-only JSONL facts.
 - **Multiple model providers**: currently includes catalogs for DeepSeek and Z.AI Coding Plan (China).
 - **Project context**: discovers `AGENTS.md`, `CLAUDE.md`, skills, and prompt templates.
 - **Terminal UI**: renders Markdown, streaming content, tool cards, model selection, and line-based differential updates.
 - **Desktop MVP**: supports workspace selection, session history, streaming messages, tool approval, model switching, and a slash-command palette.
+- **Cross-client Plan Mode**: provides read-only exploration, structured questions, immutable plan revisions, and explicit execution confirmation shared by CLI and desktop.
 
 ## Interfaces
 
@@ -36,7 +38,7 @@ The desktop MVP currently supports:
 - Tool execution cards and result updates
 - Approval prompts for `bash`, `write`, and `edit`
 - A command palette that opens when `/` is entered
-- `/help`, `/new`, `/model`, `/compact`, `/clear`, and `/session`
+- `/help`, `/new`, `/model`, `/compact`, `/clear`, `/session`, `/plan`, `/cancel-plan`, `/execute-plan`, and `/memory`
 
 ## Requirements
 
@@ -152,6 +154,21 @@ uv run coding-agent --session <path-or-session-id>
 uv run coding-agent --no-session
 ```
 
+### Plan Mode
+
+Enter Plan Mode interactively with `/plan`, `Shift+Tab`, or `Alt+M`. `Shift+Tab`/`Alt+M` leaves Plan Mode by cancelling; it never executes a plan. Thinking-level cycling is `Alt+T`, while `Ctrl+T` only toggles thinking-block visibility.
+
+For resumable non-interactive workflows:
+
+```powershell
+uv run coding-agent --agent-mode plan -p "Plan the requested change"
+uv run coding-agent --session <session-id> --answer-plan-question <question-id> "answer"
+uv run coding-agent --session <session-id> --execute-plan <revision>
+uv run coding-agent --session <session-id> --cancel-plan
+```
+
+Plan State is stored in JSONL v4 and can be resumed by either the CLI or desktop client. When a revision is ready, the interactive clients ask whether to execute it or supplement ideas; supplemental text returns the episode to drafting and never authorizes execution. See [Plan Mode Specification](docs/specs/plan-mode.md).
+
 ### Provider and model selection
 
 ```powershell
@@ -172,6 +189,28 @@ uv run coding-agent --exclude-tools bash
 # Disable all tools
 uv run coding-agent --no-tools
 ```
+
+### Web search
+
+Web search is enabled by default and automatically follows the selected model:
+
+- DeepSeek uses the native server-side `web_search` tool through the Responses API and reuses `DEEPSEEK_API_KEY`; no separate search key is required.
+- Other models use the stored Zhipu Z.AI Coding Plan credential through the Web Search Prime Remote MCP fallback.
+
+The welcome card reports the effective state as `WEB on/off`. Native DeepSeek search is counted as an available tool but does not open an MCP connection.
+
+```powershell
+# Enable for this run only (overrides the persisted setting)
+uv run coding-agent --web-search "Find the current stable Python release and cite official sources"
+
+# Persist the setting for future sessions (enter this in the interactive UI)
+/settings web_search_enabled true
+
+# Explicitly disable for this run
+uv run coding-agent --no-web-search
+```
+
+Queries are sent to the active search service and may consume DeepSeek API or Coding Plan MCP quota. Never include API keys, cookies, private code, internal URLs, or personal data. Search snippets are untrusted external data, and final answers should retain the returned source URLs.
 
 ### File and image attachments
 
@@ -197,6 +236,7 @@ Images can only be sent to models whose catalog entries declare `image` input su
 | `find` | Find files by name or pattern |
 | `ls` | List directory contents |
 | `bash` | Execute shell commands |
+| `web_search` | Search the public web through native DeepSeek Responses or the configured Remote MCP fallback; enabled by default |
 
 Tools expose their name, description, JSON Schema parameters, and asynchronous execution method through a common interface. The agent runtime validates arguments before execution and emits start, update, and end events. Embedding frontends can use before/after hooks for approval, auditing, or result transformation.
 
@@ -208,9 +248,11 @@ Tools expose their name, description, JSON Schema parameters, and asynchronous e
 | `/model` | Select a model from configured providers |
 | `/login`, `/logout` | Manage provider credentials |
 | `/new` | Start a new session |
+| `/plan`, `/cancel-plan`, `/execute-plan` | Enter, cancel, or explicitly execute Plan Mode |
 | `/session` | Show session information and statistics |
 | `/tree` | Inspect and switch session branches |
 | `/compact` | Compact context manually |
+| `/memory` | Inspect, toggle, forget, or clear long-term memory |
 | `/settings` | View or update persistent settings |
 | `/export` | Export HTML or JSONL |
 | `/copy` | Copy the latest assistant response |
@@ -219,6 +261,23 @@ Tools expose their name, description, JSON Schema parameters, and asynchronous e
 
 The terminal editor provides slash-command completion. Entering `/` in the desktop composer opens a filterable command palette.
 
+### Long-term memory
+
+Long-term memory is enabled by default. After a successful outer task, extraction uses only user-authored evidence, structured Plan answers, or the exact Plan revision the user explicitly executed. Tool output, assistant-only conclusions, Plan drafts, and compaction summaries are excluded. Relevant records are injected transiently before the next task and are never appended to the session JSONL.
+
+```text
+/memory status
+/memory list [--global|--project]
+/memory conflicts
+/memory forget <id-or-key> [--global|--project] --confirm
+/memory clear --project --confirm
+/memory clear --all --confirm
+/memory on
+/memory off
+```
+
+Memories are isolated by user and project. Forget and clear operations append tombstones so replaying old sessions cannot restore deleted values.
+
 ## Sessions and configuration
 
 The default data directory is `~/.coding-agent`. Override it with `CODING_AGENT_HOME`:
@@ -226,8 +285,9 @@ The default data directory is `~/.coding-agent`. Override it with `CODING_AGENT_
 ```text
 ~/.coding-agent/
 ├── auth.json        # Provider credentials
-├── settings.json    # Model, thinking level, and retry settings
-└── sessions/        # Per-project JSONL sessions
+├── settings.json    # Model, thinking, retry, memory, and web-search settings
+├── sessions/        # Per-project JSONL sessions
+└── memory/          # User/project YAML snapshots and JSONL fact logs
 ```
 
 Session files are append-only. In addition to user and assistant messages, they record model changes, thinking levels, compaction entries, and branch pointers so the active context can be restored after a restart.

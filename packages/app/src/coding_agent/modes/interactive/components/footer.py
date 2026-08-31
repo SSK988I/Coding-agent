@@ -84,6 +84,10 @@ class FooterComponent(Component):
         if is_reasoning:
             lvl = thinking_level or "off"
             model_part = f"{model_id} • thinking {lvl}"
+        mode_part = (
+            "mode plan" if getattr(self._session, "collaboration_mode", "default") == "plan"
+            else ""
+        )
 
         # Token stats + context usage.
         token_part = ""
@@ -99,7 +103,7 @@ class FooterComponent(Component):
         cost_part = f"${stats.cost:.4f}" if stats.cost > 0 else ""
 
         # Join with separators, then color and truncate.
-        parts = [p for p in (left, model_part, token_part, cost_part) if p]
+        parts = [p for p in (left, mode_part, model_part, token_part, cost_part) if p]
         line = " | ".join(parts)
 
         # Colorize the context marker if present.

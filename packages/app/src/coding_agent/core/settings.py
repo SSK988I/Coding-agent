@@ -26,6 +26,17 @@ class Settings:
     max_retries: int = 2
     retry_initial_delay: float = 1.0
     retry_max_delay: float = 8.0
+    memory_enabled: bool = True
+    memory_auto_extract: bool = True
+    memory_user_id: str = "local-user"
+    memory_max_records: int = 8
+    memory_token_budget: int = 800
+    # Enabled by default. DeepSeek executes search natively with the same API
+    # credential; other providers use the configured application backend.
+    web_search_enabled: bool = True
+    web_search_backend: str = "zhipu-mcp"
+    web_search_max_results: int = 5
+    web_search_timeout_seconds: float = 30.0
 
 
 class SettingsManager:
@@ -108,6 +119,36 @@ class SettingsManager:
             raise ValueError("retry_max_delay must be between 0 and 300")
         if settings.retry_max_delay < settings.retry_initial_delay:
             raise ValueError("retry_max_delay must be >= retry_initial_delay")
+        if not isinstance(settings.memory_enabled, bool):
+            raise ValueError("memory_enabled must be a boolean")
+        if not isinstance(settings.memory_auto_extract, bool):
+            raise ValueError("memory_auto_extract must be a boolean")
+        if not isinstance(settings.memory_user_id, str) or not settings.memory_user_id.strip():
+            raise ValueError("memory_user_id must be a non-empty string")
+        settings.memory_user_id = settings.memory_user_id.strip()
+        if len(settings.memory_user_id) > 200:
+            raise ValueError("memory_user_id must be at most 200 characters")
+        if isinstance(settings.memory_max_records, bool) or not 1 <= settings.memory_max_records <= 50:
+            raise ValueError("memory_max_records must be between 1 and 50")
+        if isinstance(settings.memory_token_budget, bool) or not 100 <= settings.memory_token_budget <= 8000:
+            raise ValueError("memory_token_budget must be between 100 and 8000")
+        if not isinstance(settings.web_search_enabled, bool):
+            raise ValueError("web_search_enabled must be a boolean")
+        if settings.web_search_backend != "zhipu-mcp":
+            raise ValueError("web_search_backend must currently be 'zhipu-mcp'")
+        if (
+            isinstance(settings.web_search_max_results, bool)
+            or not isinstance(settings.web_search_max_results, int)
+            or not 1 <= settings.web_search_max_results <= 10
+        ):
+            raise ValueError("web_search_max_results must be between 1 and 10")
+        if (
+            isinstance(settings.web_search_timeout_seconds, bool)
+            or not isinstance(settings.web_search_timeout_seconds, (int, float))
+            or not 1 <= settings.web_search_timeout_seconds <= 120
+        ):
+            raise ValueError("web_search_timeout_seconds must be between 1 and 120")
+        settings.web_search_timeout_seconds = float(settings.web_search_timeout_seconds)
         return settings
 
     def _backup_corrupt_file(self) -> Path | None:

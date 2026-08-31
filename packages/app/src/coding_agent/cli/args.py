@@ -43,6 +43,7 @@ class Args:
     exclude_tools: list[str] | None = None
     no_tools: bool = False
     no_builtin_tools: bool = False
+    web_search: bool | None = None
 
     no_context_files: bool = False
 
@@ -58,6 +59,10 @@ class Args:
     print_mode: bool = False
     #: 非交互模式输出格式：``text`` 为最终回复，``json`` 为事件流。
     output_mode: str = "text"
+    agent_mode: str | None = None
+    answer_plan_question: str | None = None
+    execute_plan: int | None = None
+    cancel_plan: bool = False
     export_path: str | None = None
     list_models: str | None = None  # None=off, ""=all, "str"=search
 
@@ -225,6 +230,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="禁用内置工具",
     )
+    web_search_group = tool_group.add_mutually_exclusive_group()
+    web_search_group.add_argument(
+        "--web-search",
+        dest="web_search",
+        action="store_true",
+        help="为本次运行启用联网检索（查询会发送给外部服务）",
+    )
+    web_search_group.add_argument(
+        "--no-web-search",
+        dest="web_search",
+        action="store_false",
+        help="为本次运行禁用联网检索",
+    )
+    parser.set_defaults(web_search=None)
 
     # ── Project context ──────────────────────────────────────────────────
     context_group = parser.add_argument_group("项目上下文")
@@ -266,6 +285,28 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["text", "json"],
         default="text",
         help="非交互输出格式：'text' 为最终回复，'json' 为事件流（每行一个 JSON 对象）",
+    )
+    mode_group.add_argument(
+        "--agent-mode",
+        choices=["default", "plan"],
+        help="会话协作模式：default 或 plan（与输出格式 --mode 不同）",
+    )
+    plan_control = mode_group.add_mutually_exclusive_group()
+    plan_control.add_argument(
+        "--answer-plan-question",
+        metavar="QUESTION_ID",
+        help="回答恢复会话中的待处理 Plan 问题；答案由唯一位置参数提供",
+    )
+    plan_control.add_argument(
+        "--execute-plan",
+        metavar="REVISION",
+        type=int,
+        help="执行恢复会话中的指定最新 Plan revision",
+    )
+    plan_control.add_argument(
+        "--cancel-plan",
+        action="store_true",
+        help="取消恢复会话中的 Plan Mode，不执行计划",
     )
     mode_group.add_argument(
         "--export",
@@ -404,6 +445,7 @@ def _apply_namespace(args: Args, ns: argparse.Namespace) -> None:
     args.exclude_tools = ns.exclude_tools
     args.no_tools = ns.no_tools
     args.no_builtin_tools = ns.no_builtin_tools
+    args.web_search = ns.web_search
 
     args.no_context_files = ns.no_context_files
     args.skill_paths = list(ns.skill_paths) if ns.skill_paths else None
@@ -414,6 +456,10 @@ def _apply_namespace(args: Args, ns: argparse.Namespace) -> None:
     # 运行模式
     args.print_mode = ns.print_mode
     args.output_mode = ns.mode
+    args.agent_mode = ns.agent_mode
+    args.answer_plan_question = ns.answer_plan_question
+    args.execute_plan = ns.execute_plan
+    args.cancel_plan = ns.cancel_plan
     args.export_path = ns.export_path
     args.list_models = ns.list_models  # None=off, ""=all, "str"=search
 
@@ -441,6 +487,8 @@ def resolve_app_mode(args: Args) -> str:
     TTY（管道输入输出）时强制使用 ``print``，否则使用 ``interactive``。
     """
     if args.print_mode:
+        return "print"
+    if args.answer_plan_question or args.execute_plan is not None or args.cancel_plan:
         return "print"
     if getattr(args, "output_mode", "text") == "json":
         return "print"

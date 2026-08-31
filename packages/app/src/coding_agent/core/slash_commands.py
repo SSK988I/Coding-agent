@@ -47,7 +47,7 @@ BUILTIN_SLASH_COMMANDS: list[BuiltinSlashCommand] = [
     BuiltinSlashCommand("model", "Select or switch model"),
     BuiltinSlashCommand(
         "thinking",
-        "Set the reasoning/thinking level (now: Shift+Tab hotkey)",
+        "Set the reasoning/thinking level (now: Alt+T hotkey)",
         active=False,
     ),
     BuiltinSlashCommand("login", "Configure provider authentication (API key)"),
@@ -57,6 +57,10 @@ BUILTIN_SLASH_COMMANDS: list[BuiltinSlashCommand] = [
     BuiltinSlashCommand("session", "Show session info and statistics"),
     BuiltinSlashCommand("name", "Set session display name"),
     BuiltinSlashCommand("new", "Start a new session"),
+    BuiltinSlashCommand("plan", "Enter Plan Mode"),
+    BuiltinSlashCommand("cancel-plan", "Cancel Plan Mode without executing"),
+    BuiltinSlashCommand("execute-plan", "Execute the latest confirmed Plan revision"),
+    BuiltinSlashCommand("memory", "Inspect and manage long-term memory"),
 
     # ── Export and utility commands ───────────────────────────────────────
     BuiltinSlashCommand("export", "Export session to HTML (default) or JSONL (.jsonl path)"),

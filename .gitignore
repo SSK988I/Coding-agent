@@ -23,6 +23,7 @@ ENV/
 /auth.json
 /settings.json
 /sessions/
+/memory/
 
 # 测试、类型检查和覆盖率缓存
 .pytest_cache/
@@ -66,3 +67,6 @@ Desktop.ini
 .claude/
 .zcode/
 .codex/
+
+# 本地开发文档
+/docs/

@@ -7,9 +7,8 @@ from __future__ import annotations
 
 from agent_llm.types import Model, ModelCost
 
-#: DeepSeek 的 compat 块。``thinking_format:"deepseek"`` 告诉 openai-completions
-#: 发送 ``thinking: {type}`` 参数;``requires_reasoning_content_on_assistant_messages``
-#: 在多轮对话中,回放 assistant message 时会带上空的 ``reasoning_content``。
+#: DeepSeek Responses API 兼容配置。thinking_format 仍保留为 deepseek，供
+#: 自定义目录和诊断代码识别 provider 的推理语义。
 _DEEPSEEK_COMPAT = {
     "supports_store": False,
     "supports_developer_role": False,
@@ -30,7 +29,7 @@ DEEPSEEK_MODELS: dict[str, Model] = {
     "deepseek-v4-flash": Model(
         id="deepseek-v4-flash",
         name="DeepSeek V4 Flash",
-        api="openai-completions",
+        api="openai-responses",
         provider="deepseek",
         base_url="https://api.deepseek.com",
         compat=dict(_DEEPSEEK_COMPAT),
@@ -44,7 +43,7 @@ DEEPSEEK_MODELS: dict[str, Model] = {
     "deepseek-v4-pro": Model(
         id="deepseek-v4-pro",
         name="DeepSeek V4 Pro",
-        api="openai-completions",
+        api="openai-responses",
         provider="deepseek",
         base_url="https://api.deepseek.com",
         compat=dict(_DEEPSEEK_COMPAT),

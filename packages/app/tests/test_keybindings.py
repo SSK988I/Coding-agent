@@ -27,6 +27,25 @@ def test_app_clear_is_ctrl_c():
     assert get_keybinding("app.clear") == "ctrl+c"
 
 
+def test_plan_and_thinking_shortcuts_do_not_conflict():
+    assert get_keybinding("app.mode.cycle") == ["shift+tab", "alt+m"]
+    assert get_keybinding("app.thinking.cycle") == "alt+t"
+    assert get_keybinding("app.thinking.toggle") == "ctrl+t"
+
+
+def test_windows_vt_shift_tab_sequence_matches_mode_cycle():
+    from agent_tui import matches_key
+
+    assert matches_key("\x1b[Z", get_keybinding("app.mode.cycle"))  # type: ignore[arg-type]
+
+
+def test_alt_meta_sequences_match_mode_and_thinking_cycles():
+    from agent_tui import matches_key
+
+    assert matches_key("\x1bm", get_keybinding("app.mode.cycle"))  # type: ignore[arg-type]
+    assert matches_key("\x1bt", get_keybinding("app.thinking.cycle"))  # type: ignore[arg-type]
+
+
 def test_editor_submit_is_enter():
     assert get_keybinding("editor.submit") == "enter"
 

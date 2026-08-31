@@ -11,13 +11,15 @@ Coding Agent 是一个面向本地开发工作的编程 Agent。项目以 Python
 ## 主要功能
 
 - **流式 Agent Loop**：处理模型输出、工具调用、工具结果和后续推理，支持运行中终止、转向消息与后续消息。
-- **七个内置开发工具**：`read`、`write`、`edit`、`grep`、`find`、`ls` 和 `bash`。
+- **内置开发与检索工具**：`read`、`write`、`edit`、`grep`、`find`、`ls`、`bash`，以及可选的 `web_search`。
 - **可恢复会话**：使用 Append-only JSONL 保存消息和设置变更，通过 Entry Tree 记录活动分支。
 - **上下文管理**：提供 Token 估算、摘要压缩和上下文溢出后的 Compact-and-Retry。
+- **文件式长期记忆**：从成功任务中提取稳定偏好和已确认项目决策，按用户与项目检索，使用 YAML 快照与 Append-only JSONL 事实日志持久化。
 - **多模型 Provider**：当前内置 DeepSeek 和智谱 Z.AI Coding Plan（中国区）模型目录。
 - **项目上下文**：支持发现 `AGENTS.md`、`CLAUDE.md`、Skills 和提示词模板。
 - **终端界面**：支持 Markdown、流式内容、工具卡片、模型选择和按行差分渲染。
 - **桌面端 MVP**：支持项目选择、会话列表、流式消息、工具审批、模型切换和斜杠命令面板。
+- **跨端 Plan Mode**：CLI 与桌面端共享只读探索、结构化问题、不可变计划 revision 和显式执行确认。
 
 ## 界面形态
 
@@ -36,7 +38,7 @@ Coding Agent 是一个面向本地开发工作的编程 Agent。项目以 Python
 - 展示工具调用状态和执行结果
 - 对 `bash`、`write`、`edit` 请求执行确认
 - 输入 `/` 打开命令面板
-- `/help`、`/new`、`/model`、`/compact`、`/clear`、`/session`
+- `/help`、`/new`、`/model`、`/compact`、`/clear`、`/session`、`/plan`、`/cancel-plan`、`/execute-plan`、`/memory`
 
 ## 环境要求
 
@@ -152,6 +154,21 @@ uv run coding-agent --session <路径或会话ID>
 uv run coding-agent --no-session
 ```
 
+### Plan Mode
+
+交互模式可通过 `/plan`、`Shift+Tab` 或 `Alt+M` 进入 Plan Mode。再次按 `Shift+Tab`/`Alt+M` 只会取消规划，不会执行计划。思考级别循环迁移到 `Alt+T`；`Ctrl+T` 仍只展开或折叠 thinking block。
+
+非交互模式使用可恢复控制参数：
+
+```powershell
+uv run coding-agent --agent-mode plan -p "规划这项改动"
+uv run coding-agent --session <会话ID> --answer-plan-question <问题ID> "回答"
+uv run coding-agent --session <会话ID> --execute-plan <revision>
+uv run coding-agent --session <会话ID> --cancel-plan
+```
+
+Plan State 使用 JSONL v4 持久化，可由 CLI 或桌面端交叉恢复。revision 就绪后，交互端会要求选择“执行方案”或“补充想法”；补充内容会回到 drafting，且绝不会构成执行授权。完整约束见 [Plan Mode 规范](docs/specs/plan-mode.md)。
+
 ### 选择 Provider 和模型
 
 ```powershell
@@ -172,6 +189,28 @@ uv run coding-agent --exclude-tools bash
 # 禁用全部工具
 uv run coding-agent --no-tools
 ```
+
+### 联网检索
+
+联网检索默认开启，并按当前模型自动选择执行路径：
+
+- DeepSeek：通过 Responses API 使用服务端原生 `web_search`，复用 `DEEPSEEK_API_KEY`，不需要额外的搜索 Key。
+- 其他模型：使用已保存的智谱 Z.AI Coding Plan 凭据连接 Web Search Prime Remote MCP。
+
+欢迎卡片中的 `WEB on/off` 显示当前开关；DeepSeek 原生搜索仍会计入工具总数，但不会建立 MCP 连接。
+
+```powershell
+# 仅为本次运行启用（可覆盖持久设置）
+uv run coding-agent --web-search "搜索 Python 当前稳定版本，并附上官方来源"
+
+# 持久启用；在交互界面中输入，后续会话生效
+/settings web_search_enabled true
+
+# 显式禁用本次运行
+uv run coding-agent --no-web-search
+```
+
+搜索词会发送给当前搜索服务，并可能消耗 DeepSeek API 或 Coding Plan MCP 额度。不要在查询中放入 API Key、Cookie、私有代码、内部 URL 或个人数据。搜索摘要属于不可信外部数据，最终回答应保留来源 URL。
 
 ### 附加文件和图片
 
@@ -197,6 +236,7 @@ uv run coding-agent --provider zhipu --model glm-5v-turbo `
 | `find` | 按名称或模式查找文件 |
 | `ls` | 查看目录内容 |
 | `bash` | 执行 Shell 命令 |
+| `web_search` | 搜索公开网络；DeepSeek 使用原生 Responses 工具，其他模型回退到配置的 Remote MCP；默认开启 |
 
 工具通过统一接口声明名称、描述、JSON Schema 参数和异步执行方法。Agent Runtime 会在执行前校验参数，并发出开始、更新和结束事件。嵌入式前端可以通过执行前后 Hook 加入审批、审计或结果处理逻辑。
 
@@ -208,9 +248,11 @@ uv run coding-agent --provider zhipu --model glm-5v-turbo `
 | `/model` | 选择已配置 Provider 的模型 |
 | `/login`、`/logout` | 管理 Provider 凭据 |
 | `/new` | 创建新会话 |
+| `/plan`、`/cancel-plan`、`/execute-plan` | 进入、取消或显式执行 Plan Mode |
 | `/session` | 查看会话信息和统计数据 |
 | `/tree` | 查看并切换会话分支 |
 | `/compact` | 手动压缩上下文 |
+| `/memory` | 查看、开关、遗忘或清理长期记忆 |
 | `/settings` | 查看或修改持久化设置 |
 | `/export` | 导出 HTML 或 JSONL |
 | `/copy` | 复制最近一条助手回复 |
@@ -219,6 +261,23 @@ uv run coding-agent --provider zhipu --model glm-5v-turbo `
 
 终端输入框支持斜杠命令补全。桌面端输入 `/` 会打开可筛选的命令面板。
 
+### 长期记忆
+
+长期记忆默认开启。每个成功的外层任务结束后，应用只使用本轮用户原文、结构化 Plan 回答或用户明确执行的精确 Plan revision 提取候选；工具输出、助手单方面结论、Plan 草稿和压缩摘要不能作为事实证据。新任务开始前，相关记录会以临时系统上下文注入，不写回会话 JSONL。
+
+```text
+/memory status
+/memory list [--global|--project]
+/memory conflicts
+/memory forget <id-or-key> [--global|--project] --confirm
+/memory clear --project --confirm
+/memory clear --all --confirm
+/memory on
+/memory off
+```
+
+记忆按用户和项目隔离。项目级记录只在当前项目生效；同 key 的项目记录会临时覆盖全局记录。`forget` 和 `clear` 会写入墓碑，防止旧会话重放后恢复已删除内容。
+
 ## 会话与配置
 
 默认数据目录为 `~/.coding-agent`，可以通过 `CODING_AGENT_HOME` 修改：
@@ -226,8 +285,9 @@ uv run coding-agent --provider zhipu --model glm-5v-turbo `
 ```text
 ~/.coding-agent/
 ├── auth.json        # Provider 凭据
-├── settings.json    # 模型、思考级别和重试设置
-└── sessions/        # 按项目保存的 JSONL 会话
+├── settings.json    # 模型、思考级别、重试、记忆和联网检索设置
+├── sessions/        # 按项目保存的 JSONL 会话
+└── memory/          # 用户/项目隔离的 YAML 快照与 JSONL 事实日志
 ```
 
 会话文件使用追加写入。除用户和助手消息外，还会记录模型切换、思考级别、压缩节点和分支指针等状态，因此可以在重启后恢复活动上下文。

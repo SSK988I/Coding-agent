@@ -1,36 +1,28 @@
-import { FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, KeyboardEvent, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
+import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import remarkGfm from "remark-gfm";
 import type {
-  AgentMessage,
-  ContentBlock,
   RuntimeEvent,
+  PlanQuestionPayload,
+  PlanRevisionPayload,
   SessionInfo,
   WorkspacePayload,
 } from "../shared/types";
-
-interface ViewMessage {
-  id: string;
-  role: "user" | "assistant";
-  text: string;
-  thinking: string;
-  status?: string;
-}
-
-interface ToolView {
-  id: string;
-  name: string;
-  args: unknown;
-  result?: unknown;
-  status: "running" | "done" | "error";
-}
-
-interface ApprovalView {
-  approvalId: string;
-  toolCallId: string;
-  toolName: string;
-  args: unknown;
-}
+import { ToolCard } from "./components/tool-card";
+import {
+  createTimelineState,
+  createTimelineStateFromMessages,
+  reduceRuntimeEventBatch,
+  selectTimelineItems,
+  type TimelineApproval,
+  type TimelineCompactionItem,
+  type TimelineCompactionStatus,
+  type TimelineItem,
+  type TimelineMessageItem,
+  type TimelineState,
+  type TimelineToolItem,
+} from "./timeline/timelineState";
 
 interface ModelOption {
   id: string;
@@ -52,36 +44,8 @@ const COMMAND_ICONS: Record<string, string> = {
   compact: "⌁",
   clear: "↺",
   session: "◷",
+  memory: "◎",
 };
-
-function messageText(message: AgentMessage): { text: string; thinking: string } {
-  if (typeof message.content === "string") return { text: message.content, thinking: "" };
-  let text = "";
-  let thinking = "";
-  for (const block of message.content as ContentBlock[]) {
-    if (block.type === "text") text += block.text ?? "";
-    if (block.type === "thinking") thinking += block.thinking ?? "";
-  }
-  return { text, thinking };
-}
-
-function persistedMessages(messages: AgentMessage[]): ViewMessage[] {
-  return messages.flatMap((message, index) => {
-    if (message.role !== "user" && message.role !== "assistant") return [];
-    const content = messageText(message);
-    // Slash commands belong to the local UI, and tool-only/error assistant
-    // records have no chat body. Older MVP sessions may contain both.
-    if (message.role === "user" && content.text.trimStart().startsWith("/")) return [];
-    if (message.role === "assistant" && !content.text && !content.thinking) return [];
-    return [{
-      id: `persisted-${message.timestamp ?? index}-${index}`,
-      role: message.role,
-      text: content.text,
-      thinking: content.thinking,
-      status: message.stop_reason,
-    } as ViewMessage];
-  });
-}
 
 function shortPath(value: string): string {
   const normalized = value.replaceAll("\\", "/");
@@ -89,13 +53,173 @@ function shortPath(value: string): string {
   return parts.slice(-2).join("/") || value;
 }
 
+interface PlanTimelineItem {
+  id: string;
+  kind: "plan";
+  order: number;
+  plan: PlanRevisionPayload;
+}
+
+type RenderTimelineItem = TimelineItem | PlanTimelineItem;
+
+const COMPACTION_LABELS: Record<TimelineCompactionStatus, string> = {
+  running: "正在压缩上下文…",
+  completed: "上下文压缩完成",
+  skipped: "未执行上下文压缩",
+  failed: "上下文压缩失败",
+  aborted: "上下文压缩已取消",
+};
+
+const TimelineMessageCard = memo(function TimelineMessageCard({
+  message,
+}: { message: TimelineMessageItem }) {
+  return (
+    <article className={`message ${message.role}`}>
+      <div className="message-avatar">{message.role === "user" ? "你" : "AI"}</div>
+      <div className="message-body">
+        {message.thinking && (
+          <details className="thinking-block">
+            <summary>思考过程</summary>
+            <pre>{message.thinking}</pre>
+          </details>
+        )}
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+          {message.text || (message.status === "streaming" ? "正在思考…" : "")}
+        </ReactMarkdown>
+      </div>
+    </article>
+  );
+});
+
+const TimelineCompactionCard = memo(function TimelineCompactionCard({
+  compaction,
+}: { compaction: TimelineCompactionItem }) {
+  return (
+    <section
+      className={`compaction-card ${compaction.status}`}
+      data-testid="compaction-card"
+    >
+      <div className="compaction-card-header">
+        <span className="compaction-icon">⌁</span>
+        <strong>{COMPACTION_LABELS[compaction.status]}</strong>
+        {compaction.status === "running" && <span className="compaction-spinner" aria-hidden="true" />}
+      </div>
+      {compaction.status === "running" && <p>正在整理较早的对话并生成可恢复摘要，请稍候。</p>}
+      {compaction.summary && compaction.reason !== "persisted" && <p>{compaction.summary}</p>}
+      {compaction.summary && compaction.reason === "persisted" && (
+        <details>
+          <summary>查看压缩摘要</summary>
+          <div className="compaction-summary">
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{compaction.summary}</ReactMarkdown>
+          </div>
+        </details>
+      )}
+      {typeof compaction.tokensBefore === "number" && (
+        <span className="compaction-meta">压缩前约 {compaction.tokensBefore.toLocaleString()} tokens</span>
+      )}
+      {compaction.detail && <p className="compaction-detail">{compaction.detail}</p>}
+    </section>
+  );
+});
+
+const TimelinePlanCard = memo(function TimelinePlanCard({ plan }: { plan: PlanRevisionPayload }) {
+  return (
+    <section className="plan-card" data-testid="plan-card">
+      <div className="plan-card-header">
+        <span className="plan-badge">PLAN</span>
+        <strong>{plan.title}</strong>
+        <span>revision {plan.revision} · {plan.digest.slice(0, 12)}</span>
+      </div>
+      <div className="plan-markdown">
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>{plan.markdown}</ReactMarkdown>
+      </div>
+    </section>
+  );
+});
+
+function tokenizeCommandArguments(value: string): string[] {
+  const tokens: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | null = null;
+  let tokenStarted = false;
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    if (character === "\\" && quote !== "'") {
+      if (index + 1 >= value.length) throw new Error("命令参数不能以转义符结尾");
+      current += value[index + 1];
+      tokenStarted = true;
+      index += 1;
+      continue;
+    }
+    if (quote !== null) {
+      if (character === quote) quote = null;
+      else current += character;
+      tokenStarted = true;
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      tokenStarted = true;
+      continue;
+    }
+    if (/\s/.test(character)) {
+      if (tokenStarted) {
+        tokens.push(current);
+        current = "";
+        tokenStarted = false;
+      }
+      continue;
+    }
+    current += character;
+    tokenStarted = true;
+  }
+  if (quote !== null) throw new Error("记忆命令参数的引号未闭合");
+  if (tokenStarted) tokens.push(current);
+  return tokens;
+}
+
+function appendTimelineItem(
+  state: TimelineState,
+  createItem: (order: number) => TimelineItem,
+): TimelineState {
+  const order = state.lastOrder + 1;
+  const item = createItem(order);
+  const exists = Boolean(state.entities[item.id]);
+  return {
+    ...state,
+    entities: { ...state.entities, [item.id]: item },
+    orderedIds: exists ? state.orderedIds : [...state.orderedIds, item.id],
+    lastOrder: Math.max(order, item.order),
+    activeCompactionId: item.kind === "compaction" && item.status === "running"
+      ? item.id
+      : state.activeCompactionId,
+  };
+}
+
+function updateTimelineItem(
+  state: TimelineState,
+  id: string,
+  update: (item: TimelineItem) => TimelineItem,
+): TimelineState {
+  const item = state.entities[id];
+  if (!item) return state;
+  const next = update(item);
+  if (next === item) return state;
+  return {
+    ...state,
+    entities: { ...state.entities, [id]: next },
+    activeCompactionId: next.kind === "compaction" && next.status !== "running"
+      && state.activeCompactionId === id
+      ? null
+      : state.activeCompactionId,
+  };
+}
+
 export function App() {
   const [sidecarStatus, setSidecarStatus] = useState("starting");
   const [workspace, setWorkspace] = useState<WorkspacePayload | null>(null);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
-  const [messages, setMessages] = useState<ViewMessage[]>([]);
-  const [tools, setTools] = useState<ToolView[]>([]);
-  const [approvals, setApprovals] = useState<ApprovalView[]>([]);
+  const [timelineState, setTimelineState] = useState<TimelineState>(() => createTimelineState());
   const [commandOptions, setCommandOptions] = useState<CommandOption[]>([]);
   const [commandMenuOpen, setCommandMenuOpen] = useState(false);
   const [selectedCommandIndex, setSelectedCommandIndex] = useState(0);
@@ -104,14 +228,20 @@ export function App() {
   const [modelQuery, setModelQuery] = useState("");
   const [input, setInput] = useState("");
   const [running, setRunning] = useState(false);
+  const [compacting, setCompacting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const timelineRef = useRef<HTMLDivElement>(null);
+  const [isAtBottom, setIsAtBottom] = useState(true);
+  const [customPlanAnswer, setCustomPlanAnswer] = useState("");
+  const [supplementingPlanDigest, setSupplementingPlanDigest] = useState<string | null>(null);
+  const virtuosoRef = useRef<VirtuosoHandle>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
   const didBootstrap = useRef(false);
   const rafQueue = useRef<RuntimeEvent[]>([]);
   const rafId = useRef<number | null>(null);
-  const activeAssistantIds = useRef(new Map<string, string>());
-  const assistantSequence = useRef(0);
+  const localItemSequence = useRef(0);
+  const activeCompactionId = useRef<string | null>(null);
+  const compactingRef = useRef(false);
 
   const refreshSessions = async () => {
     try {
@@ -129,23 +259,75 @@ export function App() {
     }
   };
 
-  const applyWorkspace = (payload: WorkspacePayload) => {
+  const applyWorkspace = (payload: WorkspacePayload, restoreTimeline = true) => {
     setWorkspace(payload);
-    setMessages(persistedMessages(payload.messages));
-    setTools([]);
-    setApprovals([]);
+    if (restoreTimeline) {
+      setTimelineState(createTimelineStateFromMessages(payload.messages, payload.sessionId));
+    }
     setCommandMenuOpen(false);
     setModelPickerOpen(false);
-    activeAssistantIds.current.clear();
+    setCustomPlanAnswer("");
+    setSupplementingPlanDigest(null);
+    activeCompactionId.current = null;
+    compactingRef.current = false;
+    setCompacting(false);
+    setIsAtBottom(true);
     setError(null);
     void refreshSessions();
     void refreshCommands();
+  };
+
+  const beginCompaction = (reason: string): string => {
+    if (compactingRef.current && activeCompactionId.current) {
+      return activeCompactionId.current;
+    }
+    const timestamp = Date.now();
+    const id = `compaction-${timestamp}-local-${++localItemSequence.current}`;
+    activeCompactionId.current = id;
+    compactingRef.current = true;
+    setCompacting(true);
+    setTimelineState((current) => appendTimelineItem(current, (order): TimelineCompactionItem => ({
+      id,
+      kind: "compaction",
+      order,
+      revision: 0,
+      sessionId: workspace?.sessionId ?? null,
+      runId: null,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      status: "running",
+      reason,
+      summary: "",
+    })));
+    return id;
+  };
+
+  const finishCompaction = (
+    status: Exclude<TimelineCompactionStatus, "running">,
+    summary = "",
+    detail?: string,
+  ) => {
+    const id = activeCompactionId.current;
+    if (!id) return;
+    compactingRef.current = false;
+    setCompacting(false);
+    setTimelineState((current) => updateTimelineItem(current, id, (item) => item.kind === "compaction"
+      ? {
+          ...item,
+          status,
+          summary: summary || item.summary,
+          detail,
+          revision: item.revision + 1,
+          updatedAt: Date.now(),
+        }
+      : item));
   };
 
   const openWorkspace = async (path: string, resume = true) => {
     setError(null);
     try {
       const result = await window.agent.request<WorkspacePayload>("workspace.open", { path, resume });
+      setSidecarStatus("ready");
       applyWorkspace(result);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
@@ -160,7 +342,28 @@ export function App() {
       rafId.current = requestAnimationFrame(() => {
         const events = rafQueue.current.splice(0);
         rafId.current = null;
-        for (const item of events) handleRuntimeEvent(item);
+        // A session.changed snapshot is authoritative. Discard timeline events
+        // before the last snapshot in this frame, then reduce only events that
+        // belong to the newly selected session.
+        let sessionChangeIndex = -1;
+        for (let index = events.length - 1; index >= 0; index -= 1) {
+          if (events[index].event.type === "session.changed") {
+            sessionChangeIndex = index;
+            break;
+          }
+        }
+        if (sessionChangeIndex >= 0) {
+          const changed = events[sessionChangeIndex];
+          const snapshot = changed.event.payload as unknown as WorkspacePayload;
+          setTimelineState(createTimelineStateFromMessages(snapshot.messages, snapshot.sessionId));
+          const trailingEvents = events.slice(sessionChangeIndex + 1);
+          if (trailingEvents.length) {
+            setTimelineState((current) => reduceRuntimeEventBatch(current, trailingEvents));
+          }
+        } else {
+          setTimelineState((current) => reduceRuntimeEventBatch(current, events));
+        }
+        for (const item of events) handleRuntimeSideEffects(item);
       });
     });
     if (!didBootstrap.current) {
@@ -176,91 +379,99 @@ export function App() {
     };
   }, []);
 
-  useEffect(() => {
-    const timeline = timelineRef.current;
-    if (timeline) timeline.scrollTop = timeline.scrollHeight;
-  }, [messages, tools, approvals, running]);
-
-  const handleRuntimeEvent = (envelope: RuntimeEvent) => {
+  const handleRuntimeSideEffects = (envelope: RuntimeEvent) => {
     const { type, payload } = envelope.event;
-    const runKey = envelope.runId ?? `seq-${envelope.seq}`;
     if (type === "run.started") {
       setRunning(true);
       return;
     }
     if (type === "run.completed" || type === "run.cancelled" || type === "run.failed") {
       setRunning(false);
-      activeAssistantIds.current.delete(runKey);
       if (type === "run.failed") setError(String(payload.message ?? "运行失败"));
       void refreshSessions();
       return;
     }
-    if (type === "message_start") {
-      const raw = payload.message as AgentMessage | undefined;
-      if (raw?.role !== "assistant") return;
-      const messageId = `${runKey}-assistant-${++assistantSequence.current}`;
-      activeAssistantIds.current.set(runKey, messageId);
-      setMessages((current) => [
-        ...current,
-        { id: messageId, role: "assistant", text: "", thinking: "", status: "streaming" },
-      ]);
+    if (type === "compaction_start") {
+      compactingRef.current = true;
+      setCompacting(true);
       return;
     }
-    if (type === "message_update") {
-      const kind = String(payload.kind ?? "");
-      const delta = typeof payload.delta === "string" ? payload.delta : "";
-      if (!delta) return;
-      const messageId = activeAssistantIds.current.get(runKey);
-      if (!messageId) return;
-      setMessages((current) => current.map((item) => item.id === messageId
-        ? {
-            ...item,
-            text: kind === "text_delta" ? item.text + delta : item.text,
-            thinking: kind === "thinking_delta" ? item.thinking + delta : item.thinking,
-          }
-        : item));
+    if (type === "compaction_end") {
+      compactingRef.current = false;
+      setCompacting(false);
+      void refreshSessions();
       return;
     }
     if (type === "message_end") {
-      const raw = payload.message as AgentMessage | undefined;
-      if (raw?.role !== "assistant") return;
-      const content = messageText(raw);
-      const messageId = activeAssistantIds.current.get(runKey);
-      if (messageId) {
-        setMessages((current) => content.text || content.thinking
-          ? current.map((item) => item.id === messageId
-              ? { ...item, ...content, status: raw.stop_reason }
-              : item)
-          : current.filter((item) => item.id !== messageId));
-        activeAssistantIds.current.delete(runKey);
+      const message = payload.message;
+      if (message && typeof message === "object" && "error_message" in message) {
+        const errorMessage = (message as { error_message?: unknown }).error_message;
+        if (typeof errorMessage === "string" && errorMessage) setError(errorMessage);
       }
-      if (raw.error_message) setError(raw.error_message);
-      return;
-    }
-    if (type === "tool_execution_start") {
-      const id = String(payload.tool_call_id);
-      setTools((current) => [
-        ...current.filter((item) => item.id !== id),
-        { id, name: String(payload.tool_name), args: payload.args, status: "running" },
-      ]);
-      return;
-    }
-    if (type === "tool_execution_end") {
-      const id = String(payload.tool_call_id);
-      setTools((current) => current.map((item) => item.id === id
-        ? { ...item, result: payload.result, status: payload.is_error ? "error" : "done" }
-        : item));
-      return;
-    }
-    if (type === "approval.requested") {
-      setApprovals((current) => [...current, payload as unknown as ApprovalView]);
     }
     if (type === "session.changed") {
-      applyWorkspace(payload as unknown as WorkspacePayload);
+      applyWorkspace(payload as unknown as WorkspacePayload, false);
     }
     if (type === "model.changed") {
       const model = payload as unknown as WorkspacePayload["model"];
       setWorkspace((current) => current ? { ...current, model } : current);
+    }
+    if (type === "memory.changed") {
+      setWorkspace((current) => current ? {
+        ...current,
+        memory: { ...current.memory, ...(payload as unknown as WorkspacePayload["memory"]) },
+      } : current);
+    }
+    if (type === "collaboration_mode_changed") {
+      const mode = payload.mode === "plan" ? "plan" : "default";
+      setWorkspace((current) => current ? {
+        ...current,
+        collaborationMode: mode,
+        planState: {
+          ...current.planState,
+          phase: String(payload.phase ?? (mode === "plan" ? "drafting" : "cancelled")) as WorkspacePayload["planState"]["phase"],
+          activePlanId: String(payload.plan_id ?? current.planState.activePlanId ?? "") || null,
+          pendingQuestion: mode === "default" ? null : current.planState.pendingQuestion,
+        },
+      } : current);
+    }
+    if (type === "plan_question_requested") {
+      const question = payload.question as PlanQuestionPayload;
+      setWorkspace((current) => current ? {
+        ...current,
+        collaborationMode: "plan",
+        planState: { ...current.planState, phase: "awaiting_answer", pendingQuestion: question },
+      } : current);
+    }
+    if (type === "plan_question_answered") {
+      setWorkspace((current) => current ? {
+        ...current,
+        planState: { ...current.planState, phase: "drafting", pendingQuestion: null },
+      } : current);
+    }
+    if (type === "plan_ready") {
+      const plan = payload.plan as PlanRevisionPayload;
+      setSupplementingPlanDigest(null);
+      setWorkspace((current) => current ? {
+        ...current,
+        collaborationMode: "plan",
+        planState: { ...current.planState, phase: "ready", pendingQuestion: null, latestRevision: plan },
+      } : current);
+    }
+    if (type === "plan_execution_started") {
+      setWorkspace((current) => current ? {
+        ...current,
+        collaborationMode: "default",
+        planState: { ...current.planState, phase: "executing", pendingQuestion: null },
+      } : current);
+    }
+    if (type === "plan_execution_completed" || type === "plan_execution_failed" || type === "plan_execution_aborted") {
+      const phase = type.replace("plan_execution_", "") as "completed" | "failed" | "aborted";
+      setWorkspace((current) => current ? {
+        ...current,
+        collaborationMode: "default",
+        planState: { ...current.planState, phase },
+      } : current);
     }
   };
 
@@ -270,12 +481,21 @@ export function App() {
   };
 
   const addNotice = (text: string) => {
-    setMessages((current) => [...current, {
-      id: `notice-${Date.now()}-${current.length}`,
+    const timestamp = Date.now();
+    const id = `notice-${timestamp}-${++localItemSequence.current}`;
+    setTimelineState((current) => appendTimelineItem(current, (order): TimelineMessageItem => ({
+      id,
+      kind: "message",
+      order,
+      revision: 0,
+      sessionId: workspace?.sessionId ?? null,
+      runId: null,
+      createdAt: timestamp,
+      updatedAt: timestamp,
       role: "assistant",
       text,
       thinking: "",
-    }]);
+    })));
   };
 
   const openModelPicker = async (query = "") => {
@@ -298,10 +518,30 @@ export function App() {
         return;
       }
       if (name === "compact") {
-        const result = await window.agent.request<Record<string, unknown>>("session.compact");
-        addNotice(result.performed
-          ? `上下文已压缩。${String(result.summary_preview ?? "")}`
-          : String(result.error ?? "当前无需压缩。"));
+        if (compactingRef.current) return;
+        beginCompaction("manual");
+        try {
+          const result = await window.agent.request<Record<string, unknown>>("session.compact");
+          if (result.performed) {
+            finishCompaction("completed", String(result.summary_preview ?? ""));
+          } else {
+            const detail = String(result.error ?? "当前没有可压缩的上下文");
+            const status: Exclude<TimelineCompactionStatus, "running" | "completed"> = detail === "Compaction aborted"
+              ? "aborted"
+              : detail === "Nothing to compact" || detail === "Already compacted"
+                ? "skipped"
+                : "failed";
+            const localizedDetail = detail === "Nothing to compact"
+              ? "当前没有足够的较早对话可供压缩"
+              : detail === "Already compacted"
+                ? "当前上下文已经压缩，无需重复执行"
+                : detail === "Compaction aborted" ? "压缩已取消" : detail;
+            finishCompaction(status, "", localizedDetail);
+          }
+        } catch (reason) {
+          finishCompaction("failed", "", reason instanceof Error ? reason.message : String(reason));
+          throw reason;
+        }
         return;
       }
       if (name === "clear") {
@@ -321,6 +561,164 @@ export function App() {
         ].join("\n"));
         return;
       }
+      if (name === "plan") {
+        await enterPlanMode();
+        return;
+      }
+      if (name === "cancel-plan") {
+        await cancelPlan();
+        return;
+      }
+      if (name === "execute-plan") {
+        await executePlan();
+        return;
+      }
+      if (name === "memory") {
+        const parts = tokenizeCommandArguments(args);
+        const action = parts[0]?.toLocaleLowerCase() || "status";
+        if (action === "on" || action === "off") {
+          const memory = await window.agent.request<WorkspacePayload["memory"]>("memory.setEnabled", {
+            enabled: action === "on",
+          });
+          setWorkspace((current) => current ? { ...current, memory } : current);
+          addNotice(`长期记忆已${action === "on" ? "开启" : "关闭"}。`);
+          return;
+        }
+        if (action === "auto") {
+          const enabled = parts[1]?.toLocaleLowerCase();
+          if (parts.length !== 2 || (enabled !== "on" && enabled !== "off")) {
+            addNotice("用法：`/memory auto on|off`");
+            return;
+          }
+          const memory = await window.agent.request<WorkspacePayload["memory"]>("memory.setAutoExtract", {
+            enabled: enabled === "on",
+          });
+          setWorkspace((current) => current ? { ...current, memory } : current);
+          addNotice(`长期记忆自动提取已${enabled === "on" ? "开启" : "关闭"}。`);
+          return;
+        }
+        if (action === "status") {
+          const memory = await window.agent.request<WorkspacePayload["memory"]>("memory.status");
+          setWorkspace((current) => current ? { ...current, memory } : current);
+          addNotice([
+            "### 长期记忆状态", "",
+            `- 状态：\`${memory.enabled ? "on" : "off"}\``,
+            `- 自动提取：\`${memory.autoExtractEnabled === false ? "off" : "on"}\``,
+            `- 用户：\`${memory.userId ?? "none"}\``,
+            `- 项目：\`${memory.projectId ?? "none"}\``,
+            `- 全局记忆：\`${memory.globalCount ?? 0}\``,
+            `- 项目记忆：\`${memory.projectCount ?? 0}\``,
+            `- 待解决冲突：\`${memory.conflictCount ?? 0}\``,
+            `- 提取任务：待处理 \`${memory.pendingCount ?? 0}\` / 处理中 \`${memory.processingCount ?? 0}\` / 已完成 \`${memory.readyCount ?? 0}\` / 失败 \`${memory.failedCount ?? 0}\``,
+            ...(memory.lastError ? [`- 最近错误：\`${memory.lastError}\``] : []),
+            `- 目录：\`${memory.root ?? ""}\``,
+          ].join("\n"));
+          return;
+        }
+        if (action === "remember") {
+          const values = parts.slice(1);
+          const delimiter = values.indexOf("--");
+          const optionSide = delimiter >= 0 ? values.slice(0, delimiter) : [...values];
+          const literalSide = delimiter >= 0 ? values.slice(delimiter + 1) : [];
+          const scopeFlags: Record<string, "global" | "project"> = {
+            "--global": "global", "--project": "project",
+          };
+          let scope: "global" | "project" = "global";
+          const trailing = optionSide.at(-1);
+          if (trailing && trailing in scopeFlags) {
+            scope = scopeFlags[trailing];
+            optionSide.pop();
+            const preceding = optionSide.at(-1);
+            if (preceding && preceding in scopeFlags) {
+              addNotice("用法：`/memory remember <内容> [--global|--project]`");
+              return;
+            }
+          }
+          const content = [...optionSide, ...literalSide].join(" ").trim();
+          if (!content) {
+            addNotice("用法：`/memory remember <内容> [--global|--project]`");
+            return;
+          }
+          const result = await window.agent.request<{
+            record: Record<string, unknown> | null;
+            memory: WorkspacePayload["memory"];
+          }>("memory.remember", { content, scope });
+          setWorkspace((current) => current ? { ...current, memory: result.memory } : current);
+          addNotice(result.record
+            ? `已记住（${scope}）：\`${String(result.record.id)}\`。可用 \`/memory forget ${String(result.record.id)}\` 遗忘。`
+            : "该内容未产生新的长期记忆。");
+          return;
+        }
+        if (action === "list") {
+          const scope = parts.includes("--global") ? "global" : parts.includes("--project") ? "project" : undefined;
+          const records = await window.agent.request<Array<{ scope: string; record: Record<string, unknown> }>>(
+            "memory.list", scope ? { scope } : {},
+          );
+          addNotice(records.length ? [
+            "### 长期记忆", "",
+            ...records.map((item) => [
+              `- \`${String(item.record.key)}\`（\`${String(item.record.id)}\`）= `,
+              `\`${JSON.stringify(item.record.value)}\``,
+              `（${String(item.record.kind)}/${item.scope}，状态 ${String(item.record.status)}，`,
+              `来源 ${String(item.record.authority)}，更新于 ${String(item.record.updated_at)}）`,
+            ].join("")),
+          ].join("\n") : "没有匹配的长期记忆。");
+          return;
+        }
+        if (action === "conflicts") {
+          const conflicts = await window.agent.request<Array<{ scope: string; conflict: Record<string, unknown> }>>(
+            "memory.conflicts",
+          );
+          addNotice(conflicts.length ? [
+            "### 记忆冲突", "",
+            ...conflicts.map((item) => {
+              const candidates = Array.isArray(item.conflict.candidates)
+                ? item.conflict.candidates as Array<Record<string, unknown>>
+                : [];
+              const values = candidates.map((candidate) => [
+                JSON.stringify(candidate.value), `（\`${String(candidate.id)}\`）`,
+              ].join("")).join(" / ");
+              return `- \`${String(item.conflict.key)}\`（${item.scope}）：${values}`;
+            }),
+          ].join("\n") : "当前没有待解决的记忆冲突。");
+          return;
+        }
+        if (action === "forget") {
+          const key = parts.find((item, index) => index > 0 && !item.startsWith("--"));
+          if (!key || !parts.includes("--confirm")) {
+            addNotice("用法：`/memory forget <key> [--global|--project] --confirm`");
+            return;
+          }
+          const scope = parts.includes("--global") ? "global" : parts.includes("--project") ? "project" : undefined;
+          const result = await window.agent.request<{
+            removed: boolean;
+            memory: WorkspacePayload["memory"];
+          }>("memory.forget", {
+            key, scope, confirmed: true,
+          });
+          setWorkspace((current) => current ? { ...current, memory: result.memory } : current);
+          addNotice(result.removed ? "记忆已遗忘并写入墓碑。" : "未找到该记忆。");
+          return;
+        }
+        if (action === "clear") {
+          const allScopes = parts.includes("--all");
+          if ((!allScopes && !parts.includes("--project")) || !parts.includes("--confirm")) {
+            addNotice("用法：`/memory clear --project|--all --confirm`");
+            return;
+          }
+          const result = await window.agent.request<{
+            count: number;
+            memory: WorkspacePayload["memory"];
+          }>("memory.clear", {
+            allScopes, confirmed: true,
+          });
+          setWorkspace((current) => current ? { ...current, memory: result.memory } : current);
+          addNotice(`已遗忘 ${result.count} 条记忆，并保留墓碑记录。`);
+          return;
+        }
+        addNotice("用法：`/memory status|list|conflicts|remember|forget|clear|auto|on|off`");
+        return;
+      }
       setError(`桌面端暂不支持命令：/${name}`);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
@@ -330,7 +728,7 @@ export function App() {
   const submit = async (event?: FormEvent) => {
     event?.preventDefault();
     const text = input.trim();
-    if (!text || !workspace || running) return;
+    if (!text || !workspace || running || compacting) return;
     if (text.startsWith("/")) {
       const [rawName, ...rest] = text.slice(1).split(/\s+/);
       const command = commandOptions.find((item) => item.name === rawName.toLocaleLowerCase());
@@ -340,12 +738,21 @@ export function App() {
     }
     setInput("");
     setError(null);
-    setMessages((current) => [...current, {
-      id: `user-${Date.now()}`,
+    const timestamp = Date.now();
+    const id = `user-${timestamp}-${++localItemSequence.current}`;
+    setTimelineState((current) => appendTimelineItem(current, (order): TimelineMessageItem => ({
+      id,
+      kind: "message",
+      order,
+      revision: 0,
+      sessionId: workspace.sessionId,
+      runId: null,
+      createdAt: timestamp,
+      updatedAt: timestamp,
       role: "user",
       text,
       thinking: "",
-    }]);
+    })));
     setRunning(true);
     try {
       await window.agent.request("run.start", { text });
@@ -353,6 +760,73 @@ export function App() {
       setRunning(false);
       setError(reason instanceof Error ? reason.message : String(reason));
     }
+  };
+
+  const enterPlanMode = async () => {
+    if (!workspace || running || compacting || workspace.collaborationMode === "plan") return;
+    try {
+      applyWorkspace(await window.agent.request<WorkspacePayload>("mode.enterPlan"));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  };
+
+  const cancelPlan = async () => {
+    const planId = workspace?.planState.activePlanId;
+    if (!planId || running || compacting) return;
+    try {
+      applyWorkspace(await window.agent.request<WorkspacePayload>("plan.cancel", { planId }));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  };
+
+  const answerPlanQuestion = async (answer: string) => {
+    const question = workspace?.planState.pendingQuestion;
+    if (!question || !answer.trim()) return;
+    setError(null);
+    try {
+      await window.agent.request("plan.answer", {
+        questionId: question.questionId,
+        answer: answer.trim(),
+      });
+      setCustomPlanAnswer("");
+      setWorkspace((current) => current ? {
+        ...current,
+        planState: { ...current.planState, phase: "drafting", pendingQuestion: null },
+      } : current);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  };
+
+  const executePlan = async () => {
+    const plan = workspace?.planState.latestRevision;
+    if (!plan || running || compacting || workspace?.planState.phase !== "ready") return;
+    setError(null);
+    setRunning(true);
+    setWorkspace((current) => current ? {
+      ...current,
+      collaborationMode: "default",
+      planState: { ...current.planState, phase: "executing", pendingQuestion: null },
+    } : current);
+    try {
+      await window.agent.request("plan.execute", {
+        planId: plan.planId,
+        revision: plan.revision,
+        digest: plan.digest,
+      });
+    } catch (reason) {
+      setRunning(false);
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  };
+
+  const supplementPlan = () => {
+    const plan = workspace?.planState.latestRevision;
+    if (!plan || running || compacting || workspace?.planState.phase !== "ready") return;
+    setSupplementingPlanDigest(plan.digest);
+    requestAnimationFrame(() => composerRef.current?.focus());
   };
 
   const selectModel = async (model: ModelOption) => {
@@ -385,6 +859,7 @@ export function App() {
     setInput(value);
     const isCommandSearch = Boolean(workspace)
       && !running
+      && !compacting
       && value.startsWith("/")
       && !/\s/.test(value);
     if (isCommandSearch) setModelPickerOpen(false);
@@ -426,23 +901,38 @@ export function App() {
     }
   };
 
-  const resolveApproval = async (approvalId: string, approved: boolean) => {
+  const resolveApproval = useCallback(async (approval: TimelineApproval, approved: boolean) => {
+    setTimelineState((current) => {
+      const item = Object.values(current.entities).find((candidate): candidate is TimelineToolItem => (
+        candidate.kind === "tool" && candidate.toolCallId === approval.toolCallId
+      ));
+      if (!item) return current;
+      return updateTimelineItem(current, item.id, (candidate) => candidate.kind === "tool"
+        ? {
+            ...candidate,
+            approval: undefined,
+            result: approved ? candidate.result : "用户拒绝了本次工具调用",
+            status: approved ? "running" : "error",
+            revision: candidate.revision + 1,
+            updatedAt: Date.now(),
+          }
+        : candidate);
+    });
     try {
-      await window.agent.request("approval.resolve", { approvalId, approved });
-      setApprovals((current) => current.filter((item) => item.approvalId !== approvalId));
+      await window.agent.request("approval.resolve", { approvalId: approval.approvalId, approved });
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     }
-  };
+  }, []);
 
   const openSession = async (sessionId: string) => {
-    if (running || sessionId === workspace?.sessionId) return;
+    if (running || compacting || sessionId === workspace?.sessionId) return;
     const result = await window.agent.request<WorkspacePayload>("session.open", { sessionId });
     applyWorkspace(result);
   };
 
   const newSession = async () => {
-    if (running || !workspace) return;
+    if (running || compacting || !workspace) return;
     const result = await window.agent.request<WorkspacePayload>("session.new");
     applyWorkspace(result);
   };
@@ -452,6 +942,92 @@ export function App() {
     if (sidecarStatus === "starting") return "正在启动运行时";
     return sidecarStatus.startsWith("error:") ? "运行时异常" : "运行时已断开";
   }, [sidecarStatus]);
+  const readyPlan = workspace?.planState.phase === "ready"
+    ? workspace.planState.latestRevision
+    : null;
+  const awaitingPlanDecision = Boolean(
+    readyPlan && supplementingPlanDigest !== readyPlan.digest,
+  );
+
+  const timelineItems = useMemo(() => selectTimelineItems(timelineState), [timelineState]);
+  const renderTimelineItems = useMemo<RenderTimelineItem[]>(() => readyPlan
+    ? [
+        ...timelineItems,
+        {
+          id: `plan:${readyPlan.planId}:${readyPlan.revision}:${readyPlan.digest}`,
+          kind: "plan",
+          order: timelineState.lastOrder + 1,
+          plan: readyPlan,
+        },
+      ]
+    : timelineItems, [readyPlan, timelineItems, timelineState.lastOrder]);
+  const virtuosoComponents = useMemo(() => ({
+    Header: () => <div className="timeline-spacer timeline-spacer--top" aria-hidden="true" />,
+    Footer: () => <div className="timeline-spacer timeline-spacer--bottom" aria-hidden="true" />,
+    EmptyPlaceholder: () => (
+      <div className="timeline-row timeline-row--welcome">
+        <section className="welcome-card">
+          <span className="eyebrow">DESKTOP MVP</span>
+          <h1>把 Agent 放进一个真正的工作区</h1>
+          <p>当前版本已经接通流式响应、工具调用、会话恢复和危险工具审批。</p>
+          <div className="prompt-chips">
+            {["概览这个项目的架构", "找出最值得优化的模块", "运行测试并分析失败原因"].map((value) => (
+              <button key={value} onClick={() => setInput(value)}>{value}</button>
+            ))}
+          </div>
+        </section>
+      </div>
+    ),
+  }), []);
+  const renderTimelineItem = useCallback((_index: number, item: RenderTimelineItem) => {
+    if (item.kind === "plan") {
+      return (
+        <div className="timeline-row">
+          <TimelinePlanCard plan={item.plan} />
+        </div>
+      );
+    }
+    if (item.kind === "message") {
+      return (
+        <div className="timeline-row">
+          <TimelineMessageCard message={item} />
+        </div>
+      );
+    }
+    if (item.kind === "compaction") {
+      return (
+        <div className="timeline-row">
+          <TimelineCompactionCard compaction={item} />
+        </div>
+      );
+    }
+    return (
+      <div className="timeline-row">
+        <ToolCard
+          tool={item}
+          cwd={workspace?.path}
+          onResolveApproval={resolveApproval}
+        />
+      </div>
+    );
+  }, [resolveApproval, workspace?.path]);
+  const lastTimelineSignature = (() => {
+    const last = renderTimelineItems.at(-1);
+    if (!last) return "empty";
+    return last.kind === "plan" ? `${last.id}:${last.plan.digest}` : `${last.id}:${last.revision}`;
+  })();
+
+  useEffect(() => {
+    if (!isAtBottom || renderTimelineItems.length === 0) return;
+    const frame = requestAnimationFrame(() => {
+      virtuosoRef.current?.scrollToIndex({
+        index: renderTimelineItems.length - 1,
+        align: "end",
+        behavior: "auto",
+      });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [isAtBottom, lastTimelineSignature, renderTimelineItems.length, workspace?.sessionId]);
 
   return (
     <div className="app-shell">
@@ -464,14 +1040,14 @@ export function App() {
         <div className="titlebar-spacer" />
         <div className={`runtime-dot ${sidecarStatus === "ready" ? "online" : ""}`} />
         <span className="runtime-label">{statusLabel}</span>
-        <button className="ghost-button" onClick={chooseWorkspace}>打开项目</button>
+        <button className="ghost-button" onClick={chooseWorkspace} disabled={running || compacting}>打开项目</button>
       </header>
 
       <div className={`workspace-grid ${sidebarOpen ? "" : "sidebar-closed"}`}>
         <aside className="sidebar">
           <div className="sidebar-heading">
             <span>会话</span>
-            <button className="icon-button" onClick={newSession} title="新建会话">＋</button>
+            <button className="icon-button" onClick={newSession} title="新建会话" disabled={running || compacting}>＋</button>
           </div>
           <div className="session-list">
             {sessions.map((session) => (
@@ -479,6 +1055,7 @@ export function App() {
                 key={session.id}
                 className={`session-item ${session.id === workspace?.sessionId ? "active" : ""}`}
                 onClick={() => openSession(session.id)}
+                disabled={running || compacting}
               >
                 <strong>{session.name || session.first_message || "新会话"}</strong>
                 <span>{session.message_count} 条消息</span>
@@ -492,6 +1069,29 @@ export function App() {
               <strong>{workspace.model.name || workspace.model.id}</strong>
               <span>工具</span>
               <strong>{workspace.tools.length} 个已启用</strong>
+              <span>长期记忆</span>
+              <button
+                className={`memory-toggle ${workspace.memory.enabled ? "on" : "off"}`}
+                onClick={() => void executeSlashCommand("memory", workspace.memory.enabled ? "off" : "on")}
+                disabled={running || compacting}
+              >
+                {workspace.memory.enabled ? "已开启" : "已关闭"}
+              </button>
+              <span>自动提取</span>
+              <button
+                className={`memory-toggle ${workspace.memory.autoExtractEnabled === false ? "off" : "on"}`}
+                onClick={() => void executeSlashCommand(
+                  "memory", workspace.memory.autoExtractEnabled === false ? "auto on" : "auto off",
+                )}
+                disabled={running || compacting || !workspace.memory.enabled}
+              >
+                {workspace.memory.autoExtractEnabled === false ? "自动提取关闭" : "自动提取开启"}
+              </button>
+              <span>提取队列</span>
+              <strong>
+                待处理 {workspace.memory.pendingCount ?? 0} · 处理中 {workspace.memory.processingCount ?? 0}
+                {" · "}已完成 {workspace.memory.readyCount ?? 0} · 失败 {workspace.memory.failedCount ?? 0}
+              </strong>
             </div>
           )}
         </aside>
@@ -500,62 +1100,81 @@ export function App() {
           <button className="sidebar-toggle" onClick={() => setSidebarOpen((value) => !value)}>
             {sidebarOpen ? "‹" : "›"}
           </button>
-          <div className="timeline" ref={timelineRef}>
-            {!messages.length && (
-              <section className="welcome-card">
-                <span className="eyebrow">DESKTOP MVP</span>
-                <h1>把 Agent 放进一个真正的工作区</h1>
-                <p>当前版本已经接通流式响应、工具调用、会话恢复和危险工具审批。</p>
-                <div className="prompt-chips">
-                  {["概览这个项目的架构", "找出最值得优化的模块", "运行测试并分析失败原因"].map((value) => (
-                    <button key={value} onClick={() => setInput(value)}>{value}</button>
+          <Virtuoso
+            ref={virtuosoRef}
+            className="timeline"
+            aria-label="对话时间线"
+            data={renderTimelineItems}
+            initialItemCount={Math.min(renderTimelineItems.length, 20)}
+            increaseViewportBy={{ top: 600, bottom: 800 }}
+            atBottomThreshold={72}
+            atBottomStateChange={setIsAtBottom}
+            followOutput={(atBottom) => atBottom ? "auto" : false}
+            computeItemKey={(_index, item) => item.id}
+            components={virtuosoComponents}
+            itemContent={renderTimelineItem}
+          />
+          <div className="composer-wrap">
+            {!isAtBottom && renderTimelineItems.length > 0 && (
+              <button
+                className="jump-latest"
+                aria-label="回到最新消息"
+                onClick={() => virtuosoRef.current?.scrollToIndex({
+                  index: renderTimelineItems.length - 1,
+                  align: "end",
+                  behavior: "smooth",
+                })}
+              >
+                ↓ 最新消息
+              </button>
+            )}
+            {workspace?.planState.pendingQuestion && (
+              <section className="plan-question" data-testid="plan-question">
+                <div className="plan-question-header">
+                  <span className="plan-badge">PLAN</span>
+                  <strong>{workspace.planState.pendingQuestion.header}</strong>
+                </div>
+                <p>{workspace.planState.pendingQuestion.question}</p>
+                <div className="plan-options">
+                  {workspace.planState.pendingQuestion.options.map((option) => (
+                    <button key={option.label} onClick={() => void answerPlanQuestion(option.label)}>
+                      <strong>{option.label}</strong>
+                      <span>{option.description}</span>
+                    </button>
                   ))}
                 </div>
+                {workspace.planState.pendingQuestion.allowCustom && (
+                  <div className="plan-custom-answer">
+                    <input
+                      value={customPlanAnswer}
+                      onChange={(event) => setCustomPlanAnswer(event.target.value)}
+                      placeholder="自定义回答"
+                    />
+                    <button onClick={() => void answerPlanQuestion(customPlanAnswer)} disabled={!customPlanAnswer.trim()}>提交</button>
+                  </div>
+                )}
               </section>
             )}
-
-            {messages.map((message) => (
-              <article key={message.id} className={`message ${message.role}`}>
-                <div className="message-avatar">{message.role === "user" ? "你" : "AI"}</div>
-                <div className="message-body">
-                  {message.thinking && (
-                    <details className="thinking-block">
-                      <summary>思考过程</summary>
-                      <pre>{message.thinking}</pre>
-                    </details>
-                  )}
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.text || (message.status === "streaming" ? "正在思考…" : "")}</ReactMarkdown>
+            {readyPlan && awaitingPlanDecision && (
+              <section className="plan-question plan-decision" data-testid="plan-decision">
+                <div className="plan-question-header">
+                  <span className="plan-badge">PLAN</span>
+                  <strong>下一步</strong>
                 </div>
-              </article>
-            ))}
-
-            {tools.map((tool) => (
-              <section key={tool.id} className={`tool-card ${tool.status}`}>
-                <div className="tool-card-header">
-                  <span className="tool-icon">⌁</span>
-                  <strong>{tool.name}</strong>
-                  <span>{tool.status === "running" ? "执行中" : tool.status === "done" ? "已完成" : "失败"}</span>
+                <p>计划已完成，下一步怎么做？</p>
+                <div className="plan-options">
+                  <button onClick={() => void executePlan()} disabled={running || compacting}>
+                    <strong>执行方案</strong>
+                    <span>确认 revision {readyPlan.revision} 并立即切回 Default 执行</span>
+                  </button>
+                  <button onClick={supplementPlan} disabled={running || compacting}>
+                    <strong>补充想法</strong>
+                    <span>保持 Plan Mode，在输入框中说明要补充或修改的内容</span>
+                  </button>
                 </div>
-                <pre>{JSON.stringify(tool.result ?? tool.args, null, 2)}</pre>
+                <button className="plan-decision-cancel" onClick={() => void cancelPlan()} disabled={running || compacting}>取消规划</button>
               </section>
-            ))}
-
-            {approvals.map((approval) => (
-              <section key={approval.approvalId} className="approval-card">
-                <div>
-                  <span className="eyebrow">需要确认</span>
-                  <h3>允许执行 {approval.toolName}？</h3>
-                  <pre>{JSON.stringify(approval.args, null, 2)}</pre>
-                </div>
-                <div className="approval-actions">
-                  <button className="danger-button" onClick={() => resolveApproval(approval.approvalId, false)}>拒绝</button>
-                  <button className="primary-button" onClick={() => resolveApproval(approval.approvalId, true)}>允许一次</button>
-                </div>
-              </section>
-            ))}
-          </div>
-
-          <div className="composer-wrap">
+            )}
             {commandMenuOpen && (
               <section className="command-palette" aria-label="斜杠命令">
                 <div className="command-palette-title">
@@ -604,19 +1223,45 @@ export function App() {
               </section>
             )}
             {error && <div className="error-banner">{error}<button onClick={() => setError(null)}>×</button></div>}
-            <form className="composer" onSubmit={submit}>
+            <form className={`composer ${workspace?.collaborationMode === "plan" ? "plan-mode" : ""}`} onSubmit={submit}>
               <textarea
+                ref={composerRef}
                 value={input}
                 onChange={(event) => onInputChange(event.target.value)}
                 onKeyDown={onInputKeyDown}
-                placeholder={workspace ? "描述你想完成的任务…" : "请先打开工作区"}
-                disabled={!workspace}
+                placeholder={compacting
+                  ? "正在压缩上下文，请稍候…"
+                  : !workspace
+                  ? "请先打开工作区"
+                  : supplementingPlanDigest === readyPlan?.digest
+                    ? "补充你的想法或修改要求…"
+                    : awaitingPlanDecision
+                      ? "请先选择执行方案或补充想法"
+                      : "描述你想完成的任务…"}
+                disabled={!workspace || awaitingPlanDecision || compacting}
                 rows={3}
               />
               <div className="composer-footer">
+                <div className="mode-switch" aria-label="协作模式">
+                  <button
+                    type="button"
+                    className={workspace?.collaborationMode === "default" ? "active" : ""}
+                    onClick={() => workspace?.collaborationMode === "plan" ? void cancelPlan() : undefined}
+                    disabled={!workspace || running || compacting}
+                  >Default</button>
+                  <button
+                    type="button"
+                    className={workspace?.collaborationMode === "plan" ? "active" : ""}
+                    onClick={() => void enterPlanMode()}
+                    disabled={!workspace || running || compacting}
+                  >Plan</button>
+                  {workspace?.collaborationMode === "plan" && <span className="plan-badge">PLAN</span>}
+                </div>
                 <span>Enter 发送 · Shift+Enter 换行</span>
                 {running ? (
                   <button type="button" className="stop-button" onClick={() => window.agent.request("run.abort")}>■ 停止</button>
+                ) : compacting ? (
+                  <button type="button" className="send-button" disabled>压缩中…</button>
                 ) : (
                   <button type="submit" className="send-button" disabled={!input.trim() || !workspace}>发送 ↑</button>
                 )}

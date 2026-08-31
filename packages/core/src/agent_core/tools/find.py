@@ -51,6 +51,7 @@ class FindTool:
     """
 
     name: str = "find"
+    effect: str = "read"
     label: str = "find"
     description: str = (
         f"Search for files by glob pattern. Returns matching file paths relative "
@@ -84,7 +85,10 @@ class FindTool:
 
         fd = find_in_path("fd")
         if fd:
-            text = await self._run_with_fd(fd, pattern, full_path, limit)
+            try:
+                text = await self._run_with_fd(fd, pattern, full_path, limit)
+            except (OSError, RuntimeError):
+                text = self._run_with_pathlib(pattern, full_path, limit)
         else:
             text = self._run_with_pathlib(pattern, full_path, limit)
 
