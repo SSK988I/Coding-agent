@@ -40,11 +40,12 @@ def test_zhipu_provider_returns_six_models():
 
 
 def test_deepseek_provider_unchanged_regression():
-    """Adding Zhipu must not perturb DeepSeek's factory or env var."""
+    """DeepSeek keeps its endpoint/auth while using the Responses adapter."""
     p = deepseek_provider()
     assert p.id == "deepseek"
     assert p.base_url == "https://api.deepseek.com"
     assert p.auth.api_key.env_vars == ["DEEPSEEK_API_KEY"]
+    assert all(model.api == "openai-responses" for model in p.get_models())
 
 
 # ─── Model catalog fidelity ────────────────────

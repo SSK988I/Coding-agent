@@ -31,6 +31,12 @@ class Settings:
     memory_user_id: str = "local-user"
     memory_max_records: int = 8
     memory_token_budget: int = 800
+    # Enabled by default. DeepSeek executes search natively with the same API
+    # credential; other providers use the configured application backend.
+    web_search_enabled: bool = True
+    web_search_backend: str = "zhipu-mcp"
+    web_search_max_results: int = 5
+    web_search_timeout_seconds: float = 30.0
 
 
 class SettingsManager:
@@ -126,6 +132,23 @@ class SettingsManager:
             raise ValueError("memory_max_records must be between 1 and 50")
         if isinstance(settings.memory_token_budget, bool) or not 100 <= settings.memory_token_budget <= 8000:
             raise ValueError("memory_token_budget must be between 100 and 8000")
+        if not isinstance(settings.web_search_enabled, bool):
+            raise ValueError("web_search_enabled must be a boolean")
+        if settings.web_search_backend != "zhipu-mcp":
+            raise ValueError("web_search_backend must currently be 'zhipu-mcp'")
+        if (
+            isinstance(settings.web_search_max_results, bool)
+            or not isinstance(settings.web_search_max_results, int)
+            or not 1 <= settings.web_search_max_results <= 10
+        ):
+            raise ValueError("web_search_max_results must be between 1 and 10")
+        if (
+            isinstance(settings.web_search_timeout_seconds, bool)
+            or not isinstance(settings.web_search_timeout_seconds, (int, float))
+            or not 1 <= settings.web_search_timeout_seconds <= 120
+        ):
+            raise ValueError("web_search_timeout_seconds must be between 1 and 120")
+        settings.web_search_timeout_seconds = float(settings.web_search_timeout_seconds)
         return settings
 
     def _backup_corrupt_file(self) -> Path | None:

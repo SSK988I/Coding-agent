@@ -11,7 +11,7 @@ It can read and modify project files, search code, execute shell commands, and s
 ## Features
 
 - **Streaming agent loop**: processes model output, tool calls, tool results, and subsequent reasoning, with abort, steering, and follow-up support.
-- **Seven built-in development tools**: `read`, `write`, `edit`, `grep`, `find`, `ls`, and `bash`.
+- **Built-in development and search tools**: `read`, `write`, `edit`, `grep`, `find`, `ls`, `bash`, plus optional `web_search`.
 - **Restorable sessions**: stores messages and settings changes in append-only JSONL and tracks the active branch through an entry tree.
 - **Context management**: includes token estimation, summary compaction, and compact-and-retry after context overflow.
 - **File-backed long-term memory**: extracts stable preferences and confirmed project decisions, retrieves them by user and project, and persists YAML snapshots backed by append-only JSONL facts.
@@ -190,6 +190,28 @@ uv run coding-agent --exclude-tools bash
 uv run coding-agent --no-tools
 ```
 
+### Web search
+
+Web search is enabled by default and automatically follows the selected model:
+
+- DeepSeek uses the native server-side `web_search` tool through the Responses API and reuses `DEEPSEEK_API_KEY`; no separate search key is required.
+- Other models use the stored Zhipu Z.AI Coding Plan credential through the Web Search Prime Remote MCP fallback.
+
+The welcome card reports the effective state as `WEB on/off`. Native DeepSeek search is counted as an available tool but does not open an MCP connection.
+
+```powershell
+# Enable for this run only (overrides the persisted setting)
+uv run coding-agent --web-search "Find the current stable Python release and cite official sources"
+
+# Persist the setting for future sessions (enter this in the interactive UI)
+/settings web_search_enabled true
+
+# Explicitly disable for this run
+uv run coding-agent --no-web-search
+```
+
+Queries are sent to the active search service and may consume DeepSeek API or Coding Plan MCP quota. Never include API keys, cookies, private code, internal URLs, or personal data. Search snippets are untrusted external data, and final answers should retain the returned source URLs.
+
 ### File and image attachments
 
 Prefix a path with `@` to attach a text file or image to the initial message:
@@ -214,6 +236,7 @@ Images can only be sent to models whose catalog entries declare `image` input su
 | `find` | Find files by name or pattern |
 | `ls` | List directory contents |
 | `bash` | Execute shell commands |
+| `web_search` | Search the public web through native DeepSeek Responses or the configured Remote MCP fallback; enabled by default |
 
 Tools expose their name, description, JSON Schema parameters, and asynchronous execution method through a common interface. The agent runtime validates arguments before execution and emits start, update, and end events. Embedding frontends can use before/after hooks for approval, auditing, or result transformation.
 
@@ -262,7 +285,7 @@ The default data directory is `~/.coding-agent`. Override it with `CODING_AGENT_
 ```text
 ~/.coding-agent/
 ├── auth.json        # Provider credentials
-├── settings.json    # Model, thinking, retry, and memory settings
+├── settings.json    # Model, thinking, retry, memory, and web-search settings
 ├── sessions/        # Per-project JSONL sessions
 └── memory/          # User/project YAML snapshots and JSONL fact logs
 ```

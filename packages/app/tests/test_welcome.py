@@ -15,6 +15,7 @@ def _component() -> WelcomeComponent:
         model=SimpleNamespace(id="deepseek-v4-pro"),
         thinking_level="medium",
         tools=[SimpleNamespace(name=name) for name in ("read", "edit", "bash")],
+        web_search_enabled=True,
     )
     return WelcomeComponent(session, load_theme("dark"), "0.1.0")
 
@@ -32,6 +33,8 @@ def test_wide_welcome_surfaces_runtime_context_and_shortcuts() -> None:
     assert "deepseek-v4-pro" in rendered
     assert "medium" in rendered
     assert "TOOLS" in rendered
+    assert "WEB" in rendered
+    assert "on" in rendered
     assert "/help" in rendered
     assert "/model" in rendered
 

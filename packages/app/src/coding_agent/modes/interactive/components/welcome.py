@@ -44,13 +44,17 @@ class WelcomeComponent(Component):
         lines.append(self._content_line("", inner_width))
 
         if card_width >= self._WIDE_LAYOUT_WIDTH:
-            metadata = (
+            metadata_primary = (
                 f"MODEL  {self._model_id()}   "
-                f"MODE  {self._mode()}   "
-                f"THINKING  {self._thinking_level()}   "
-                f"TOOLS  {self._tool_count()}"
+                f"MODE  {self._mode()}"
             )
-            lines.append(self._content_line(metadata, inner_width, self._style_metadata))
+            metadata_secondary = (
+                f"THINKING  {self._thinking_level()}   "
+                f"TOOLS  {self._tool_count()}   "
+                f"WEB  {self._web_search_state()}"
+            )
+            lines.append(self._content_line(metadata_primary, inner_width, self._style_metadata))
+            lines.append(self._content_line(metadata_secondary, inner_width, self._style_metadata))
         else:
             lines.append(
                 self._content_line(
@@ -60,7 +64,7 @@ class WelcomeComponent(Component):
             )
             lines.append(
                 self._content_line(
-                    f"THINKING  {self._thinking_level()}   TOOLS  {self._tool_count()}",
+                    f"THINKING  {self._thinking_level()}   WEB  {self._web_search_state()}",
                     inner_width,
                     self._style_metadata,
                 )
@@ -95,7 +99,10 @@ class WelcomeComponent(Component):
     def _render_minimal(self, width: int) -> list[str]:
         title = self._theme.bold(self._theme.fg("accent", "CODING AGENT"))
         version = self._theme.fg("dim", f" v{self._version}")
-        metadata = f"{self._model_id()} · {self._thinking_level()} · {self._tool_count()} tools"
+        metadata = (
+            f"{self._model_id()} · {self._thinking_level()} · "
+            f"{self._tool_count()} tools · web {self._web_search_state()}"
+        )
         raw_lines = [
             title + version,
             self._theme.fg("text", "理解代码 · 修改项目 · 运行验证"),
@@ -131,7 +138,7 @@ class WelcomeComponent(Component):
         return f"{border} {content} {border}"
 
     def _style_metadata(self, text: str) -> str:
-        for label in ("MODEL", "MODE", "THINKING", "TOOLS"):
+        for label in ("MODEL", "MODE", "THINKING", "TOOLS", "WEB"):
             text = text.replace(label, self._theme.fg("muted", label))
         return text
 
@@ -177,3 +184,6 @@ class WelcomeComponent(Component):
 
     def _tool_count(self) -> int:
         return len(getattr(self._session, "tools", None) or [])
+
+    def _web_search_state(self) -> str:
+        return "on" if bool(getattr(self._session, "web_search_enabled", False)) else "off"

@@ -82,6 +82,8 @@ class DesktopRuntime:
             "memory.clear": self._memory_clear,
             "memory.setEnabled": self._memory_set_enabled,
             "memory.setAutoExtract": self._memory_set_auto_extract,
+            "webSearch.status": self._web_search_status,
+            "webSearch.setEnabled": self._web_search_set_enabled,
             "session.compact": self._session_compact,
             "runtime.dispose": self._dispose_command,
         }
@@ -94,7 +96,7 @@ class DesktopRuntime:
         del params
         return {
             "protocolVersion": PROTOCOL_VERSION, "status": "ready",
-            "capabilities": ["plan_mode_v1", "memory_v1", "memory_v2"],
+            "capabilities": ["plan_mode_v1", "memory_v1", "memory_v2", "web_search_v1"],
         }
 
     async def _workspace_open(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -190,6 +192,13 @@ class DesktopRuntime:
             memory_user_id=settings.memory_user_id,
             memory_max_records=settings.memory_max_records,
             memory_token_budget=settings.memory_token_budget,
+            web_search_enabled=settings.web_search_enabled,
+            web_search_credential_resolver=lambda search_provider: _resolve_api_key_for(
+                search_provider
+            ),
+            web_search_backend_name=settings.web_search_backend,
+            web_search_max_results=settings.web_search_max_results,
+            web_search_timeout_seconds=settings.web_search_timeout_seconds,
         )
         self._workspace = workspace
         self._session = AgentSession(config)
@@ -672,6 +681,38 @@ class DesktopRuntime:
         self._publish("memory.changed", payload)
         return payload
 
+    async def _web_search_status(self, params: dict[str, Any]) -> dict[str, Any]:
+        del params
+        session = self._require_session()
+        native = bool(getattr(session, "native_web_search_enabled", False))
+        credential_provider = session.model.provider if native else "zai-coding-cn"
+        configured = bool(_resolve_api_key_for(credential_provider))
+        enabled = session.web_search_enabled
+        return {
+            "enabled": enabled,
+            "backend": session.web_search_backend_label,
+            "available": configured,
+            "status": "idle" if enabled and configured else "disabled" if not enabled else "unavailable",
+            "errorCode": None if configured else "WEB_SEARCH_NOT_CONFIGURED",
+        }
+
+    async def _web_search_set_enabled(self, params: dict[str, Any]) -> dict[str, Any]:
+        self._ensure_no_active_run("任务运行时不能切换联网检索")
+        enabled = params.get("enabled")
+        if not isinstance(enabled, bool):
+            raise RpcError("INVALID_PARAMS", "webSearch.setEnabled 需要 enabled")
+        session = self._require_session()
+        manager = session.settings_manager
+        try:
+            if manager is not None:
+                manager.set_value("web_search_enabled", "true" if enabled else "false")
+            await session.set_web_search_enabled(enabled)
+        except (OSError, TypeError, ValueError, RuntimeError) as exc:
+            raise RpcError("WEB_SEARCH_SETTINGS_FAILED", str(exc)) from exc
+        payload = await self._web_search_status({})
+        self._publish("webSearch.changed", payload)
+        return payload
+
     async def _dispose_command(self, params: dict[str, Any]) -> dict[str, Any]:
         del params
         await self.dispose()
@@ -767,6 +808,26 @@ class DesktopRuntime:
             "userId": getattr(getattr(session, "memory_identity", None), "user_id", None),
             "projectId": getattr(getattr(session, "memory_identity", None), "project_id", None),
         }
+        native_web_search = bool(getattr(session, "native_web_search_enabled", False))
+        credential_provider = session.model.provider if native_web_search else "zai-coding-cn"
+        web_search_available = bool(_resolve_api_key_for(credential_provider))
+        web_search_enabled = bool(getattr(session, "web_search_enabled", False))
+        session_config = getattr(session, "_config", None)
+        web_search = {
+            "enabled": web_search_enabled,
+            "backend": getattr(
+                session,
+                "web_search_backend_label",
+                getattr(session_config, "web_search_backend_name", "zhipu-mcp"),
+            ),
+            "available": web_search_available,
+            "status": (
+                "idle" if web_search_enabled and web_search_available
+                else "disabled" if not web_search_enabled
+                else "unavailable"
+            ),
+            "errorCode": None if web_search_available else "WEB_SEARCH_NOT_CONFIGURED",
+        }
         return {
             "path": str(self._require_workspace()),
             "sessionId": session.session_manager.header.id,
@@ -777,6 +838,7 @@ class DesktopRuntime:
             "collaborationMode": session.collaboration_mode,
             "planState": session.plan_state.to_payload(),
             "memory": memory,
+            "webSearch": web_search,
         }
 
     async def _workspace_payload_with_memory(self) -> dict[str, Any]:

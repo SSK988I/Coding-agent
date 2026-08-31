@@ -62,6 +62,15 @@ def test_project_trust_flags_are_mutually_exclusive():
         raise AssertionError("expected conflicting trust flags to fail")
 
 
+def test_web_search_flags_are_tristate_and_mutually_exclusive():
+    assert parse_args([]).web_search is None
+    assert parse_args(["--web-search"]).web_search is True
+    assert parse_args(["--no-web-search"]).web_search is False
+    with pytest.raises(SystemExit) as exc:
+        parse_args(["--web-search", "--no-web-search"])
+    assert exc.value.code == 2
+
+
 def test_no_approve_skips_project_context(monkeypatch, tmp_path: Path):
     def unexpected_load(*_args, **_kwargs):
         raise AssertionError("project context should not be loaded")

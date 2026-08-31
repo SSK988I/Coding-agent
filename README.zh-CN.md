@@ -11,7 +11,7 @@ Coding Agent 是一个面向本地开发工作的编程 Agent。项目以 Python
 ## 主要功能
 
 - **流式 Agent Loop**：处理模型输出、工具调用、工具结果和后续推理，支持运行中终止、转向消息与后续消息。
-- **七个内置开发工具**：`read`、`write`、`edit`、`grep`、`find`、`ls` 和 `bash`。
+- **内置开发与检索工具**：`read`、`write`、`edit`、`grep`、`find`、`ls`、`bash`，以及可选的 `web_search`。
 - **可恢复会话**：使用 Append-only JSONL 保存消息和设置变更，通过 Entry Tree 记录活动分支。
 - **上下文管理**：提供 Token 估算、摘要压缩和上下文溢出后的 Compact-and-Retry。
 - **文件式长期记忆**：从成功任务中提取稳定偏好和已确认项目决策，按用户与项目检索，使用 YAML 快照与 Append-only JSONL 事实日志持久化。
@@ -190,6 +190,28 @@ uv run coding-agent --exclude-tools bash
 uv run coding-agent --no-tools
 ```
 
+### 联网检索
+
+联网检索默认开启，并按当前模型自动选择执行路径：
+
+- DeepSeek：通过 Responses API 使用服务端原生 `web_search`，复用 `DEEPSEEK_API_KEY`，不需要额外的搜索 Key。
+- 其他模型：使用已保存的智谱 Z.AI Coding Plan 凭据连接 Web Search Prime Remote MCP。
+
+欢迎卡片中的 `WEB on/off` 显示当前开关；DeepSeek 原生搜索仍会计入工具总数，但不会建立 MCP 连接。
+
+```powershell
+# 仅为本次运行启用（可覆盖持久设置）
+uv run coding-agent --web-search "搜索 Python 当前稳定版本，并附上官方来源"
+
+# 持久启用；在交互界面中输入，后续会话生效
+/settings web_search_enabled true
+
+# 显式禁用本次运行
+uv run coding-agent --no-web-search
+```
+
+搜索词会发送给当前搜索服务，并可能消耗 DeepSeek API 或 Coding Plan MCP 额度。不要在查询中放入 API Key、Cookie、私有代码、内部 URL 或个人数据。搜索摘要属于不可信外部数据，最终回答应保留来源 URL。
+
 ### 附加文件和图片
 
 在路径前添加 `@`，可以把文本文件或图片附加到初始消息：
@@ -214,6 +236,7 @@ uv run coding-agent --provider zhipu --model glm-5v-turbo `
 | `find` | 按名称或模式查找文件 |
 | `ls` | 查看目录内容 |
 | `bash` | 执行 Shell 命令 |
+| `web_search` | 搜索公开网络；DeepSeek 使用原生 Responses 工具，其他模型回退到配置的 Remote MCP；默认开启 |
 
 工具通过统一接口声明名称、描述、JSON Schema 参数和异步执行方法。Agent Runtime 会在执行前校验参数，并发出开始、更新和结束事件。嵌入式前端可以通过执行前后 Hook 加入审批、审计或结果处理逻辑。
 
@@ -262,7 +285,7 @@ uv run coding-agent --provider zhipu --model glm-5v-turbo `
 ```text
 ~/.coding-agent/
 ├── auth.json        # Provider 凭据
-├── settings.json    # 模型、思考级别、重试和记忆设置
+├── settings.json    # 模型、思考级别、重试、记忆和联网检索设置
 ├── sessions/        # 按项目保存的 JSONL 会话
 └── memory/          # 用户/项目隔离的 YAML 快照与 JSONL 事实日志
 ```

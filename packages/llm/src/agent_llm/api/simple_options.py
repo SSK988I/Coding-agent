@@ -85,6 +85,7 @@ def build_base_options(
             "max_retry_delay_ms",
             "metadata",
             "env",
+            "web_search",
         ):
             if k in options:
                 opts[k] = options[k]

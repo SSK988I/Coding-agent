@@ -163,6 +163,11 @@ class AssistantMessage:
     usage: Usage = field(default_factory=Usage)
     stop_reason: StopReason = "stop"
     error_message: str | None = None
+    # Provider-owned response items required to faithfully continue a
+    # stateless conversation (for example DeepSeek Responses reasoning and
+    # server-side web-search call items).  Application code treats this as an
+    # opaque JSON-safe payload.
+    provider_data: Any = None
     timestamp: float = field(default_factory=_now_ms)
 
 
@@ -351,6 +356,9 @@ class StreamOptions(TypedDict, total=False):
     max_retry_delay_ms: int
     metadata: dict[str, Any]
     env: ProviderEnv
+    # Ask a provider that supports a native server-side search tool to expose
+    # it for this request. Providers without that capability ignore the flag.
+    web_search: bool
 
 
 class SimpleStreamOptions(StreamOptions, total=False):

@@ -26,6 +26,7 @@ from typing import Any, Callable, Literal, cast
 
 from agent_llm import (
     AssistantMessage,
+    Context,
     Model,
     ThinkingLevel,
 )
@@ -135,6 +136,14 @@ class AgentSessionConfig:
     memory_consolidation_model: Model | None = None
     memory_service: Any = None
     memory_identity: Any = None
+    # Model-independent web search. A backend can be injected by tests or
+    # embedding hosts; CLI/Desktop construct the built-in backend lazily.
+    web_search_enabled: bool = False
+    web_search_backend: Any = None
+    web_search_credential_resolver: "Callable[[str], str | None] | None" = None
+    web_search_backend_name: str = "zhipu-mcp"
+    web_search_max_results: int = 5
+    web_search_timeout_seconds: float = 30.0
 
 
 @dataclass
@@ -237,6 +246,25 @@ class AgentSession:
                 shell_kind=getattr(config, "shell_kind", "bash"),
                 platform=getattr(config, "platform", ""),
             )
+        self._web_search_backend = None
+        if config.web_search_enabled and not config.no_tools and not config.no_builtin_tools:
+            from coding_agent.search.backends import ZhipuMcpSearchBackend
+            from coding_agent.search.tool import WebSearchTool
+
+            backend = config.web_search_backend
+            if backend is None:
+                if config.web_search_backend_name != "zhipu-mcp":
+                    raise ValueError(f"Unsupported web search backend: {config.web_search_backend_name}")
+                backend = ZhipuMcpSearchBackend(
+                    config.web_search_credential_resolver or config.get_api_key,
+                    timeout_seconds=config.web_search_timeout_seconds,
+                )
+            self._web_search_backend = backend
+            if not any(tool.name == "web_search" for tool in raw_tools):
+                raw_tools.append(cast(AgentTool, WebSearchTool(
+                    backend,
+                    default_count=config.web_search_max_results,
+                )))
         self._development_tools = _filter_tools(
             raw_tools,
             config.allowed_tool_names,
@@ -420,6 +448,62 @@ class AgentSession:
         if self._plan_state.mode == "plan":
             tools.append(cast(AgentTool, self._control_tool))
         return tools
+
+    @property
+    def web_search_enabled(self) -> bool:
+        return any(tool.name == "web_search" for tool in self._development_tools)
+
+    @property
+    def native_web_search_enabled(self) -> bool:
+        """Whether this session will use the model provider's built-in search."""
+        return self.web_search_enabled and self._model.provider == "deepseek"
+
+    @property
+    def web_search_backend_label(self) -> str:
+        return "deepseek-native" if self.native_web_search_enabled else self._config.web_search_backend_name
+
+    async def set_web_search_enabled(self, enabled: bool) -> None:
+        """Enable or disable the application-owned search tool at runtime."""
+        if self._is_processing:
+            raise RuntimeError("RUN_IN_PROGRESS: 任务运行时不能切换联网检索")
+        if enabled == self.web_search_enabled:
+            self._config.web_search_enabled = enabled
+            return
+        if enabled:
+            self._config.web_search_enabled = True
+            if self._config.no_tools or self._config.no_builtin_tools:
+                return
+            if self._config.allowed_tool_names and "web_search" not in self._config.allowed_tool_names:
+                return
+            if self._config.excluded_tool_names and "web_search" in self._config.excluded_tool_names:
+                return
+            from coding_agent.search.backends import ZhipuMcpSearchBackend
+            from coding_agent.search.tool import WebSearchTool
+
+            backend = self._web_search_backend or self._config.web_search_backend
+            if backend is None:
+                if self._config.web_search_backend_name != "zhipu-mcp":
+                    raise ValueError(
+                        f"Unsupported web search backend: {self._config.web_search_backend_name}"
+                    )
+                backend = ZhipuMcpSearchBackend(
+                    self._config.web_search_credential_resolver or self._config.get_api_key,
+                    timeout_seconds=self._config.web_search_timeout_seconds,
+                )
+            self._web_search_backend = backend
+            self._development_tools.append(cast(AgentTool, WebSearchTool(
+                backend,
+                default_count=self._config.web_search_max_results,
+            )))
+        else:
+            self._config.web_search_enabled = False
+            self._development_tools = [
+                tool for tool in self._development_tools if tool.name != "web_search"
+            ]
+            if self._web_search_backend is not None:
+                await self._web_search_backend.aclose()
+                self._web_search_backend = None
+        self._refresh_collaboration_runtime()
 
     def _build_effective_system_prompt(self, shell_kind: str | None = None) -> str:
         resolved_shell_kind = shell_kind or (
@@ -1152,12 +1236,18 @@ class AgentSession:
 
     async def aclose(self, *, memory_grace_seconds: float = 0.25) -> None:
         """Stop background memory work safely, then flush session persistence."""
+        if self._web_search_backend is not None:
+            await self._web_search_backend.aclose()
         if self.memory_service is not None:
             await self.memory_service.close(grace_seconds=memory_grace_seconds)
         self.dispose()
 
     def dispose(self) -> None:
         """Clean up resources, persisting only sessions that contain entries."""
+        if self._web_search_backend is not None:
+            request_stop = getattr(self._web_search_backend, "request_stop", None)
+            if callable(request_stop):
+                request_stop()
         if self.memory_service is not None:
             self.memory_service.request_stop()
         if (
@@ -1337,8 +1427,39 @@ class AgentSession:
         from agent_llm.compat import stream_simple
 
         def _stream(model: Model, context, options=None):
+            effective_options: dict[str, Any] = dict(options or {})
+            effective_context = context
+            if self.web_search_enabled and model.provider == "deepseek":
+                # DeepSeek's Responses API owns web_search server-side. Keep
+                # the application tool registered for UI/provider switching,
+                # but do not expose a duplicate function tool to DeepSeek.
+                effective_options["web_search"] = True
+                native_search_prompt = (
+                    "<native_web_search>\n"
+                    "You have a native web_search tool. Use it for current or unstable "
+                    "information and whenever the user asks you to search the web. "
+                    "Do not claim that web access is unavailable while this tool is enabled. "
+                    "Never put API keys, cookies, private code, internal URLs, or personal "
+                    "data in a search query. Preserve source URLs in the answer.\n"
+                    "</native_web_search>"
+                )
+                effective_context = Context(
+                    system_prompt=(
+                        f"{context.system_prompt}\n\n{native_search_prompt}"
+                        if context.system_prompt else native_search_prompt
+                    ),
+                    messages=context.messages,
+                    tools=[
+                        tool for tool in (context.tools or [])
+                        if tool.name != "web_search"
+                    ] or None,
+                )
             return retrying_stream(
-                lambda: stream_simple(model, context, options),
+                lambda: stream_simple(
+                    model,
+                    effective_context,
+                    cast(Any, effective_options or None),
+                ),
                 self.retry_policy,
                 on_retry=lambda attempt, delay, error: self._emit_event({
                     "type": "retry",

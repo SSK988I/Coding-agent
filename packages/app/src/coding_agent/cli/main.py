@@ -511,6 +511,15 @@ def main(argv: list[str] | None = None) -> int:
         memory_user_id=settings.memory_user_id,
         memory_max_records=settings.memory_max_records,
         memory_token_budget=settings.memory_token_budget,
+        web_search_enabled=(
+            args.web_search if args.web_search is not None else settings.web_search_enabled
+        ),
+        # --api-key is a model-provider override and must never be forwarded
+        # to a different service. Search always resolves its own Zhipu key.
+        web_search_credential_resolver=lambda provider_id: _resolve_api_key_for(provider_id),
+        web_search_backend_name=settings.web_search_backend,
+        web_search_max_results=settings.web_search_max_results,
+        web_search_timeout_seconds=settings.web_search_timeout_seconds,
     )
     if args.no_tools:
         config.no_tools = True

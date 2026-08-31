@@ -43,6 +43,7 @@ class Args:
     exclude_tools: list[str] | None = None
     no_tools: bool = False
     no_builtin_tools: bool = False
+    web_search: bool | None = None
 
     no_context_files: bool = False
 
@@ -229,6 +230,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="禁用内置工具",
     )
+    web_search_group = tool_group.add_mutually_exclusive_group()
+    web_search_group.add_argument(
+        "--web-search",
+        dest="web_search",
+        action="store_true",
+        help="为本次运行启用联网检索（查询会发送给外部服务）",
+    )
+    web_search_group.add_argument(
+        "--no-web-search",
+        dest="web_search",
+        action="store_false",
+        help="为本次运行禁用联网检索",
+    )
+    parser.set_defaults(web_search=None)
 
     # ── Project context ──────────────────────────────────────────────────
     context_group = parser.add_argument_group("项目上下文")
@@ -430,6 +445,7 @@ def _apply_namespace(args: Args, ns: argparse.Namespace) -> None:
     args.exclude_tools = ns.exclude_tools
     args.no_tools = ns.no_tools
     args.no_builtin_tools = ns.no_builtin_tools
+    args.web_search = ns.web_search
 
     args.no_context_files = ns.no_context_files
     args.skill_paths = list(ns.skill_paths) if ns.skill_paths else None

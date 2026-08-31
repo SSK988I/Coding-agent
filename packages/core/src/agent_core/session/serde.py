@@ -140,12 +140,14 @@ def message_to_dict(message: Message) -> dict:
     """
     role = getattr(message, "role", None)
     if role == "user":
+        assert isinstance(message, UserMessage)
         return {
             "role": "user",
             "content": _encode_user_content(message.content),
             "timestamp": getattr(message, "timestamp", None),
         }
     if role == "assistant":
+        assert isinstance(message, AssistantMessage)
         return {
             "role": "assistant",
             "content": [content_block_to_dict(b) for b in message.content],
@@ -157,9 +159,11 @@ def message_to_dict(message: Message) -> dict:
             "usage": usage_to_dict(message.usage),
             "stop_reason": message.stop_reason,
             "error_message": message.error_message,
+            "provider_data": message.provider_data,
             "timestamp": getattr(message, "timestamp", None),
         }
     if role == "toolResult":
+        assert isinstance(message, ToolResultMessage)
         return {
             "role": "toolResult",
             "tool_call_id": message.tool_call_id,
@@ -194,6 +198,7 @@ def dict_to_message(d: dict) -> Message:
             usage=dict_to_usage(d.get("usage")),
             stop_reason=d.get("stop_reason", "stop"),
             error_message=d.get("error_message"),
+            provider_data=d.get("provider_data"),
             timestamp=float(d.get("timestamp") or 0.0),
         )
     if role == "toolResult":
