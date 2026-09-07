@@ -8,6 +8,8 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
+import pytest
+
 from agent_llm import AssistantMessage, TextContent, ToolResultMessage, UserMessage
 
 from agent_core.session.session_manager import SessionManager
@@ -64,6 +66,21 @@ def test_new_session_timestamps_are_iso_8601_but_filename_is_safe(tmp_path: Path
 # Tests pass a synthetic short cwd ("/test/proj") plus the real tmp_path as
 # agent_dir. Encoding the real Windows tmp_path into a directory name would
 # blow past MAX_PATH=260; the agent_dir controls where files actually land.
+
+@pytest.mark.parametrize("ending", [b"\n", b"\r\n", b"", b"\r"])
+def test_append_preserves_record_boundary_after_valid_tail(tmp_path: Path, ending: bytes):
+    sm = SessionManager.create(cwd="/test/proj", agent_dir=tmp_path)
+    sm.append_message(_msg_user("hello"))
+    sm.append_message(_msg_asst("reply"))
+    assert sm.path is not None
+    original = sm.path.read_bytes().rstrip(b"\r\n") + ending
+    sm.path.write_bytes(original)
+    sm.append_message(_msg_user("next turn"))
+    assert sm.path.read_bytes().startswith(original)
+    restored = SessionManager.open(sm.path)
+    assert not restored.load_issues
+    assert restored.entries == sm.entries
+
 
 def test_flush_on_first_assistant(tmp_path: Path):
     sm = SessionManager.create(cwd="/test/proj", agent_dir=tmp_path)

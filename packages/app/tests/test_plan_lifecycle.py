@@ -117,6 +117,71 @@ def test_end_to_end_question_revision_stale_handoff_and_settled(tmp_path):
     assert events[-2]["state"]["phase"] == "settled"
 
 
+@pytest.mark.parametrize("reopen", ["no", "ready", "drafting"])
+def test_handoff_revision_is_available_to_review_without_source_history(tmp_path, reopen):
+    session = session_at(tmp_path, disk=True)
+    title = "Unique handoff title"
+    markdown = "Unique handoff body\n1. Preserve the original files."
+    private_message = "Source-only private planning conversation"
+    asyncio.run(drive(session, private_message, submission(title=title, markdown=markdown)))
+    plan = session.plan_state.latest_revision
+    target = session.handoff_plan_to_new_session(plan.plan_id, plan.revision, plan.digest)
+    assert session.plan_state.phase == "ready"
+    assert session.state.messages == []
+    if reopen == "drafting":
+        asyncio.run(drive(session, "Continue reviewing", AssistantMessage(
+            content=[TextContent(text="I will review the plan.")], stop_reason="stop",
+        )))
+        assert session.plan_state.phase == "drafting"
+    if reopen != "no":
+        session = AgentSession(AgentSessionConfig(
+            model=session.model, cwd=str(tmp_path), session_manager=SessionManager.open(target.path),
+        ))
+    contexts = []
+    asyncio.run(drive(
+        session, "Review the handed-off plan and add rollback steps",
+        submission("review-submit", title=title, markdown=markdown + "\n2. Roll back on failure."),
+        seen=contexts,
+    ))
+    assert len(contexts) == 1
+    context = contexts[0]
+    assert title in context.system_prompt
+    assert markdown in context.system_prompt
+    assert plan.digest in context.system_prompt
+    assert private_message not in context.system_prompt + repr(context.messages)
+    tool_names = {tool.name for tool in context.tools}
+    assert "submit_plan" in tool_names
+    assert not tool_names.intersection({"bash", "write", "edit"})
+    latest = session.plan_state.latest_revision
+    assert session.plan_state.phase == "ready"
+    assert latest.revision == plan.revision + 1
+    assert latest.digest != plan.digest
+    assert not any(isinstance(entry, PlanRunEntry) for entry in session.session_manager.entries)
+    with pytest.raises(PlanModeError) as error:
+        asyncio.run(session.execute_plan(plan.plan_id, plan.revision, plan.digest))
+    assert error.value.code == "STALE_PLAN_REVISION"
+    session.cancel_plan_mode()
+    assert "Unique handoff body" not in session._build_effective_system_prompt()
+    session.enter_plan_mode()
+    assert "Unique handoff body" not in session._build_effective_system_prompt()
+
+
+def test_handoff_review_context_follows_active_branch(tmp_path):
+    session = session_at(tmp_path)
+    plan = ready(session)
+    target = session.handoff_plan_to_new_session(plan.plan_id, plan.revision, plan.digest)
+    handoff_leaf = target.leaf_id
+    assert "<handed_off_plan_for_review>" in session.state.system_prompt
+    target.branch(target.entries[0].id)
+    session.refresh_plan_state_from_branch()
+    assert session.plan_state.phase == "drafting"
+    assert "<handed_off_plan_for_review>" not in session.state.system_prompt
+    target.branch(handoff_leaf)
+    session.refresh_plan_state_from_branch()
+    assert session.plan_state.phase == "ready"
+    assert "<handed_off_plan_for_review>" in session.state.system_prompt
+
+
 @pytest.mark.parametrize("stop", ["aborted", "error", "length"])
 def test_incomplete_assistant_cannot_submit(tmp_path, stop):
     session = session_at(tmp_path)
@@ -286,12 +351,14 @@ def test_legacy_digest_validated_without_rewrite(tmp_path):
 
 
 @pytest.mark.parametrize("bad_line", ['{"type":', "[]", '"text"', '{"type":"plan_run","status":"bad"}'])
-def test_corrupt_jsonl_requires_recovery_and_explicit_exit(tmp_path, bad_line):
+@pytest.mark.parametrize("ending", ["\n", ""])
+def test_corrupt_jsonl_requires_recovery_and_explicit_exit(tmp_path, bad_line, ending):
     session = session_at(tmp_path, disk=True)
     ready(session)
     path = session.session_manager.path
     with path.open("a", encoding="utf-8") as stream:
-        stream.write(bad_line + "\n")
+        stream.write(bad_line + ending)
+    damaged_bytes = path.read_bytes()
     with pytest.warns(RuntimeWarning):
         manager = SessionManager.open(path)
     restored = AgentSession(AgentSessionConfig(model=session.model, session_manager=manager))
@@ -303,6 +370,15 @@ def test_corrupt_jsonl_requires_recovery_and_explicit_exit(tmp_path, bad_line):
     with pytest.warns(RuntimeWarning):
         reopened = SessionManager.open(path)
     assert reduce_plan_state(reopened.get_branch(), load_issues=reopened.load_issues).phase == "cancelled"
+    assert path.read_bytes().startswith(damaged_bytes)
+    restored.enter_plan_mode()
+    asyncio.run(drive(restored, "plan again", submission("recovery-submit")))
+    plan = restored.plan_state.latest_revision
+    with pytest.warns(RuntimeWarning):
+        replanned = SessionManager.open(path)
+    state = reduce_plan_state(replanned.get_branch(), load_issues=replanned.load_issues)
+    assert state.phase == "ready"
+    assert state.latest_revision.digest == plan.digest
 
 
 @pytest.mark.parametrize("stage", ["target_flush", "source_append"])
@@ -336,11 +412,14 @@ def test_handoff_failure_retains_source_ready_and_keeps_child(tmp_path, monkeypa
     assert not any(isinstance(item, PlanRunEntry) for item in child.entries)
 
 
-def test_entry_append_failure_does_not_advance_memory_or_file(tmp_path, monkeypatch):
+@pytest.mark.parametrize("tail", [b"", b'{"type":'])
+def test_entry_append_failure_does_not_advance_memory_or_file(tmp_path, monkeypatch, tail):
     import agent_core.session.storage as storage
     session = session_at(tmp_path, disk=True)
     ready(session)
     manager = session.session_manager
+    with manager.path.open("ab") as stream:
+        stream.write(tail)
     original_bytes = manager.path.read_bytes()
     previous_leaf = manager.leaf_id
     def fail_fsync(_fd):

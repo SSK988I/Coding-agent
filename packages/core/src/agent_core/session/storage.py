@@ -422,8 +422,17 @@ def append_entry_line(path: Path, entry: SessionEntry) -> None:
         CollaborationModeChangeEntry, PlanQuestionEntry, PlanQuestionAnswerEntry,
         PlanRevisionEntry, PlanRunEntry,
     ))
-    with open(path, "ab", buffering=0) as stream:
+    with open(path, "a+b", buffering=0) as stream:
+        stream.seek(0, os.SEEK_END)
         offset = stream.tell()
+        if offset:
+            stream.seek(-1, os.SEEK_END)
+            if stream.read(1) != b"\n":
+                # Preserve an unterminated (possibly crash-truncated) last line,
+                # but never merge a new record into it. Rollback includes this
+                # separator so a failed append leaves the original bytes intact.
+                encoded = b"\n" + encoded
+            stream.seek(0, os.SEEK_END)
         try:
             written = stream.write(encoded)
             if written != len(encoded):

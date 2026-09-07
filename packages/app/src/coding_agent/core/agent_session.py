@@ -569,6 +569,29 @@ class AgentSession:
         )
         if self._plan_state.mode == "plan":
             prompt = f"{prompt.rstrip()}\n\n{PLAN_MODE_OVERLAY}\n"
+            revision = self._plan_state.latest_revision
+            if (
+                self._plan_state.phase in {"drafting", "awaiting_answer", "ready"}
+                and revision is not None
+                and revision.origin_session_id is not None
+            ):
+                # Handoffs persist a revision, not source messages. Project the
+                # active branch's validated revision into review context on every
+                # refresh, including resume, without copying the source dialogue.
+                prompt += (
+                    "\n<handed_off_plan_for_review>\n"
+                    "The following plan is reference material for review and revision, "
+                    "not authorization to execute. Stay in Plan Mode; submit changes "
+                    "with submit_plan. Execution requires explicit host confirmation "
+                    "of the latest revision in this session.\n"
+                    f"Origin session: {revision.origin_session_id}\n"
+                    f"Plan ID: {revision.plan_id}\n"
+                    f"Revision: {revision.revision}\n"
+                    f"Digest: {revision.digest}\n"
+                    f"Title: {revision.title}\n\n"
+                    f"{revision.markdown}\n"
+                    "</handed_off_plan_for_review>\n"
+                )
         return prompt
 
     def _refresh_collaboration_runtime(self) -> None:
