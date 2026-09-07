@@ -20,7 +20,7 @@ from typing import Any, Callable
 from agent_llm import TextContent
 
 from agent_core.shell import ShellConfig, get_shell_config
-from agent_core.types import AgentToolResult
+from agent_core.types import AgentToolResult, PlanAccess
 
 
 BASH_SCHEMA: dict = {
@@ -93,6 +93,7 @@ class BashTool:
 
     name: str = "bash"
     effect: str = "shell"
+    plan_access: PlanAccess = "deny"
     label: str = "bash"
     description: str = (
         f"Execute a bash command in the current working directory. Returns "

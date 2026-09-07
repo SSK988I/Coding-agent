@@ -59,7 +59,10 @@ from coding_agent.modes.interactive.components.login_dialog import (
 from coding_agent.modes.interactive.components.model_selector import (
     ModelSelectorComponent,
 )
-from coding_agent.modes.interactive.components.plan_actions import PlanActionsComponent
+from coding_agent.modes.interactive.components.plan_actions import (
+    PlanActionsComponent,
+    PlanModeMenuComponent,
+)
 from coding_agent.modes.interactive.components.plan_question import PlanQuestionComponent
 from coding_agent.modes.interactive.components.status_indicator import (
     StatusIndicator,
@@ -150,6 +153,7 @@ class InteractiveMode:
         #: Either a ModelSelectorComponent or a LoginDialogComponent (duck-typed
         #: via handle_input + render + focused).
         self._current_selector: Any = None
+        self._displayed_plan_key: tuple[Any, ...] | None = None
 
     def _spawn(self, coro):
         """Schedule a fire-and-forget coroutine, keeping a strong reference.
@@ -439,9 +443,15 @@ class InteractiveMode:
                 self.theme,
             ))
         elif etype == "plan_question_requested":
-            self._open_plan_question(event)
+            pass  # Compatibility event; controls use only full snapshots.
         elif etype == "plan_ready":
-            self._show_plan_ready(event)
+            pass
+        elif etype in {"plan_state_changed", "plan.stateChanged"}:
+            # The runtime owns all transitions.  Frontends only re-render the
+            # authoritative snapshot already applied to ``session.plan_state``.
+            self._refresh_footer()
+            self._update_editor_border_color()
+            self._render_plan_state_controls()
         elif etype == "plan_validation_failed":
             self._add_system_message(
                 f"Plan 校验失败 [{event.get('code', 'INVALID_PLAN_SPEC')}]："
@@ -451,8 +461,7 @@ class InteractiveMode:
             "collaboration_mode_changed", "plan_execution_started",
             "plan_execution_completed", "plan_execution_failed", "plan_execution_aborted",
         }:
-            self._refresh_footer()
-            self._update_editor_border_color()
+            pass
 
     # 16 ms matches the TUI render interval. Duplicated as a
     # literal to avoid a cross-package import for one constant; the value is
@@ -652,6 +661,7 @@ class InteractiveMode:
         Used after compaction rewrites the session history.
         """
         self.chat_container.clear()
+        self._displayed_plan_key = None
         self._pending_tools.clear()
         self._streaming_component = None
         try:
@@ -808,11 +818,27 @@ class InteractiveMode:
     def _cmd_clear(self) -> None:
         self._session.agent.reset()
         self.chat_container.clear()
+        self._displayed_plan_key = None
         self._tool_cards.clear()
         self._print_welcome()
         self._add_system_message("对话已清空。")
+        self._render_plan_state_controls()
 
     def _cmd_plan(self) -> None:
+        state = self._session.plan_state
+        # Reopening a pending question through bare /plan first shows the
+        # state menu, so users can either redisplay the question or leave the
+        # episode.  Startup/event rehydration still restores the question card
+        # directly through _render_plan_state_controls().
+        if state.phase == "awaiting_answer":
+            self._mount_plan_phase_menu("awaiting_answer")
+            return
+        if state.phase in {
+            "drafting", "ready", "executing",
+            "uncertain", "recovery_error",
+        }:
+            self._render_plan_state_controls()
+            return
         try:
             self._session.enter_plan_mode()
         except PlanModeError as exc:
@@ -821,6 +847,7 @@ class InteractiveMode:
         self._refresh_footer()
         self._update_editor_border_color()
         self._add_system_message("已进入计划模式。")
+        self._render_plan_state_controls()
 
     async def _cmd_compact(self) -> None:
         self._add_system_message("正在压缩上下文…")
@@ -1017,6 +1044,7 @@ class InteractiveMode:
             self._add_system_message("已切换到所选分支。")
         finally:
             self._restore_editor()
+        self._render_plan_state_controls()
 
     def _swap_editor_for(self, selector: Any) -> None:
         """Replace the editor with ``selector`` in the TUI tree.
@@ -1077,6 +1105,11 @@ class InteractiveMode:
             self._add_system_message("收到无效的 Plan 问题事件。")
             return
 
+        self._mount_plan_question(question)
+
+    def _mount_plan_question(self, question: PlanQuestion) -> None:
+        """Mount a pending question from either a live event or restored state."""
+
         def on_answer(answer: str) -> None:
             self._restore_editor()
             self._spawn(self._answer_plan_question(question.question_id, answer))
@@ -1091,26 +1124,70 @@ class InteractiveMode:
         )
 
     async def _answer_plan_question(self, question_id: str, answer: str) -> None:
+        # A live question continues inside the already-subscribed `_respond`
+        # task.  A restored/deferred question starts a fresh Core prompt here,
+        # so this method must temporarily subscribe and lock the editor itself.
+        resumed = getattr(self._session, "_question_future", None) is None
+        unsub: Callable[[], None] | None = None
+        if resumed:
+            self._is_responding = True
+            self.editor.disable_submit = True
+            unsub = self._session.on_event(self._on_agent_event)
         try:
             await self._session.answer_plan_question(question_id, answer)
         except PlanModeError as exc:
             self._add_system_message(f"回答失败 [{exc.code}]：{exc}")
+        except Exception as exc:
+            self._add_system_message(f"回答失败：{exc}")
+        finally:
+            if resumed:
+                if unsub is not None:
+                    unsub()
+                self._is_responding = False
+                self.editor.disable_submit = False
+                self._refresh_footer()
+                self._render_plan_state_controls()
 
     def _show_plan_ready(self, event: dict) -> None:
         raw = event.get("plan") or {}
         try:
-            plan = PlanRevision(
-                plan_id=str(raw["planId"]), revision=int(raw["revision"]),
-                title=str(raw["title"]), markdown=str(raw["markdown"]),
-                digest=str(raw["digest"]),
-                source_message_id=str(raw.get("sourceMessageId", "")),
-            )
+            plan_id = str(raw["planId"])
+            revision = int(raw["revision"])
+            restored = self._session.plan_state.latest_revision
+            if (
+                restored is not None
+                and restored.plan_id == plan_id
+                and restored.revision == revision
+                and restored.digest == str(raw["digest"])
+            ):
+                plan = restored
+            else:
+                plan = PlanRevision(
+                    plan_id=plan_id, revision=revision,
+                    title=str(raw["title"]), markdown=str(raw["markdown"]),
+                    digest=str(raw["digest"]),
+                    source_message_id=str(raw.get("sourceMessageId", "")),
+                    schema_version=int(raw.get("schemaVersion", 0)),
+                    submitted_by_tool_call_id=str(raw.get("submittedByToolCallId", "")),
+                    origin_session_id=(
+                        str(raw["originSessionId"])
+                        if raw.get("originSessionId") is not None else None
+                    ),
+                )
         except (KeyError, TypeError, ValueError):
             self._add_system_message("收到无效的 Plan revision 事件。")
             return
-        self._add_assistant_text(
-            f"**PLAN · revision {plan.revision} · `{plan.digest[:12]}`**\n\n{plan.markdown}"
-        )
+        self._mount_plan_ready(plan)
+
+    def _mount_plan_ready(self, plan: PlanRevision) -> None:
+        """Mount actions for an immutable ready revision without duplicating it."""
+        key = (self._session.session_manager.header.id, plan.plan_id, plan.revision, plan.digest)
+        if getattr(self, "_displayed_plan_key", None) != key:
+            self._add_assistant_text(
+                f"**PLAN · revision {plan.revision} · `{plan.digest[:12]}`**\n\n"
+                f"{plan.title}\n\n{plan.markdown}"
+            )
+            self._displayed_plan_key = key
 
         def on_action(action: str) -> None:
             self._restore_editor()
@@ -1120,10 +1197,132 @@ class InteractiveMode:
                 self._cancel_plan()
             elif action == "execute":
                 self._spawn(self._execute_latest_plan())
+            elif action == "handoff":
+                self._handoff_latest_plan()
 
         self._swap_editor_for(
             PlanActionsComponent(self.theme, plan, on_action, self._restore_editor)
         )
+
+    def _render_plan_state_controls(self) -> None:
+        """Rehydrate the correct Plan control from authoritative Core state.
+
+        This is deliberately called after startup, branch/session switches and
+        full-state events.  It contains no transition logic; callbacks invoke
+        ``AgentSession`` APIs and let the runtime publish the next snapshot.
+        """
+        state = getattr(self._session, "plan_state", None)
+        if state is None:
+            return
+        phase = str(getattr(state, "phase", "idle"))
+        question = getattr(state, "pending_question", None)
+        latest = getattr(state, "latest_revision", None)
+        if getattr(state, "legacy_candidate", False):
+            key = (self._session.session_manager.header.id, state.active_plan_id, "legacy")
+            if getattr(self, "_displayed_plan_key", None) != key:
+                self._add_system_message(
+                    "检测到旧版计划候选文本，尚未形成可执行 revision。"
+                    "请继续规划，并通过 submit_plan 重新提交后再确认执行。"
+                )
+                self._displayed_plan_key = key
+
+        if phase == "awaiting_answer" and question is not None:
+            self._mount_plan_question(question)
+            return
+        if phase == "ready" and latest is not None:
+            self._mount_plan_ready(latest)
+            return
+        if phase in {"drafting", "executing", "uncertain", "recovery_error"}:
+            self._mount_plan_phase_menu(phase)
+            return
+        self._close_plan_controls()
+
+    def _mount_plan_phase_menu(self, phase: str) -> None:
+        def on_action(action: str) -> None:
+            self._restore_editor()
+            if action == "continue":
+                self._add_system_message("继续输入需求、约束或修改意见。")
+            elif action == "submit":
+                self._spawn(self._request_plan_submission())
+            elif action == "answer":
+                question = self._session.plan_state.pending_question
+                if question is None:
+                    self._add_system_message("当前没有待回答的 Plan 问题。")
+                else:
+                    self._mount_plan_question(question)
+            elif action == "details":
+                self._show_plan_recovery_details()
+            elif action == "stop":
+                self._spawn(self._session.abort())
+                self._add_system_message("已请求停止当前 Plan 执行回合。")
+            elif action == "replan":
+                self._restart_plan_after_recovery()
+            elif action == "cancel":
+                self._cancel_plan()
+
+        self._swap_editor_for(
+            PlanModeMenuComponent(self.theme, phase, on_action, self._restore_editor)
+        )
+
+    def _close_plan_controls(self) -> None:
+        selector = getattr(self, "_current_selector", None)
+        if isinstance(selector, (PlanActionsComponent, PlanModeMenuComponent, PlanQuestionComponent)):
+            self._restore_editor()
+
+    async def _request_plan_submission(self) -> None:
+        """Ask the model to submit the discussion through the control tool."""
+        if self._is_responding:
+            self._add_system_message("任务运行中，请先按 Esc 停止。")
+            return
+        prompt = (
+            "请基于当前讨论整理一份决策完备的实施计划，并仅通过 submit_plan "
+            "控制工具提交；不要执行计划。"
+        )
+        self._add_user_message(prompt)
+        self._is_responding = True
+        self.editor.disable_submit = True
+        try:
+            await self._respond(prompt)
+        finally:
+            self._is_responding = False
+            self.editor.disable_submit = False
+            self._refresh_footer()
+            self._render_plan_state_controls()
+
+    def _show_plan_recovery_details(self) -> None:
+        state = self._session.plan_state
+        details = [f"Plan 状态：`{state.phase}`"]
+        if state.active_plan_id:
+            details.append(f"planId：`{state.active_plan_id}`")
+        latest_run = getattr(state, "latest_run", None)
+        run_id = getattr(latest_run, "run_id", None)
+        if run_id:
+            details.append(f"runId：`{run_id}`")
+        error = getattr(state, "recovery_error", None)
+        if error:
+            if isinstance(error, dict):
+                code = error.get("code", "PLAN_RECOVERY_ERROR")
+                message = error.get("message", "")
+            else:
+                code = getattr(error, "code", "PLAN_RECOVERY_ERROR")
+                message = getattr(error, "message", str(error))
+            details.append(f"恢复错误：`{code}` {message}")
+        details.append("不会自动重试，也不会把未知终态当作成功。")
+        self._add_assistant_text("\n\n".join(details))
+
+    def _restart_plan_after_recovery(self) -> None:
+        """Start a new episode through Core; never retry the old run."""
+        try:
+            if self._session.collaboration_mode == "plan":
+                self._session.cancel_plan_mode(self._session.plan_state.active_plan_id)
+            self._session.enter_plan_mode()
+        except PlanModeError as exc:
+            self._add_system_message(f"重新规划失败 [{exc.code}]：{exc}")
+            return
+        self._refresh_footer()
+        self._update_editor_border_color()
+        self._add_system_message("已开始新的 Plan Episode；旧执行不会自动重试。")
+        self._render_plan_state_controls()
 
     def _cancel_plan(self) -> None:
         try:
@@ -1160,6 +1359,34 @@ class InteractiveMode:
             self.editor.disable_submit = False
             self._refresh_footer()
             self._update_editor_border_color()
+
+    def _handoff_latest_plan(self) -> None:
+        """Move the latest revision into a clean, linked session for review."""
+        latest = self._session.plan_state.latest_revision
+        if latest is None:
+            self._add_system_message("当前没有可交接的 Plan revision。")
+            return
+        try:
+            manager = self._session.handoff_plan_to_new_session(
+                latest.plan_id, latest.revision, latest.digest,
+            )
+        except PlanModeError as exc:
+            self._add_system_message(f"交接失败 [{exc.code}]：{exc}")
+            return
+        except Exception as exc:
+            self._add_system_message(f"交接失败：{exc}")
+            return
+
+        self.chat_container.clear()
+        self._displayed_plan_key = None
+        self._tool_cards.clear()
+        self._print_welcome()
+        self._refresh_footer()
+        self._update_editor_border_color()
+        self._add_system_message(
+            f"Plan 已交接到新会话 {manager.header.id}；请再次复核后执行。"
+        )
+        self._render_plan_state_controls()
 
     # ── Collaboration / thinking cycles ────────────────────────────────────
 
@@ -1441,10 +1668,13 @@ class InteractiveMode:
     def _cmd_new(self) -> None:
         manager = self._session.new_session()
         self.chat_container.clear()
+        self._displayed_plan_key = None
         self._tool_cards.clear()
         self._print_welcome()
         self._refresh_footer()
+        self._update_editor_border_color()
         self._add_system_message(f"已创建新会话：{manager.header.id}")
+        self._render_plan_state_controls()
 
     def _cmd_settings(self, arg: str) -> None:
         """Show settings or persist ``/settings <key> <value>``."""
@@ -1917,6 +2147,10 @@ class InteractiveMode:
             finally:
                 self._is_responding = False
                 self.editor.disable_submit = False
+
+        # Rehydrate branch-local Plan controls after all startup work.  This
+        # also reflects any state transition caused by an initial prompt.
+        self._render_plan_state_controls()
 
         # Event loop.
         while self._running:

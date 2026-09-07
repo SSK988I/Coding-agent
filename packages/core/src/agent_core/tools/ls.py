@@ -11,7 +11,7 @@ from typing import Any
 
 from agent_llm import TextContent
 
-from agent_core.types import AgentToolResult
+from agent_core.types import AgentToolResult, PlanAccess
 
 LS_SCHEMA: dict = {
     "type": "object",
@@ -43,6 +43,7 @@ class LsTool:
 
     name: str = "ls"
     effect: str = "read"
+    plan_access: PlanAccess = "observe"
     label: str = "ls"
     description: str = (
         f"List directory contents. Returns entries sorted alphabetically, with "

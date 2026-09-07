@@ -84,10 +84,7 @@ class FooterComponent(Component):
         if is_reasoning:
             lvl = thinking_level or "off"
             model_part = f"{model_id} • thinking {lvl}"
-        mode_part = (
-            "mode plan" if getattr(self._session, "collaboration_mode", "default") == "plan"
-            else ""
-        )
+        mode_part = self._plan_label()
 
         # Token stats + context usage.
         token_part = ""
@@ -102,9 +99,18 @@ class FooterComponent(Component):
 
         cost_part = f"${stats.cost:.4f}" if stats.cost > 0 else ""
 
-        # Join with separators, then color and truncate.
+        # Join with separators.  Wide terminals retain the existing inline
+        # order.  On narrow terminals, keep the Plan recovery/lifecycle label
+        # visible even when a long cwd would otherwise consume the whole row.
         parts = [p for p in (left, mode_part, model_part, token_part, cost_part) if p]
         line = " | ".join(parts)
+
+        if len(line) > width and mode_part:
+            suffix = f" | {mode_part}"
+            if len(suffix) < width:
+                line = left[: width - len(suffix)] + suffix
+            else:
+                line = mode_part[:width]
 
         # Colorize the context marker if present.
         line = self._colorize_context(line, model, stats)
@@ -119,6 +125,27 @@ class FooterComponent(Component):
         return [self._theme.fg("dim", line)]
 
     # ── helpers ─────────────────────────────────────────────────────────
+
+    def _plan_label(self) -> str:
+        """Return the compact, state-aware Plan indicator.
+
+        ``uncertain`` and ``recovery_error`` remain visible even though the
+        runtime is fail-closed in Default mode, so reopening a session never
+        hides the fact that user action is required.
+        """
+        state = getattr(self._session, "plan_state", None)
+        phase = getattr(state, "phase", None)
+        if phase == "ready":
+            return "plan ready"
+        if phase == "uncertain":
+            return "plan uncertain"
+        if phase == "recovery_error":
+            return "plan recovery"
+        if phase in {"drafting", "awaiting_answer", "executing"}:
+            return "plan"
+        if getattr(self._session, "collaboration_mode", "default") == "plan":
+            return "plan"
+        return ""
 
     def _context_percent(self, model: Any, stats: Any) -> "float | None":
         """Current context-window occupancy as a percentage.

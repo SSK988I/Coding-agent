@@ -283,6 +283,95 @@ def test_manual_compaction_rehydrates_desktop_with_persisted_summary(tmp_path: P
     assert changed["payload"]["messages"][0]["summary"] == "durable compacted context"
 
 
+def test_session_snapshot_includes_authoritative_plan_state() -> None:
+    import asyncio
+
+    state_payload = {
+        "mode": "plan",
+        "phase": "ready",
+        "activePlanId": "plan-1",
+        "latestRevision": {"planId": "plan-1", "revision": 2, "digest": "abc"},
+        "pendingQuestion": None,
+        "latestRun": None,
+        "recoveryError": None,
+        "handoffTargetSessionId": None,
+    }
+    runtime = DesktopRuntime(lambda _event: None)
+    runtime._session = SimpleNamespace(
+        collaboration_mode="plan",
+        plan_state=SimpleNamespace(to_payload=lambda: state_payload),
+        session_manager=SimpleNamespace(header=SimpleNamespace(id="session-plan")),
+        state=SimpleNamespace(messages=[]),
+        get_stats=lambda: {"messages": 0},
+    )
+
+    result = asyncio.run(runtime.dispatch("session.snapshot", {}))
+
+    assert result["sessionId"] == "session-plan"
+    assert result["collaborationMode"] == "plan"
+    assert result["planState"] == state_payload
+
+
+def test_plan_handoff_opens_fresh_review_session_after_core_persists(
+    tmp_path: Path,
+) -> None:
+    import asyncio
+
+    calls: list[tuple[str, int, str, bool]] = []
+    target_manager = SimpleNamespace(header=SimpleNamespace(id="session-child"))
+
+    def handoff(plan_id: str, revision: int, digest: str, *, attach: bool):
+        calls.append((plan_id, revision, digest, attach))
+        source.__dict__.update(target_session.__dict__)
+        return target_manager
+
+    source = SimpleNamespace(handoff_plan_to_new_session=handoff)
+    ready_state = {
+        "mode": "plan",
+        "phase": "ready",
+        "activePlanId": "plan-1",
+        "latestRevision": {
+            "planId": "plan-1", "revision": 2, "digest": "digest-2",
+            "title": "Plan", "markdown": "body", "sourceMessageId": "message-1",
+        },
+        "pendingQuestion": None,
+    }
+    target_session = SimpleNamespace(
+        session_manager=target_manager,
+        state=SimpleNamespace(messages=[]),
+        model=SimpleNamespace(id="model", name="Model", provider="test"),
+        thinking_level=None,
+        tools=[],
+        collaboration_mode="plan",
+        plan_state=SimpleNamespace(to_payload=lambda: ready_state),
+        memory_enabled=False,
+        memory_identity=None,
+    )
+    events: list[dict] = []
+    runtime = DesktopRuntime(events.append)
+    runtime._workspace = tmp_path
+    runtime._session = source  # type: ignore[assignment]
+
+    async def replace_session(
+        workspace: Path, *, session_id: str | None = None, resume: bool = False,
+    ) -> None:
+        assert workspace == tmp_path
+        assert session_id == "session-child"
+        assert resume is False
+        runtime._session = target_session  # type: ignore[assignment]
+
+    runtime._replace_session = replace_session  # type: ignore[method-assign]
+
+    result = asyncio.run(runtime.dispatch("plan.handoff", {
+        "planId": "plan-1", "revision": 2, "digest": "digest-2",
+    }))
+
+    assert calls == [("plan-1", 2, "digest-2", True)]
+    assert result["sessionId"] == "session-child"
+    assert result["planState"] == ready_state
+    assert events[-1]["event"] == {"type": "session.changed", "payload": result}
+
+
 def test_opening_saved_session_does_not_persist_abandoned_empty_session(
     tmp_path: Path,
 ) -> None:
@@ -429,3 +518,9 @@ def test_unanswered_approval_expires_instead_of_waiting_forever() -> None:
         "approval.requested",
         "approval.expired",
     ]
+
+
+def test_default_approval_preserves_upstream_fd_redirect_support() -> None:
+    from coding_agent.desktop.runtime import _is_read_only_bash_command
+    assert _is_read_only_bash_command("git log --oneline -20 --no-merges 2>&1 | head -30")
+    assert not _is_read_only_bash_command("cat missing.txt 2> errors.txt")

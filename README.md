@@ -19,7 +19,7 @@ It can read and modify project files, search code, execute shell commands, and s
 - **Project context**: discovers `AGENTS.md`, `CLAUDE.md`, skills, and prompt templates.
 - **Terminal UI**: renders Markdown, streaming content, tool cards, model selection, and line-based differential updates.
 - **Desktop MVP**: supports workspace selection, session history, streaming messages, tool approval, model switching, and a slash-command palette.
-- **Cross-client Plan Mode**: provides read-only exploration, structured questions, immutable plan revisions, and explicit execution confirmation shared by CLI and desktop.
+- **Cross-client Plan Mode**: provides runtime-enforced observation tools, structured questions, immutable plan revisions, recovery states, and explicit execution confirmation shared by CLI and desktop.
 
 ## Interfaces
 
@@ -164,10 +164,11 @@ For resumable non-interactive workflows:
 uv run coding-agent --agent-mode plan -p "Plan the requested change"
 uv run coding-agent --session <session-id> --answer-plan-question <question-id> "answer"
 uv run coding-agent --session <session-id> --execute-plan <revision>
+uv run coding-agent --session <session-id> --handoff-plan [revision]
 uv run coding-agent --session <session-id> --cancel-plan
 ```
 
-Plan State is stored in JSONL v4 and can be resumed by either the CLI or desktop client. When a revision is ready, the interactive clients ask whether to execute it or supplement ideas; supplemental text returns the episode to drafting and never authorizes execution. See [Plan Mode Specification](docs/specs/plan-mode.md).
+Plan State is reduced from the active JSONL v4 branch and can be resumed by either the CLI or desktop client. A bare `/plan` restores state-aware controls for drafting, pending questions, ready revisions, active execution, or recovery. Ready plans can be executed in place or handed to a clean child session for a second review; supplemental text returns the episode to drafting and never authorizes execution. `settled` means the Agent turn ended, not that its result was verified, and cancelling/stopping does not roll back effects already performed. See the [Plan Mode Specification](docs/specs/plan-mode.md) and [architecture decision](docs/adr/0001-centralize-collaboration-mode-policy.md).
 
 ### Provider and model selection
 
@@ -248,7 +249,7 @@ Tools expose their name, description, JSON Schema parameters, and asynchronous e
 | `/model` | Select a model from configured providers |
 | `/login`, `/logout` | Manage provider credentials |
 | `/new` | Start a new session |
-| `/plan`, `/cancel-plan`, `/execute-plan` | Enter, cancel, or explicitly execute Plan Mode |
+| `/plan`, `/cancel-plan`, `/execute-plan` | Open state-aware Plan controls, cancel, or explicitly execute |
 | `/session` | Show session information and statistics |
 | `/tree` | Inspect and switch session branches |
 | `/compact` | Compact context manually |

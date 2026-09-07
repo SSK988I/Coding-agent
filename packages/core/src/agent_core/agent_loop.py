@@ -106,6 +106,11 @@ async def run_agent_loop(
         await _emit(emit, {"type": "message_start", "message": p})
         await _emit(emit, {"type": "message_end", "message": p})
 
+    # Subscribers may persist/reduce a collaboration-state transition while
+    # handling the user message (for example Plan ready -> drafting).  Adopt
+    # that authoritative runtime policy before the first model request.
+    await _refresh_runtime_context(current_context, config)
+
     await _run_loop(current_context, config, emit, signal, stream_fn, new_messages, first_turn=True)
     return new_messages
 
@@ -189,6 +194,7 @@ async def _run_loop(
                     context.messages.append(msg)
                     new_messages.append(msg)
                 pending = []
+                await _refresh_runtime_context(context, config)
 
             # (a)(b) Stream the assistant response.
             message = await _stream_assistant_response(
@@ -226,6 +232,10 @@ async def _run_loop(
 
             await _emit(emit, {"type": "turn_end", "message": message, "tool_results": tool_results})
 
+            if tool_calls and batch_terminate:
+                await _emit(emit, {"type": "agent_end", "messages": new_messages})
+                return
+
             # Post-turn steering poll.
             pending = await _drain_queue(config.get_steering_messages)
         # inner exited: no more tool calls AND no pending steering.
@@ -239,6 +249,22 @@ async def _run_loop(
         break
 
     await _emit(emit, {"type": "agent_end", "messages": new_messages})
+
+
+async def _refresh_runtime_context(
+    context: AgentContext,
+    config: AgentLoopConfig,
+) -> None:
+    """Refresh policy fields without replacing the loop-owned transcript."""
+    if config.refresh_context is None:
+        return
+    refreshed = config.refresh_context()
+    if hasattr(refreshed, "__await__"):
+        refreshed = await refreshed
+    if refreshed is None:
+        return
+    context.system_prompt = refreshed.system_prompt
+    context.tools = list(refreshed.tools) if refreshed.tools is not None else None
 
 
 # ─── stream + consume ──────────────────────────
@@ -387,9 +413,9 @@ class _Finalized:
     is_error: bool
 
 
-def _error_result(message: str) -> AgentToolResult:
+def _error_result(message: str, details: Any = None) -> AgentToolResult:
     """Build a non-terminating error result for a failed tool call."""
-    return AgentToolResult(content=[TextContent(text=message)])
+    return AgentToolResult(content=[TextContent(text=message)], details=details)
 
 
 async def _execute_tool_calls(
@@ -551,6 +577,18 @@ async def _prepare_tool_call(
     tool_map = {t.name: t for t in (context.tools or [])}
     tool = tool_map.get(tc.name)
     if tool is None:
+        if config.before_tool_call is not None:
+            before = await _maybe_await(config.before_tool_call(
+                BeforeToolCallContext(
+                    assistant_message=assistant_message, tool_call=tc,
+                    args=tc.arguments, context=context,
+                ), signal,
+            ))
+            if before is not None and before.block:
+                return {
+                    "kind": "immediate",
+                    "finalized": _Finalized(tc, _blocked_result(before), True),
+                }
         return {
             "kind": "immediate",
             "finalized": _Finalized(
@@ -584,7 +622,7 @@ async def _prepare_tool_call(
                     "kind": "immediate",
                     "finalized": _Finalized(
                         tc,
-                        _error_result(before.reason or "Tool execution was blocked"),
+                        _blocked_result(before),
                         True,
                     ),
                 }
@@ -600,6 +638,17 @@ async def _prepare_tool_call(
             "kind": "immediate",
             "finalized": _Finalized(tc, _error_result(str(e)), True),
         }
+
+
+def _blocked_result(before: Any) -> AgentToolResult:
+    details = None
+    if before.code is not None:
+        details = {
+            "code": before.code,
+            "reason": before.reason,
+            "alternatives": before.alternatives or [],
+        }
+    return _error_result(before.reason or "Tool execution was blocked", details)
 
 
 async def _execute_prepared_tool_call(

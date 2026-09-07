@@ -22,6 +22,7 @@ import tempfile
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from agent_core.session.serde import dict_to_message, message_to_dict
 from agent_core.session.types import (
@@ -193,6 +194,7 @@ def entry_to_line_dict(entry: SessionEntry) -> dict:
             "type": "collaboration_mode_change",
             "id": entry.id, "parentId": entry.parent_id, "timestamp": entry.timestamp,
             "mode": entry.mode, "planId": entry.plan_id,
+            "reason": entry.reason, "relatedSessionId": entry.related_session_id,
         }
     if isinstance(entry, PlanQuestionEntry):
         return {
@@ -216,6 +218,9 @@ def entry_to_line_dict(entry: SessionEntry) -> dict:
             "planId": entry.plan_id, "revision": entry.revision,
             "title": entry.title, "markdown": entry.markdown,
             "digest": entry.digest, "sourceMessageId": entry.source_message_id,
+            "schemaVersion": entry.schema_version,
+            "submittedByToolCallId": entry.submitted_by_tool_call_id,
+            "originSessionId": entry.origin_session_id,
         }
     if isinstance(entry, PlanRunEntry):
         return {
@@ -224,6 +229,8 @@ def entry_to_line_dict(entry: SessionEntry) -> dict:
             "planId": entry.plan_id, "revision": entry.revision,
             "digest": entry.digest, "status": entry.status,
             "runId": entry.run_id, "error": entry.error,
+            "assistantMessageId": entry.assistant_message_id,
+            "stopReason": entry.stop_reason,
         }
     raise TypeError(f"Cannot serialize entry of type {type(entry)!r}")
 
@@ -238,6 +245,22 @@ def line_dict_to_entry(d: dict) -> SessionEntry:
         raise ValueError("Session entry id and timestamp must be strings")
     if parent_id is not None and not isinstance(parent_id, str):
         raise ValueError("Session entry parentId must be a string or null")
+    if etype in {"collaboration_mode_change", "plan_question", "plan_question_answer", "plan_revision", "plan_run"}:
+        # Accept absent legacy fields, never coerce tampered values (e.g.
+        # true or "1" into revision 1) into an apparently valid signature.
+        for field in ("planId", "questionId", "header", "question", "answer", "title", "markdown",
+                      "digest", "sourceMessageId", "submittedByToolCallId"):
+            if field in d and not isinstance(d[field], str):
+                if field != "planId" or etype != "collaboration_mode_change" or d[field] is not None:
+                    raise ValueError(f"{etype}.{field} must be a string")
+        for field in ("revision", "schemaVersion"):
+            if field in d and type(d[field]) is not int:
+                raise ValueError(f"{etype}.{field} must be an integer")
+        for field in ("runId", "error", "assistantMessageId", "stopReason", "originSessionId", "reason", "relatedSessionId"):
+            if d.get(field) is not None and not isinstance(d[field], str):
+                raise ValueError(f"{etype}.{field} must be a string or null")
+        if "allowCustom" in d and not isinstance(d["allowCustom"], bool):
+            raise ValueError("plan_question.allowCustom must be a boolean")
     if etype == "message":
         msg = d.get("message")
         return SessionMessageEntry(
@@ -287,12 +310,17 @@ def line_dict_to_entry(d: dict) -> SessionEntry:
             raise ValueError(f"Invalid collaboration mode: {mode!r}")
         return CollaborationModeChangeEntry(
             mode=mode, plan_id=d.get("planId"), id=entry_id,
+            reason=d.get("reason"), related_session_id=d.get("relatedSessionId"),
             parent_id=parent_id, timestamp=timestamp,
         )
     if etype == "plan_question":
         options = d.get("options") or []
         if not isinstance(options, list):
             raise ValueError("plan_question.options must be a list")
+        if any(not isinstance(item, dict) or not all(
+            isinstance(item.get(key), str) for key in ("label", "description")
+        ) for item in options):
+            raise ValueError("plan_question.options must contain string labels and descriptions")
         return PlanQuestionEntry(
             plan_id=str(d.get("planId", "")),
             question_id=str(d.get("questionId", "")),
@@ -314,6 +342,9 @@ def line_dict_to_entry(d: dict) -> SessionEntry:
             title=str(d.get("title", "")), markdown=str(d.get("markdown", "")),
             digest=str(d.get("digest", "")),
             source_message_id=str(d.get("sourceMessageId", "")), id=entry_id,
+            schema_version=int(d.get("schemaVersion", 0) or 0),
+            submitted_by_tool_call_id=str(d.get("submittedByToolCallId", "")),
+            origin_session_id=d.get("originSessionId"),
             parent_id=parent_id, timestamp=timestamp,
         )
     if etype == "plan_run":
@@ -324,6 +355,8 @@ def line_dict_to_entry(d: dict) -> SessionEntry:
             plan_id=str(d.get("planId", "")), revision=int(d.get("revision", 0) or 0),
             digest=str(d.get("digest", "")), status=status,
             run_id=d.get("runId"), error=d.get("error"), id=entry_id,
+            assistant_message_id=d.get("assistantMessageId"),
+            stop_reason=d.get("stopReason"),
             parent_id=parent_id, timestamp=timestamp,
         )
     raise ValueError(f"Unknown entry type in session file: {etype!r}")
@@ -384,9 +417,33 @@ def rewrite_header_line(path: Path, header: SessionHeader) -> None:
 
 def append_entry_line(path: Path, entry: SessionEntry) -> None:
     """Append one entry as a JSON line (append-only)."""
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry_to_line_dict(entry), ensure_ascii=False))
-        f.write("\n")
+    encoded = (json.dumps(entry_to_line_dict(entry), ensure_ascii=False) + "\n").encode("utf-8")
+    durable = isinstance(entry, (
+        CollaborationModeChangeEntry, PlanQuestionEntry, PlanQuestionAnswerEntry,
+        PlanRevisionEntry, PlanRunEntry,
+    ))
+    with open(path, "a+b", buffering=0) as stream:
+        stream.seek(0, os.SEEK_END)
+        offset = stream.tell()
+        if offset:
+            stream.seek(-1, os.SEEK_END)
+            if stream.read(1) != b"\n":
+                # Preserve an unterminated (possibly crash-truncated) last line,
+                # but never merge a new record into it. Rollback includes this
+                # separator so a failed append leaves the original bytes intact.
+                encoded = b"\n" + encoded
+            stream.seek(0, os.SEEK_END)
+        try:
+            written = stream.write(encoded)
+            if written != len(encoded):
+                raise OSError("Incomplete session entry write")
+            if durable:
+                os.fsync(stream.fileno())
+        except BaseException:
+            # Undo only this attempted JSONL append. Never rewrite earlier
+            # session history; a process crash remains detectable on replay.
+            stream.truncate(offset)
+            raise
 
 
 # ─── file read ────────────────────────────────────────────────────────
@@ -403,25 +460,75 @@ def read_header(path: Path) -> SessionHeader | None:
         return None
 
 
-def read_entries(path: Path) -> list[SessionEntry]:
+def read_entries(
+    path: Path,
+    *,
+    issues: list[dict[str, Any]] | None = None,
+) -> list[SessionEntry]:
     """Read all valid entries and warn when damaged JSONL lines are skipped."""
     entries: list[SessionEntry] = []
     corrupt_lines: list[int] = []
+    seen_ids: set[str] = set()
+
+    def record_issue(line_number: int, code: str, message: str) -> None:
+        corrupt_lines.append(line_number)
+        if issues is not None:
+            issues.append({
+                "line": line_number,
+                "code": code,
+                "message": message,
+            })
+
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        # Decode line-by-line so one invalid UTF-8 tail cannot hide every
+        # otherwise valid entry that precedes or follows it.
+        with open(path, "rb") as f:
             first = True
-            for line_number, line in enumerate(f, start=1):
+            for line_number, raw_line in enumerate(f, start=1):
                 if first:  # skip header
                     first = False
                     continue
-                line = line.strip()
+                try:
+                    line = raw_line.decode("utf-8").strip()
+                except UnicodeDecodeError as exc:
+                    record_issue(line_number, "INVALID_UTF8", str(exc))
+                    continue
                 if not line:
                     continue
                 try:
-                    entries.append(line_dict_to_entry(json.loads(line)))
-                except (ValueError, KeyError):
-                    # Skip corrupt/trailing entries but keep the rest.
-                    corrupt_lines.append(line_number)
+                    payload = json.loads(line)
+                    if not isinstance(payload, dict):
+                        raise ValueError("session entry must be a JSON object")
+                    entry = line_dict_to_entry(payload)
+                    if not entry.id:
+                        raise ValueError("session entry id must not be empty")
+                    if entry.id in seen_ids:
+                        raise ValueError(f"duplicate session entry id: {entry.id}")
+                    if entry.parent_id == entry.id:
+                        raise ValueError("session entry cannot parent itself")
+                    if entry.parent_id is not None and entry.parent_id not in seen_ids:
+                        record_issue(
+                            line_number,
+                            "DANGLING_PARENT",
+                            f"unknown parentId: {entry.parent_id}",
+                        )
+                    if (
+                        isinstance(entry, LeafEntry)
+                        and entry.target_id is not None
+                        and entry.target_id not in seen_ids
+                    ):
+                        record_issue(
+                            line_number,
+                            "INVALID_LEAF_TARGET",
+                            f"unknown leaf targetId: {entry.target_id}",
+                        )
+                    setattr(entry, "_source_line", line_number)
+                    entries.append(entry)
+                    seen_ids.add(entry.id)
+                except (AttributeError, KeyError, TypeError, ValueError) as exc:
+                    # Skip corrupt/trailing entries but keep the rest and make
+                    # the damage available to the Plan recovery reducer.
+                    record_issue(line_number, "CORRUPT_SESSION_ENTRY", str(exc))
                     continue
     except OSError:
         pass

@@ -19,7 +19,7 @@ Coding Agent 是一个面向本地开发工作的编程 Agent。项目以 Python
 - **项目上下文**：支持发现 `AGENTS.md`、`CLAUDE.md`、Skills 和提示词模板。
 - **终端界面**：支持 Markdown、流式内容、工具卡片、模型选择和按行差分渲染。
 - **桌面端 MVP**：支持项目选择、会话列表、流式消息、工具审批、模型切换和斜杠命令面板。
-- **跨端 Plan Mode**：CLI 与桌面端共享只读探索、结构化问题、不可变计划 revision 和显式执行确认。
+- **跨端 Plan Mode**：CLI 与桌面端共享 Runtime 强制的观察工具、结构化问题、不可变 revision、恢复状态和显式执行确认。
 
 ## 界面形态
 
@@ -164,10 +164,11 @@ uv run coding-agent --no-session
 uv run coding-agent --agent-mode plan -p "规划这项改动"
 uv run coding-agent --session <会话ID> --answer-plan-question <问题ID> "回答"
 uv run coding-agent --session <会话ID> --execute-plan <revision>
+uv run coding-agent --session <会话ID> --handoff-plan [revision]
 uv run coding-agent --session <会话ID> --cancel-plan
 ```
 
-Plan State 使用 JSONL v4 持久化，可由 CLI 或桌面端交叉恢复。revision 就绪后，交互端会要求选择“执行方案”或“补充想法”；补充内容会回到 drafting，且绝不会构成执行授权。完整约束见 [Plan Mode 规范](docs/specs/plan-mode.md)。
+Plan State 从活动 JSONL v4 分支归约，可由 CLI 或桌面端交叉恢复。裸 `/plan` 会按 drafting、待回答问题、ready、执行中或恢复异常重新显示对应控件。ready 方案既可在当前会话执行，也可交接到干净子会话再次复核；补充内容会回到 drafting，且绝不会构成执行授权。`settled` 仅表示 Agent 回合结束，不代表结果已经验证；取消或停止也不会回滚已经发生的副作用。完整约束见 [Plan Mode 规范](docs/specs/plan-mode.md)及[架构决策](docs/adr/0001-centralize-collaboration-mode-policy.md)。
 
 ### 选择 Provider 和模型
 
@@ -248,7 +249,7 @@ uv run coding-agent --provider zhipu --model glm-5v-turbo `
 | `/model` | 选择已配置 Provider 的模型 |
 | `/login`、`/logout` | 管理 Provider 凭据 |
 | `/new` | 创建新会话 |
-| `/plan`、`/cancel-plan`、`/execute-plan` | 进入、取消或显式执行 Plan Mode |
+| `/plan`、`/cancel-plan`、`/execute-plan` | 打开状态化 Plan 控件、取消或显式执行 |
 | `/session` | 查看会话信息和统计数据 |
 | `/tree` | 查看并切换会话分支 |
 | `/compact` | 手动压缩上下文 |

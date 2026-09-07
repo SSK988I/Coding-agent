@@ -55,7 +55,8 @@ export interface MemoryStatePayload {
 
 export type PlanPhase =
   | "idle" | "drafting" | "awaiting_answer" | "ready" | "executing"
-  | "completed" | "failed" | "aborted" | "cancelled";
+  | "completed" | "settled" | "failed" | "aborted" | "cancelled"
+  | "uncertain" | "recovery_error";
 
 export interface PlanQuestionOptionPayload {
   label: string;
@@ -77,13 +78,48 @@ export interface PlanRevisionPayload {
   markdown: string;
   digest: string;
   sourceMessageId: string;
+  schemaVersion?: number;
+  submittedByToolCallId?: string | null;
+  originSessionId?: string | null;
+}
+
+export interface PlanRunPayload {
+  planId: string;
+  revision: number;
+  digest: string;
+  status: "started" | "completed" | "failed" | "aborted";
+  runId: string | null;
+  error: string | null;
+  assistantMessageId: string | null;
+  stopReason: string | null;
+  entryId: string;
+  timestamp: string;
+}
+
+export interface PlanRecoveryErrorPayload {
+  code: string;
+  message: string;
+  entryId: string;
 }
 
 export interface PlanStatePayload {
+  mode?: "default" | "plan";
   phase: PlanPhase;
   activePlanId: string | null;
   latestRevision: PlanRevisionPayload | null;
   pendingQuestion: PlanQuestionPayload | null;
+  latestRun?: PlanRunPayload | null;
+  recoveryError?: PlanRecoveryErrorPayload | null;
+  handoffTargetSessionId?: string | null;
+  legacyCandidate?: boolean;
+}
+
+export interface SessionSnapshotPayload {
+  sessionId: string;
+  messages: AgentMessage[];
+  stats: Record<string, unknown>;
+  collaborationMode: "default" | "plan";
+  planState: PlanStatePayload;
 }
 
 export interface AgentMessage {

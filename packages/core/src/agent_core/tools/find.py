@@ -13,7 +13,7 @@ from typing import Any
 
 from agent_llm import TextContent
 
-from agent_core.types import AgentToolResult
+from agent_core.types import AgentToolResult, PlanAccess
 from agent_core.tools._subprocess import find_in_path, head_truncate_bytes
 from agent_core.tools._gitignore import is_ignored
 
@@ -52,6 +52,7 @@ class FindTool:
 
     name: str = "find"
     effect: str = "read"
+    plan_access: PlanAccess = "observe"
     label: str = "find"
     description: str = (
         f"Search for files by glob pattern. Returns matching file paths relative "
@@ -64,9 +65,18 @@ class FindTool:
         "Use find to locate files by name or extension before searching their contents.",
     ]
 
-    def __init__(self, cwd: str = ".", *, limit: int = DEFAULT_LIMIT) -> None:
+    def __init__(
+        self,
+        cwd: str = ".",
+        *,
+        limit: int = DEFAULT_LIMIT,
+        prefer_external: bool = True,
+    ) -> None:
         self.cwd = cwd
         self.limit = limit
+        # Plan mode sets this to False so repository-controlled PATH entries
+        # can never turn a read-only search into external code execution.
+        self.prefer_external = prefer_external
 
     async def execute(
         self,
@@ -83,7 +93,7 @@ class FindTool:
         if not os.path.isdir(full_path):
             raise FileNotFoundError(f"Path not found: {path}")
 
-        fd = find_in_path("fd")
+        fd = find_in_path("fd") if self.prefer_external else None
         if fd:
             try:
                 text = await self._run_with_fd(fd, pattern, full_path, limit)

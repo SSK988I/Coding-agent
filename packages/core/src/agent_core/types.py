@@ -50,6 +50,10 @@ ToolExecutionMode = Literal["sequential", "parallel"]
 #: Coarse side-effect classification used by collaboration-mode policy.
 ToolEffect = Literal["read", "write", "shell", "control", "unknown"]
 
+#: Explicit Plan-mode access classification.  Callers must treat a missing
+#: declaration as ``"deny"`` so third-party/custom tools fail closed.
+PlanAccess = Literal["observe", "control", "deny"]
+
 #: Queue drain policy. "all" drains every queued message in one
 #: drain call; "one-at-a-time" drains only the oldest, leaving the rest for a
 #: later drain. Both steering and follow-up queues default to "one-at-a-time".
@@ -87,6 +91,7 @@ class AgentTool(Protocol):
     prepare_arguments: Callable[[dict], dict]
     execution_mode: ToolExecutionMode
     effect: ToolEffect
+    plan_access: PlanAccess
 
     async def execute(
         self,
@@ -142,6 +147,8 @@ class BeforeToolCallResult:
     args."""
     block: bool = False
     reason: str | None = None
+    code: str | None = None
+    alternatives: list[dict[str, Any]] | None = None
 
 
 @dataclass
@@ -190,6 +197,11 @@ class AgentLoopConfig:
     # naturally stops. Sync or async return values both accepted.
     get_steering_messages: "Callable[[], Awaitable[list] | list] | None" = None
     get_follow_up_messages: "Callable[[], Awaitable[list] | list] | None" = None
+    # Re-read mutable runtime policy after newly emitted user/steering messages
+    # have been persisted and reduced by subscribers.  The active loop keeps
+    # its transcript, but adopts the refreshed system prompt and tool set
+    # before the next model request.
+    refresh_context: "Callable[[], Awaitable[AgentContext] | AgentContext] | None" = None
 
 
 # ─── Events ───────────────────────────────────

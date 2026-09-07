@@ -315,6 +315,28 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #8e8a82; outli
 .plan-custom-answer { display: flex; gap: 7px; margin-top: 8px; }
 .plan-custom-answer input { flex: 1; min-width: 0; border: 1px solid #d8cfac; border-radius: 8px; padding: 7px 9px; outline: 0; background: #fff; font-size: 10px; }
 .plan-custom-answer input:focus { border-color: #aa984d; }
+.plan-status {
+  max-width: 820px;
+  margin: 0 auto 9px;
+  padding: 13px 14px;
+  border: 1px solid #d9b56f;
+  border-radius: 12px;
+  background: #fff9e9;
+  box-shadow: 0 6px 22px rgba(98, 78, 24, .07);
+}
+.plan-status.recovery_error { border-color: #d39a92; background: #fff5f3; }
+.plan-status p { margin: 10px 0 0; color: #5d5035; font-size: 11px; line-height: 1.6; }
+.plan-status pre {
+  max-height: 120px;
+  margin: 9px 0 0;
+  padding: 8px 10px;
+  overflow: auto;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, .72);
+  color: #7f433e;
+  font-size: 9px;
+  white-space: pre-wrap;
+}
 
 .composer-wrap {
   position: relative;

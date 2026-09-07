@@ -25,6 +25,7 @@ from agent_core.types import (
     BeforeToolCallContext,
     BeforeToolCallResult,
     QueueMode,
+    PlanAccess,
     StreamFn,
     ToolExecutionMode,
     ToolEffect,
@@ -33,6 +34,7 @@ from agent_core.tools.bash import BashRawResult, BashTool
 from agent_core.tools.edit import EditTool
 from agent_core.tools.find import FindTool
 from agent_core.tools.grep import GrepTool
+from agent_core.tools.git import GitDiffTool, GitLogTool, GitShowTool, GitStatusTool
 from agent_core.tools.ls import LsTool
 from agent_core.tools.read import ReadTool
 from agent_core.tools.write import WriteTool
@@ -60,6 +62,7 @@ __all__ = [
     "StreamFn",
     "ToolExecutionMode",
     "ToolEffect",
+    "PlanAccess",
     "QueueMode",
     "PendingMessageQueue",
     "BeforeToolCallContext",
@@ -72,6 +75,10 @@ __all__ = [
     "BashRawResult",
     "EditTool",
     "GrepTool",
+    "GitStatusTool",
+    "GitLogTool",
+    "GitDiffTool",
+    "GitShowTool",
     "FindTool",
     "LsTool",
     # session persistence + compaction
