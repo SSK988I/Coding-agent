@@ -12,6 +12,7 @@ from __future__ import annotations
 import copy
 import os
 from pathlib import Path
+from typing import Any
 
 from agent_llm import Message
 
@@ -76,6 +77,7 @@ class SessionManager:
         agent_dir: Path | None = None,
         sessions_dir: Path | None = None,
         in_memory: bool = False,
+        load_issues: list[dict[str, Any]] | None = None,
     ) -> None:
         self.header = header
         self.entries: list[SessionEntry] = list(entries or [])
@@ -84,9 +86,11 @@ class SessionManager:
         self.agent_dir: Path | None = agent_dir
         self.sessions_dir: Path | None = sessions_dir
         self.in_memory: bool = in_memory
+        self.load_issues: list[dict[str, Any]] = list(load_issues or [])
         # Flush-on-first-assistant buffering:
         # before the file is created we buffer entries in memory.
         self._flushed: bool = path is not None and (path.exists() if path else False)
+        self._persisted_count = len(self.entries) if self._flushed else 0
         self._buffer: list[SessionEntry] = [] if not self._flushed else list(self.entries)
 
     # ─── factories ─────────────────────────────────────────────────────
@@ -100,6 +104,7 @@ class SessionManager:
         sessions_dir: Path | None = None,
         in_memory: bool = False,
         session_id: str | None = None,
+        parent_session: str | None = None,
     ) -> "SessionManager":
         """Create a brand-new session."""
         cwd = cwd or os.getcwd()
@@ -109,7 +114,9 @@ class SessionManager:
         if not is_valid_session_id(session_id):
             raise ValueError(f"Invalid session id: {session_id!r}")
         ts = iso_now()
-        header = SessionHeader(id=session_id, timestamp=ts, cwd=cwd)
+        header = SessionHeader(
+            id=session_id, timestamp=ts, cwd=cwd, parent_session=parent_session,
+        )
         path = None if in_memory else session_file_path(
             header, cwd, agent_dir, sessions_dir=sessions_dir,
         )
@@ -137,7 +144,8 @@ class SessionManager:
         header = read_header(path)
         if header is None:
             raise FileNotFoundError(f"Not a valid session file: {path}")
-        entries = read_entries(path)
+        load_issues: list[dict[str, Any]] = []
+        entries = read_entries(path, issues=load_issues)
         # 用 compute_leaf_id：如果文件末尾有 LeafEntry，恢复到它指向的叶；
         # 否则退化为"最后一条 entry"，与旧行为完全一致。
         leaf_id = compute_leaf_id(entries)
@@ -147,6 +155,7 @@ class SessionManager:
             agent_dir=agent_dir,
             sessions_dir=sessions_dir,
             in_memory=False,
+            load_issues=load_issues,
         )
         sm._flushed = True
         return sm
@@ -321,12 +330,16 @@ class SessionManager:
 
     def append_collaboration_mode_change(
         self, mode: str, *, plan_id: str | None = None,
+        reason: str | None = None, related_session_id: str | None = None,
     ) -> CollaborationModeChangeEntry:
         if mode not in {"default", "plan"}:
             raise ValueError(f"Invalid collaboration mode: {mode!r}")
+        if reason not in {None, "user", "handoff"}:
+            raise ValueError(f"Invalid collaboration transition reason: {reason!r}")
         entry = CollaborationModeChangeEntry(
             id=self._next_entry_id(), parent_id=self._parent_for_new_entry(),
-            timestamp=iso_now(), mode=mode, plan_id=plan_id,  # type: ignore[arg-type]
+            timestamp=iso_now(), mode=mode, plan_id=plan_id,
+            reason=reason, related_session_id=related_session_id,  # type: ignore[arg-type]
         )
         self._commit_v4(entry)
         return entry
@@ -357,13 +370,16 @@ class SessionManager:
 
     def append_plan_revision(
         self, *, plan_id: str, revision: int, title: str, markdown: str,
-        digest: str, source_message_id: str,
+        digest: str, source_message_id: str, schema_version: int = 0,
+        submitted_by_tool_call_id: str = "", origin_session_id: str | None = None,
     ) -> PlanRevisionEntry:
         entry = PlanRevisionEntry(
             id=self._next_entry_id(), parent_id=self._parent_for_new_entry(),
             timestamp=iso_now(), plan_id=plan_id, revision=revision,
             title=title, markdown=markdown, digest=digest,
-            source_message_id=source_message_id,
+            source_message_id=source_message_id, schema_version=schema_version,
+            submitted_by_tool_call_id=submitted_by_tool_call_id,
+            origin_session_id=origin_session_id,
         )
         self._commit_v4(entry)
         return entry
@@ -371,13 +387,18 @@ class SessionManager:
     def append_plan_run(
         self, *, plan_id: str, revision: int, digest: str, status: str,
         run_id: str | None = None, error: str | None = None,
+        assistant_message_id: str | None = None, stop_reason: str | None = None,
     ) -> PlanRunEntry:
         if status not in {"started", "completed", "failed", "aborted"}:
             raise ValueError(f"Invalid plan run status: {status!r}")
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError("run_id is required for new plan_run entries")
         entry = PlanRunEntry(
             id=self._next_entry_id(), parent_id=self._parent_for_new_entry(),
             timestamp=iso_now(), plan_id=plan_id, revision=revision,
-            digest=digest, status=status, run_id=run_id, error=error,  # type: ignore[arg-type]
+            digest=digest, status=status, run_id=run_id, error=error,
+            assistant_message_id=assistant_message_id,
+            stop_reason=stop_reason,  # type: ignore[arg-type]
         )
         self._commit_v4(entry)
         return entry
@@ -386,29 +407,32 @@ class SessionManager:
 
     def _commit(self, entry: SessionEntry) -> None:
         """Add to memory and persist. Handles flush-on-first-assistant."""
+        previous_leaf = self.leaf_id
         self.entries.append(entry)
         self.leaf_id = entry.id
-        if self.in_memory or self.path is None:
-            return
-        # Flush-on-first-assistant: only materialize the file once an assistant
-        # message lands. Until then buffer everything in memory.
-        is_first_assistant = (
-            isinstance(entry, SessionMessageEntry)
-            and entry.message is not None
-            and getattr(entry.message, "role", None) == "assistant"
-        )
-        if not self._flushed:
-            if not is_first_assistant:
-                # Buffer; nothing on disk yet.
+        try:
+            if self.in_memory or self.path is None:
                 return
-            # First assistant message: create the file with header + all buffered entries.
-            write_header_line(self.path, self.header)
-            self._flushed = True
-            # Flush the buffer (everything except this just-added entry, which
-            # we append below).
-            for buffered in self.entries[:-1]:
-                append_entry_line(self.path, buffered)
-        append_entry_line(self.path, entry)
+            # Flush-on-first-assistant: only materialize the file once an assistant
+            # message lands. Until then buffer everything in memory.
+            is_first_assistant = (
+                isinstance(entry, SessionMessageEntry)
+                and entry.message is not None
+                and getattr(entry.message, "role", None) == "assistant"
+            )
+            if not self._flushed:
+                if not is_first_assistant:
+                    # Buffer; nothing on disk yet.
+                    return
+            self._persist_buffer()
+        except BaseException:
+            # A failed append must not advance the live reducer branch.  The
+            # partially written disk line, if any, is detected as corruption
+            # when the session is reopened.
+            if self.entries and self.entries[-1] is entry:
+                self.entries.pop()
+            self.leaf_id = previous_leaf
+            raise
 
     def _commit_v4(self, entry: SessionEntry) -> None:
         """Commit a v4-only entry, upgrading an existing legacy header first."""
@@ -425,18 +449,29 @@ class SessionManager:
             for entry in self.entries
         )
 
-    def flush(self) -> None:
-        """Force-create the file even if no assistant message has landed yet.
-
-        Useful for /save before any assistant reply. No-op if already flushed
-        or in-memory.
-        """
-        if self.in_memory or self.path is None or self._flushed:
+    def _persist_buffer(self) -> None:
+        """Resume a partially flushed buffer without losing or duplicating entries."""
+        if self.path is None:
             return
-        write_header_line(self.path, self.header)
-        self._flushed = True
-        for buffered in self.entries:
-            append_entry_line(self.path, buffered)
+        if not self._flushed:
+            write_header_line(self.path, self.header)
+            self._flushed = True
+        while self._persisted_count < len(self.entries):
+            append_entry_line(self.path, self.entries[self._persisted_count])
+            self._persisted_count += 1
+
+    def flush(self) -> None:
+        """Force-create and durably flush the current JSONL file.
+
+        Useful for Plan authorization boundaries and /save. In-memory sessions
+        remain a no-op.
+        """
+        if self.in_memory or self.path is None:
+            return
+        self._persist_buffer()
+        with open(self.path, "a", encoding="utf-8") as stream:
+            stream.flush()
+            os.fsync(stream.fileno())
 
     # ─── queries ───────────────────────────────────────────────────────
 

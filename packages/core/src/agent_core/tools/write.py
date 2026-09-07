@@ -15,7 +15,7 @@ from typing import Any
 from agent_llm import TextContent
 
 from agent_core.tools._mutation import file_mutation_lock
-from agent_core.types import AgentToolResult
+from agent_core.types import AgentToolResult, PlanAccess
 
 
 WRITE_SCHEMA: dict = {
@@ -46,6 +46,7 @@ class WriteTool:
 
     name: str = "write"
     effect: str = "write"
+    plan_access: PlanAccess = "deny"
     label: str = "write"
     description: str = (
         "Write content to a file. Creates the file if it doesn't exist, "

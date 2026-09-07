@@ -312,6 +312,33 @@ def test_default_search_backend_uses_dedicated_credential_resolver() -> None:
     session.dispose()
 
 
+@pytest.mark.parametrize("phase", ["drafting", "ready", "uncertain", "recovery_error", "memory"])
+def test_native_search_cannot_bypass_plan_or_background_context_tool_policy(monkeypatch, phase) -> None:
+    from coding_agent.core.plan_mode import PlanState
+    model = Model(id="deepseek-v4-flash", api="openai-responses", provider="deepseek",
+                  context_window=16_000, cost=ModelCost(input=0, output=0, cache_read=0, cache_write=0))
+    session = AgentSession(AgentSessionConfig(
+        model=model, web_search_enabled=True, web_search_backend=_FakeBackend(),
+    ))
+    captured = {}
+    def fake_stream(_model, context, options):
+        captured.update(context=context, options=options)
+        return object()
+    monkeypatch.setattr("agent_llm.compat.stream_simple", fake_stream)
+    monkeypatch.setattr("coding_agent.core.agent_session.retrying_stream", lambda factory, *_a, **_kw: factory())
+    if phase != "memory":
+        session._plan_state = PlanState(mode="default" if phase == "uncertain" else "plan", phase=phase)
+        session._refresh_collaboration_runtime()
+        assert "web_search" not in {tool.name for tool in session.tools}
+        assert session.native_web_search_enabled is False
+    # Even a stale context advertising the tool cannot escape Plan restrictions.
+    context = Context(tools=None if phase == "memory" else [Tool(name="web_search")])
+    session._create_stream_fn()(model, context, {"web_search": True})
+    assert not (captured["options"] or {}).get("web_search")
+    assert "<native_web_search>" not in (captured["context"].system_prompt or "")
+    session.dispose()
+
+
 def test_desktop_web_search_status_and_toggle(monkeypatch, tmp_path) -> None:
     backend = _FakeBackend()
     manager = SettingsManager(tmp_path / "settings.json")

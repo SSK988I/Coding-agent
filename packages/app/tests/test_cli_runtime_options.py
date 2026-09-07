@@ -14,6 +14,7 @@ from coding_agent.cli.main import (
     _configure_output_encoding,
     _create_session_manager,
     _load_context_for_run,
+    _run_plan_control,
 )
 from coding_agent.core.agent_session import AgentSession, AgentSessionConfig
 
@@ -41,6 +42,59 @@ def test_plan_controls_are_mutually_exclusive():
     assert exc.value.code == 2
 
 
+def test_handoff_plan_accepts_latest_or_an_explicit_revision():
+    assert parse_args(["--handoff-plan"]).handoff_plan == 0
+    assert parse_args(["--handoff-plan", "3"]).handoff_plan == 3
+
+
+def test_handoff_plan_rejects_non_positive_revision():
+    with pytest.raises(SystemExit) as exc:
+        parse_args(["--handoff-plan", "0"])
+    assert exc.value.code == 2
+
+
+def test_execute_plan_rejects_non_positive_revision():
+    with pytest.raises(SystemExit) as exc:
+        parse_args(["--execute-plan", "0"])
+    assert exc.value.code == 2
+
+
+def test_handoff_plan_is_mutually_exclusive_with_execution():
+    with pytest.raises(SystemExit) as exc:
+        parse_args(["--handoff-plan", "--execute-plan", "1"])
+    assert exc.value.code == 2
+
+
+def test_handoff_plan_control_uses_latest_revision_and_attaches(capsys):
+    latest = SimpleNamespace(plan_id="plan-1", revision=4, digest="digest-4")
+    target = SimpleNamespace(header=SimpleNamespace(id="session-child"))
+    calls: list[tuple[str, int, str]] = []
+
+    class _Session:
+        plan_state = SimpleNamespace(
+            mode="plan", phase="ready", pending_question=None, latest_revision=latest,
+        )
+        session_manager = target
+
+        def on_event(self, _callback):
+            return lambda: None
+
+        def handoff_plan_to_new_session(self, plan_id, revision, digest):
+            calls.append((plan_id, revision, digest))
+            return target
+
+        def dispose(self):
+            pass
+
+    result = _run_plan_control(
+        _Session(), Args(handoff_plan=0), answer=None, mode="text",  # type: ignore[arg-type]
+    )
+
+    assert result == 0
+    assert calls == [("plan-1", 4, "digest-4")]
+    assert "session-child" in capsys.readouterr().err
+
+
 def test_agent_mode_is_distinct_from_output_mode():
     args = parse_args(["--mode", "json", "--agent-mode", "plan"])
     assert args.output_mode == "json"
@@ -51,6 +105,7 @@ def test_plan_control_forces_non_interactive_mode(monkeypatch):
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
     assert resolve_app_mode(Args(cancel_plan=True)) == "print"
+    assert resolve_app_mode(Args(handoff_plan=0)) == "print"
 
 
 def test_project_trust_flags_are_mutually_exclusive():

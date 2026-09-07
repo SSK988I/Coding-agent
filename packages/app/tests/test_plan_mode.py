@@ -18,6 +18,8 @@ from coding_agent.core.plan_mode import (
     PlanModeError,
     PlanQuestion,
     PlanQuestionOption,
+    compute_plan_digest,
+    create_plan_revision,
     is_plan_safe_shell_command,
     reduce_plan_state,
     validate_proposed_plan,
@@ -29,6 +31,25 @@ def _model() -> Model:
         id="plan-test", provider="test", context_window=64_000,
         cost=ModelCost(input=0, output=0, cache_read=0, cache_write=0),
     )
+
+
+def _plan_markdown(title: str = "Plan") -> str:
+    return f"""# {title}
+
+## Summary
+Summary.
+
+## Implementation Changes
+Changes.
+
+## Public Interfaces
+Interfaces.
+
+## Test Plan
+Tests.
+
+## Assumptions
+None."""
 
 
 def _plan_text(title: str = "Plan") -> str:
@@ -50,6 +71,27 @@ Tests.
 ## Assumptions
 None.
 </proposed_plan>"""
+
+
+def _submit_plan(
+    session: AgentSession,
+    *,
+    title: str = "Plan",
+    markdown: str | None = None,
+    call_id: str = "submit-1",
+):
+    markdown = markdown if markdown is not None else _plan_markdown(title)
+    params = {"title": title, "markdown": markdown}
+    call = ToolCall(id=call_id, name="submit_plan", arguments=params)
+    session.session_manager.append_message(AssistantMessage(
+        content=[call],
+        stop_reason="tool_use",
+    ))
+    tool = next(item for item in session.tools if item.name == "submit_plan")
+    result = asyncio.run(tool.execute(call_id, params))
+    assert result.terminate is True
+    assert session.plan_state.latest_revision is not None
+    return session.plan_state.latest_revision
 
 
 def _bare_bilingual_plan_text() -> str:
@@ -78,7 +120,7 @@ def _bare_bilingual_plan_text() -> str:
 需要我按这个计划开始实现吗？"""
 
 
-def test_plan_spec_is_strict_and_digest_is_stable() -> None:
+def test_plan_spec_is_exact_and_digest_v1_binds_all_authorization_fields() -> None:
     revision = validate_proposed_plan(
         _plan_text().replace("\n", "\r\n"),
         plan_id="p", revision=1, source_message_id="m",
@@ -87,10 +129,25 @@ def test_plan_spec_is_strict_and_digest_is_stable() -> None:
     assert len(revision.digest) == 64
     assert "\r" not in revision.markdown
 
-    with pytest.raises(PlanModeError, match="块外"):
+    assert revision.digest != compute_plan_digest(
+        plan_id="p", revision=1, title="Other", markdown=revision.markdown,
+    )
+    assert revision.digest != compute_plan_digest(
+        plan_id="p", revision=2, title=revision.title,
+        markdown=revision.markdown,
+    )
+
+    with pytest.raises(PlanModeError, match="proposed_plan"):
         validate_proposed_plan(
             "prefix\n" + _plan_text(), plan_id="p", revision=2,
             source_message_id="m2",
+        )
+
+    with pytest.raises(PlanModeError, match="控制字符"):
+        create_plan_revision(
+            plan_id="p", revision=2, title="Plan",
+            markdown="line one\x00line two", source_message_id="m2",
+            submitted_by_tool_call_id="submit-2",
         )
 
 
@@ -119,23 +176,28 @@ A
     assert revision.title == "双语计划"
 
 
-@pytest.mark.parametrize(
-    ("command", "allowed"),
-    [
-        ("git status --short", True),
-        ("git log --oneline -20 --no-merges 2>&1 | head -30", True),
-        ("rg --files packages/app | head -20", True),
-        ("uv run pytest -q", True),
-        ("pnpm typecheck", True),
-        ("git checkout -- file.py", False),
-        ("python scripts/mutate.py", False),
-        ("cat file > copy", False),
-        ("cat missing.txt 2> errors.txt", False),
-        ("rg token ../private", False),
-    ],
-)
-def test_plan_shell_policy(command: str, allowed: bool, tmp_path: Path) -> None:
-    assert is_plan_safe_shell_command(command, str(tmp_path)) is allowed
+@pytest.mark.parametrize("command", [
+    "git status --short",
+    "git log --oneline -20 --no-merges 2>&1 | head -30",
+    "rg --files packages/app | head -20",
+    "uv run pytest -q",
+    "pnpm typecheck",
+    "git remote remove origin",
+    "git tag -d release",
+    "git diff --raw",
+    "git show --patch HEAD",
+    "git log -p",
+    "find . -fprint output.txt",
+    "sort input -o output",
+    "tail -f app.log",
+    "ruff check --fix .",
+    "python -m build",
+    "echo ok & touch sentinel",
+    "cat file > copy",
+    "cat missing.txt 2> errors.txt",
+])
+def test_plan_shell_policy_denies_every_command(command: str, tmp_path: Path) -> None:
+    assert is_plan_safe_shell_command(command, str(tmp_path)) is False
 
 
 def test_mode_only_session_is_not_materialized(tmp_path: Path) -> None:
@@ -170,61 +232,63 @@ def test_agent_session_switches_prompt_tools_and_captures_revision(tmp_path: Pat
 
     session.enter_plan_mode()
     assert session.collaboration_mode == "plan"
-    assert session.tools[-1].name == "request_user_input"
+    plan_tools = {tool.name for tool in session.tools}
+    assert {"read", "grep", "find", "ls", "git_status", "git_log",
+            "git_diff", "git_show", "request_user_input", "submit_plan"} <= plan_tools
+    assert {"bash", "write", "edit"}.isdisjoint(plan_tools)
     assert "<collaboration_mode_policy mode=\"plan\">" in session.state.system_prompt
 
-    session._capture_plan_revision(AssistantMessage(content=[TextContent(text=_plan_text())]))
-    latest = session.plan_state.latest_revision
-    assert latest is not None
+    latest = _submit_plan(session)
     assert session.plan_state.phase == "ready"
+    assert session.tools == []
+    assert latest.schema_version == 1
 
     with pytest.raises(PlanModeError) as stale:
         asyncio.run(session.execute_plan(latest.plan_id, latest.revision, "bad"))
     assert stale.value.code == "STALE_PLAN_REVISION"
 
 
-def test_bare_complete_plan_is_normalized_into_ready_revision(tmp_path: Path) -> None:
+def test_plain_assistant_plan_text_cannot_create_a_revision(tmp_path: Path) -> None:
     session = AgentSession(AgentSessionConfig(model=_model(), cwd=str(tmp_path)))
     session.enter_plan_mode()
-    events: list[dict] = []
-    session.on_event(events.append)
-
-    session._capture_plan_revision(
+    session.session_manager.append_message(
         AssistantMessage(content=[TextContent(text=_bare_bilingual_plan_text())]),
     )
+    session.refresh_plan_state_from_branch()
 
-    latest = session.plan_state.latest_revision
-    assert latest is not None
-    assert latest.title == "运行时性能优化计划"
-    assert "## Implementation Changes / 实现变更" in latest.markdown
-    assert session.plan_state.phase == "ready"
-    assert any(event.get("type") == "plan_ready" for event in events)
+    assert session.plan_state.latest_revision is None
+    assert session.plan_state.phase == "drafting"
+    assert session.plan_state.legacy_candidate is False
 
 
 def test_incomplete_markdown_discussion_does_not_become_ready(tmp_path: Path) -> None:
     session = AgentSession(AgentSessionConfig(model=_model(), cwd=str(tmp_path)))
     session.enter_plan_mode()
 
-    session._capture_plan_revision(AssistantMessage(content=[TextContent(text="# 一个想法\n\n还需要继续讨论。")]))
+    session.session_manager.append_message(
+        AssistantMessage(content=[TextContent(text="# 一个想法\n\n还需要继续讨论。")]),
+    )
+    session.refresh_plan_state_from_branch()
 
     assert session.plan_state.phase == "drafting"
     assert session.plan_state.latest_revision is None
 
 
-def test_resume_recovers_latest_complete_bare_plan(tmp_path: Path) -> None:
+def test_resume_marks_legacy_envelope_as_candidate_without_importing_it(tmp_path: Path) -> None:
     manager = SessionManager.create(cwd=str(tmp_path), in_memory=True)
     manager.append_collaboration_mode_change("plan", plan_id="plan-resume")
     manager.append_message(
-        AssistantMessage(content=[TextContent(text=_bare_bilingual_plan_text())]),
+        AssistantMessage(content=[TextContent(text=_plan_text())]),
     )
 
     session = AgentSession(AgentSessionConfig(
         model=_model(), cwd=str(tmp_path), session_manager=manager,
     ))
 
-    assert session.plan_state.phase == "ready"
-    assert session.plan_state.latest_revision is not None
-    assert any(isinstance(entry, PlanRevisionEntry) for entry in manager.entries)
+    assert session.plan_state.phase == "drafting"
+    assert session.plan_state.latest_revision is None
+    assert session.plan_state.legacy_candidate is True
+    assert not any(isinstance(entry, PlanRevisionEntry) for entry in manager.entries)
 
 
 def test_resume_does_not_revive_bare_plan_after_user_feedback(tmp_path: Path) -> None:
@@ -241,17 +305,19 @@ def test_resume_does_not_revive_bare_plan_after_user_feedback(tmp_path: Path) ->
 
     assert session.plan_state.phase == "drafting"
     assert session.plan_state.latest_revision is None
+    assert session.plan_state.legacy_candidate is False
 
 
 def test_user_feedback_after_ready_revision_returns_to_drafting(tmp_path: Path) -> None:
     session = AgentSession(AgentSessionConfig(model=_model(), cwd=str(tmp_path)))
     session.enter_plan_mode()
-    session._capture_plan_revision(AssistantMessage(content=[TextContent(text=_plan_text())]))
-    latest = session.plan_state.latest_revision
-    assert latest is not None
+    latest = _submit_plan(session)
+    tool_names_after_feedback: set[str] = set()
 
     async def fake_agent_prompt(message: str) -> None:
         session.session_manager.append_message(UserMessage(content=message))
+        session.refresh_plan_state_from_branch()
+        tool_names_after_feedback.update(tool.name for tool in session.tools)
 
     async def no_compaction() -> SimpleNamespace:
         return SimpleNamespace(need_retry=False)
@@ -263,6 +329,8 @@ def test_user_feedback_after_ready_revision_returns_to_drafting(tmp_path: Path) 
 
     assert session.plan_state.phase == "drafting"
     assert session.plan_state.latest_revision == latest
+    assert "submit_plan" in tool_names_after_feedback
+    assert "bash" not in tool_names_after_feedback
     restored = reduce_plan_state(session.session_manager.get_branch())
     assert restored.phase == "drafting"
     assert restored.latest_revision == latest
@@ -320,11 +388,9 @@ def test_deferred_question_reduces_and_resumes_same_episode(tmp_path: Path) -> N
 def test_exact_revision_execution_records_started_and_completed(tmp_path: Path) -> None:
     session = AgentSession(AgentSessionConfig(model=_model(), cwd=str(tmp_path)))
     session.enter_plan_mode()
-    session._capture_plan_revision(AssistantMessage(content=[TextContent(text=_plan_text())]))
-    latest = session.plan_state.latest_revision
-    assert latest is not None
+    latest = _submit_plan(session)
 
-    async def fake_prompt(_message) -> None:
+    async def fake_prompt(_message, **_kwargs) -> None:
         session._last_assistant_message = AssistantMessage(content=[TextContent(text="done")])
 
     session.prompt = fake_prompt  # type: ignore[method-assign]
@@ -333,4 +399,4 @@ def test_exact_revision_execution_records_started_and_completed(tmp_path: Path) 
     runs = [entry for entry in session.session_manager.entries if isinstance(entry, PlanRunEntry)]
     assert [entry.status for entry in runs] == ["started", "completed"]
     assert session.collaboration_mode == "default"
-    assert session.plan_state.phase == "completed"
+    assert session.plan_state.phase == "settled"

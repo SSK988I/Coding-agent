@@ -72,23 +72,24 @@ describe("desktop Plan Mode", () => {
     renderApp();
     await screen.findByTestId("plan-card");
     const decision = await screen.findByTestId("plan-decision");
-    expect(decision).toHaveTextContent("计划已完成，下一步怎么做？");
+    expect(decision).toHaveTextContent("计划已提交，下一步怎么做？");
     fireEvent.click(screen.getByRole("button", { name: /执行方案/ }));
     await waitFor(() => expect(requests).toHaveBeenCalledWith("plan.execute", {
       planId: "plan-1", revision: 2, digest: "abcdef0123456789",
     }));
+    await waitFor(() => expect(requests).toHaveBeenCalledWith("session.snapshot"));
   });
 
   it("lets the user supplement the ready plan from the composer", async () => {
     renderApp();
     await screen.findByTestId("plan-decision");
-    fireEvent.click(screen.getByRole("button", { name: /补充想法/ }));
+    fireEvent.click(screen.getByRole("button", { name: /继续修改/ }));
     const composer = screen.getByPlaceholderText("补充你的想法或修改要求…");
     await waitFor(() => expect(composer).toHaveFocus());
     expect(requests).not.toHaveBeenCalledWith("plan.execute", expect.anything());
   });
 
-  it("shows the decision selector when a live plan_ready event arrives", async () => {
+  it("uses a complete plan state snapshot from the live state event", async () => {
     requests.mockImplementation(async (method: string) => {
       if (method === "workspace.open") return workspace({
         planState: {
@@ -106,11 +107,138 @@ describe("desktop Plan Mode", () => {
 
     eventListener?.({
       v: 1, type: "event", seq: 1, timestamp: Date.now(), sessionId: "session-1", runId: "run-1",
-      event: { type: "plan_ready", payload: { plan: latestPlan } },
+      event: {
+        type: "plan.stateChanged",
+        payload: {
+          sessionId: "session-1",
+          state: {
+            mode: "plan",
+            phase: "ready",
+            activePlanId: "plan-1",
+            latestRevision: latestPlan,
+            pendingQuestion: null,
+            latestRun: null,
+            recoveryError: null,
+            handoffTargetSessionId: null,
+          },
+        },
+      },
     });
 
     expect(await screen.findByTestId("plan-decision")).toHaveTextContent("执行方案");
-    expect(screen.getByTestId("plan-decision")).toHaveTextContent("补充想法");
+    expect(screen.getByTestId("plan-decision")).toHaveTextContent("继续修改");
+  });
+
+  it("ignores a delayed plan snapshot from another session", async () => {
+    render(<App />);
+    await screen.findByTestId("plan-decision");
+
+    eventListener?.({
+      v: 1, type: "event", seq: 2, timestamp: Date.now(), sessionId: "session-old", runId: null,
+      event: {
+        type: "plan.stateChanged",
+        payload: {
+          sessionId: "session-old",
+          state: {
+            mode: "default",
+            phase: "uncertain",
+            activePlanId: "plan-old",
+            latestRevision: null,
+            pendingQuestion: null,
+          },
+        },
+      },
+    });
+
+    await waitFor(() => expect(screen.getByTestId("plan-decision")).toHaveTextContent("执行方案"));
+    expect(screen.queryByText("执行状态不确定")).not.toBeInTheDocument();
+  });
+
+  it("keeps the authoritative ready state and rehydrates it when execute RPC fails", async () => {
+    let rejectExecute: ((reason: Error) => void) | undefined;
+    const executeResult = new Promise((_, reject) => {
+      rejectExecute = reject;
+    });
+    requests.mockImplementation(async (method: string) => {
+      if (method === "workspace.open") return workspace();
+      if (method === "session.list" || method === "command.list") return [];
+      if (method === "plan.execute") return executeResult;
+      if (method === "session.snapshot") return {
+        sessionId: "session-1",
+        messages: [],
+        stats: {},
+        collaborationMode: "plan",
+        planState: workspace().planState,
+      };
+      return {};
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /执行方案/ }));
+
+    expect(screen.getByTestId("plan-decision")).toHaveTextContent("正在确认…");
+    expect(screen.getByTestId("plan-card")).toHaveTextContent("PLAN READY");
+    rejectExecute?.(new Error("revision rejected"));
+    await waitFor(() => expect(requests).toHaveBeenCalledWith("session.snapshot"));
+    expect(await screen.findByText("revision rejected")).toBeInTheDocument();
+    expect(screen.getByTestId("plan-decision")).toHaveTextContent("执行方案");
+    expect(screen.getByTestId("plan-card")).toHaveTextContent("Plan title");
+  });
+
+  it("hands the exact ready revision to a fresh review session", async () => {
+    const childPlan = { ...latestPlan, title: "Fresh review" };
+    requests.mockImplementation(async (method: string) => {
+      if (method === "workspace.open") return workspace();
+      if (method === "session.list" || method === "command.list") return [];
+      if (method === "plan.handoff") return workspace({
+        sessionId: "session-2",
+        planState: {
+          mode: "plan",
+          phase: "ready",
+          activePlanId: "plan-1",
+          latestRevision: childPlan,
+          pendingQuestion: null,
+        },
+      });
+      return {};
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /新会话复核/ }));
+
+    await waitFor(() => expect(requests).toHaveBeenCalledWith("plan.handoff", {
+      planId: "plan-1", revision: 2, digest: "abcdef0123456789",
+    }));
+    expect(await screen.findByTestId("plan-card")).toHaveTextContent("Fresh review");
+    expect(screen.getByTestId("plan-decision")).toHaveTextContent("新会话复核");
+  });
+
+  it.each([
+    ["uncertain", "执行状态不确定"],
+    ["recovery_error", "计划恢复失败"],
+  ] as const)("shows a clear %s recovery state", async (phase, heading) => {
+    requests.mockImplementation(async (method: string) => {
+      if (method === "workspace.open") return workspace({
+        collaborationMode: phase === "recovery_error" ? "plan" : "default",
+        planState: {
+          mode: phase === "recovery_error" ? "plan" : "default",
+          phase,
+          activePlanId: "plan-1",
+          latestRevision: latestPlan,
+          pendingQuestion: null,
+          recoveryError: phase === "recovery_error"
+            ? { code: "PLAN_DIGEST_MISMATCH", message: "digest mismatch", entryId: "entry-1" }
+            : null,
+        },
+      });
+      if (method === "session.list" || method === "command.list") return [];
+      return {};
+    });
+
+    render(<App />);
+
+    expect(await screen.findByTestId("plan-status")).toHaveTextContent(heading);
+    expect(await screen.findByTestId("plan-card")).toHaveTextContent("Plan title");
   });
 
   it("renders a structured question and submits the selected answer", async () => {
@@ -138,6 +266,71 @@ describe("desktop Plan Mode", () => {
     await waitFor(() => expect(requests).toHaveBeenCalledWith("plan.answer", {
       questionId: "question-1", answer: "核心",
     }));
+  });
+
+  it.each(["uncertain", "recovery_error"] as const)("can explicitly replan from %s", async (phase) => {
+    requests.mockImplementation(async (method: string) => {
+      if (method === "workspace.open") return workspace({
+        collaborationMode: phase === "uncertain" ? "default" : "plan",
+        planState: { phase, activePlanId: null, latestRevision: null, pendingQuestion: null },
+      });
+      if (method === "mode.enterPlan") return workspace({
+        planState: { phase: "drafting", activePlanId: "new-plan", latestRevision: null, pendingQuestion: null },
+      });
+      if (method === "session.list" || method === "command.list") return [];
+      return {};
+    });
+    render(<App />);
+    await screen.findByTestId("plan-status");
+    expect(screen.getByRole("textbox")).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "重新规划" }));
+    await waitFor(() => expect(requests).toHaveBeenCalledWith("mode.enterPlan"));
+    await waitFor(() => expect(screen.queryByTestId("plan-status")).not.toBeInTheDocument());
+    expect(requests).not.toHaveBeenCalledWith("plan.execute", expect.anything());
+  });
+
+  it("can cancel corrupt state without a recoverable plan ID", async () => {
+    requests.mockImplementation(async (method: string) => {
+      if (method === "workspace.open") return workspace({
+        planState: { phase: "recovery_error", activePlanId: null, latestRevision: null, pendingQuestion: null },
+      });
+      if (method === "plan.cancel") return workspace({
+        collaborationMode: "default",
+        planState: { phase: "cancelled", activePlanId: null, latestRevision: null, pendingQuestion: null },
+      });
+      if (method === "session.list" || method === "command.list") return [];
+      return {};
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "取消规划" }));
+    await waitFor(() => expect(requests).toHaveBeenCalledWith("plan.cancel", { planId: null }));
+    await waitFor(() => expect(screen.queryByTestId("plan-status")).not.toBeInTheDocument());
+  });
+
+  it("identifies legacy prose as a candidate that cannot execute", async () => {
+    requests.mockImplementation(async (method: string) => {
+      if (method === "workspace.open") return workspace({
+        planState: { phase: "drafting", activePlanId: "old", latestRevision: null,
+          pendingQuestion: null, legacyCandidate: true },
+      });
+      if (method === "session.list" || method === "command.list") return [];
+      return {};
+    });
+    render(<App />);
+    expect(await screen.findByTestId("plan-legacy")).toHaveTextContent("submit_plan");
+    expect(screen.queryByTestId("plan-decision")).not.toBeInTheDocument();
+  });
+
+  it("ignores granular Plan state events even before a live full snapshot", async () => {
+    render(<App />);
+    await screen.findByTestId("plan-decision");
+    await screen.findByTestId("plan-card");
+    eventListener?.({
+      v: 1, type: "event", seq: 1, timestamp: Date.now(), sessionId: "session-1", runId: "old-run",
+      event: { type: "plan_execution_started", payload: {} },
+    });
+    expect(screen.getByTestId("plan-decision")).toHaveTextContent("执行方案");
+    expect(screen.getByTestId("plan-card")).toHaveTextContent("PLAN READY");
   });
 
   it("disables Plan actions while a run is active", async () => {

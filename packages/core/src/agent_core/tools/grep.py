@@ -19,7 +19,7 @@ from typing import Any
 
 from agent_llm import TextContent
 
-from agent_core.types import AgentToolResult
+from agent_core.types import AgentToolResult, PlanAccess
 from agent_core.tools._subprocess import (
     find_in_path,
     head_truncate_bytes,
@@ -79,6 +79,7 @@ class GrepTool:
 
     name: str = "grep"
     effect: str = "read"
+    plan_access: PlanAccess = "observe"
     label: str = "grep"
     description: str = (
         f"Search file contents for a pattern. Returns matching lines with file "
@@ -92,9 +93,18 @@ class GrepTool:
         "Use grep to find code, definitions, or usages instead of reading files blindly.",
     ]
 
-    def __init__(self, cwd: str = ".", *, limit: int = DEFAULT_LIMIT) -> None:
+    def __init__(
+        self,
+        cwd: str = ".",
+        *,
+        limit: int = DEFAULT_LIMIT,
+        prefer_external: bool = True,
+    ) -> None:
         self.cwd = cwd
         self.limit = limit
+        # Plan mode sets this to False so repository-controlled PATH entries
+        # can never turn a read-only search into external code execution.
+        self.prefer_external = prefer_external
 
     async def execute(
         self,
@@ -116,7 +126,7 @@ class GrepTool:
             raise FileNotFoundError(f"Path not found: {path}")
 
         # Prefer ripgrep; fall back to pure Python.
-        rg = find_in_path("rg")
+        rg = find_in_path("rg") if self.prefer_external else None
         if rg:
             try:
                 text = await self._run_with_rg(
@@ -149,7 +159,16 @@ class GrepTool:
         literal: bool,
         limit: int,
     ) -> str:
-        args = [rg, "--json", "--line-number", "--color=never", "--hidden"]
+        args = [
+            rg,
+            "--json",
+            "--line-number",
+            "--color=never",
+            "--hidden",
+            # Respect .gitignore files even when the searched directory is not
+            # itself inside a Git worktree (for example, temporary test dirs).
+            "--no-require-git",
+        ]
         if ignore_case:
             args.append("--ignore-case")
         if literal:

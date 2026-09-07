@@ -284,6 +284,7 @@ class Agent:
             # (after the inner loop stops) messages.
             get_steering_messages=self._steering_queue.drain,
             get_follow_up_messages=self._follow_up_queue.drain,
+            refresh_context=self._create_context_snapshot,
         )
 
     async def _run_with_lifecycle(self, executor: Callable[[asyncio.Event], Awaitable[None]]) -> None:

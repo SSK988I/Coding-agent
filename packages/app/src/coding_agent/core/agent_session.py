@@ -20,6 +20,7 @@ import asyncio
 import contextlib
 import sys
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal, cast
@@ -40,6 +41,10 @@ from agent_core import (
     CompactionOrchestrator,
     EditTool,
     FindTool,
+    GitDiffTool,
+    GitLogTool,
+    GitShowTool,
+    GitStatusTool,
     GrepTool,
     LsTool,
     ReadTool,
@@ -58,13 +63,12 @@ from coding_agent.core.plan_mode import (
     PlanState,
     QuestionBehavior,
     RequestUserInputTool,
+    SubmitPlanTool,
     call_hook,
+    create_plan_revision,
     enforce_plan_tool_policy,
-    is_plan_safe_shell_command,
     new_plan_id,
-    prepare_plan_reply,
     reduce_plan_state,
-    validate_proposed_plan,
 )
 
 # ─── Session event types (extending AgentEvent) ──────────────────────────
@@ -173,7 +177,7 @@ class _TokenStats:
 # ─── Built-in tool factory ────────────────────────────────────────────────
 
 def _create_default_tools(cwd: str, shell_kind: str = "bash", platform: str = "") -> list[AgentTool]:
-    """Create the standard 7 built-in tools.
+    """Create the standard development and structured-observation tools.
 
     Returns ``AgentTool`` instances directly without additional wrappers.
     """
@@ -186,7 +190,28 @@ def _create_default_tools(cwd: str, shell_kind: str = "bash", platform: str = ""
         GrepTool(cwd=cwd),
         FindTool(cwd=cwd),
         LsTool(cwd=cwd),
+        GitStatusTool(cwd=cwd),
+        GitLogTool(cwd=cwd),
+        GitDiffTool(cwd=cwd),
+        GitShowTool(cwd=cwd),
     ])
+
+
+def _create_plan_observation_tools(
+    tools: list[AgentTool], *, cwd: str,
+) -> list[AgentTool]:
+    """Build the fail-closed Plan view of an already-filtered tool registry."""
+    result: list[AgentTool] = []
+    for tool in tools:
+        if getattr(tool, "plan_access", "deny") != "observe":
+            continue
+        if getattr(tool, "name", "") == "grep":
+            result.append(cast(AgentTool, GrepTool(cwd=cwd, prefer_external=False)))
+        elif getattr(tool, "name", "") == "find":
+            result.append(cast(AgentTool, FindTool(cwd=cwd, prefer_external=False)))
+        else:
+            result.append(tool)
+    return result
 
 
 def _filter_tools(
@@ -271,6 +296,9 @@ class AgentSession:
             config.excluded_tool_names,
             config.no_tools,
         )
+        self._plan_observation_tools = _create_plan_observation_tools(
+            self._development_tools, cwd=config.cwd,
+        )
         self._bash_tool = cast(
             BashTool | None,
             next((tool for tool in self._development_tools if tool.name == "bash"), None),
@@ -293,7 +321,12 @@ class AgentSession:
         self._background_tasks: set = set()
 
         # ── Plan state + effective tools ─────────────────────────────────
-        self._plan_state = reduce_plan_state(self.session_manager.get_branch())
+        self._active_plan_run_id: str | None = None
+        self._plan_state = reduce_plan_state(
+            self.session_manager.get_branch(),
+            parent_session_id=self.session_manager.header.parent_session,
+            load_issues=self.session_manager.load_issues,
+        )
         self._question_behavior = config.question_behavior
         self._question_future: asyncio.Future[str] | None = None
         self._question_signal_task: asyncio.Task | None = None
@@ -302,11 +335,14 @@ class AgentSession:
             self._request_plan_question,
             deferred=config.question_behavior == "deferred",
         )
+        self._submit_plan_tool = SubmitPlanTool(self._submit_plan)
         if self._plan_state.phase == "idle" and config.collaboration_mode == "plan":
             plan_id = new_plan_id()
             self.session_manager.append_collaboration_mode_change("plan", plan_id=plan_id)
-            self._plan_state = PlanState(
-                mode="plan", phase="drafting", active_plan_id=plan_id,
+            self._plan_state = reduce_plan_state(
+                self.session_manager.get_branch(),
+                parent_session_id=self.session_manager.header.parent_session,
+                load_issues=self.session_manager.load_issues,
             )
         self._tools = self._effective_tools()
 
@@ -444,10 +480,17 @@ class AgentSession:
     # ── Collaboration mode ───────────────────────────────────────────────
 
     def _effective_tools(self) -> list[AgentTool]:
-        tools = list(self._development_tools)
-        if self._plan_state.mode == "plan":
-            tools.append(cast(AgentTool, self._control_tool))
-        return tools
+        if self._plan_state.phase in {"uncertain", "recovery_error"}:
+            return []
+        if self._plan_state.mode != "plan":
+            return list(self._development_tools)
+        if self._plan_state.phase != "drafting":
+            return []
+        return [
+            *self._plan_observation_tools,
+            cast(AgentTool, self._control_tool),
+            cast(AgentTool, self._submit_plan_tool),
+        ]
 
     @property
     def web_search_enabled(self) -> bool:
@@ -456,7 +499,12 @@ class AgentSession:
     @property
     def native_web_search_enabled(self) -> bool:
         """Whether this session will use the model provider's built-in search."""
-        return self.web_search_enabled and self._model.provider == "deepseek"
+        return (
+            self.web_search_enabled
+            and self._model.provider == "deepseek"
+            and self._plan_state.mode == "default"
+            and self._plan_state.phase not in {"uncertain", "recovery_error"}
+        )
 
     @property
     def web_search_backend_label(self) -> str:
@@ -464,7 +512,7 @@ class AgentSession:
 
     async def set_web_search_enabled(self, enabled: bool) -> None:
         """Enable or disable the application-owned search tool at runtime."""
-        if self._is_processing:
+        if self._is_processing or self._active_plan_run_id is not None:
             raise RuntimeError("RUN_IN_PROGRESS: 任务运行时不能切换联网检索")
         if enabled == self.web_search_enabled:
             self._config.web_search_enabled = enabled
@@ -533,29 +581,53 @@ class AgentSession:
     async def _before_tool_call(
         self, context: BeforeToolCallContext, signal: asyncio.Event,
     ) -> BeforeToolCallResult | None:
-        if self._plan_state.mode == "plan":
-            policy_result = await enforce_plan_tool_policy(context, self.cwd)
+        if self._plan_state.mode == "plan" or self._plan_state.phase in {"uncertain", "recovery_error"}:
+            policy_result = await enforce_plan_tool_policy(
+                context, self.cwd, phase=self._plan_state.phase,
+            )
             if policy_result is not None and policy_result.block:
                 self._emit_event({
                     "type": "plan_policy_blocked",
-                    "code": "PLAN_POLICY_BLOCKED",
+                    "code": policy_result.code or "PLAN_POLICY_BLOCKED",
                     "tool_name": context.tool_call.name,
                     "reason": policy_result.reason,
                 })
                 return policy_result
         return await call_hook(self._config.before_tool_call, context, signal)
 
+    def _sync_plan_state(self, *, emit: bool = True) -> PlanState:
+        """Rebuild authoritative Plan State after a persisted transition."""
+        previous = self._plan_state
+        self._plan_state = reduce_plan_state(
+            self.session_manager.get_branch(),
+            live_run_id=self._active_plan_run_id,
+            parent_session_id=self.session_manager.header.parent_session,
+            load_issues=self.session_manager.load_issues,
+        )
+        if self._plan_state != previous:
+            self._refresh_collaboration_runtime()
+        if emit and self._plan_state != previous:
+            self._emit_event({
+                "type": "plan.stateChanged",
+                "sessionId": self.session_manager.header.id,
+                "state": self._plan_state.to_payload(),
+            })
+        return self._plan_state
+
     def enter_plan_mode(self) -> PlanState:
-        if self._is_processing:
+        if self._is_processing or self._active_plan_run_id is not None:
             raise PlanModeError("RUN_IN_PROGRESS", "任务运行中，不能切换协作模式")
-        if self._plan_state.mode == "plan":
+        if self._plan_state.mode == "plan" and self._plan_state.phase != "recovery_error":
             return self._plan_state
+        if self._plan_state.phase == "recovery_error":
+            self.session_manager.append_collaboration_mode_change(
+                "default",
+                plan_id=self._plan_state.active_plan_id,
+                reason="user",
+            )
         plan_id = new_plan_id()
         self.session_manager.append_collaboration_mode_change("plan", plan_id=plan_id)
-        self._plan_state = PlanState(
-            mode="plan", phase="drafting", active_plan_id=plan_id,
-        )
-        self._refresh_collaboration_runtime()
+        self._sync_plan_state()
         self._emit_event({
             "type": "collaboration_mode_changed", "mode": "plan",
             "phase": "drafting", "plan_id": plan_id,
@@ -563,20 +635,29 @@ class AgentSession:
         return self._plan_state
 
     def cancel_plan_mode(self, plan_id: str | None = None) -> PlanState:
+        if self._active_plan_run_id is not None:
+            raise PlanModeError("RUN_IN_PROGRESS", "任务运行中，不能取消规划")
         if self._is_processing and self._question_future is None:
             raise PlanModeError("RUN_IN_PROGRESS", "任务运行中，不能取消规划")
-        if self._plan_state.mode != "plan" or not self._plan_state.active_plan_id:
+        if (
+            self._plan_state.mode != "plan"
+            and self._plan_state.phase != "uncertain"
+        ):
             raise PlanModeError("INVALID_MODE_TRANSITION", "当前不在 Plan Mode")
+        if (
+            self._plan_state.active_plan_id is None
+            and self._plan_state.phase != "recovery_error"
+        ):
+            raise PlanModeError("INVALID_MODE_TRANSITION", "当前没有活动 Plan Episode")
         if plan_id is not None and plan_id != self._plan_state.active_plan_id:
             raise PlanModeError("INVALID_MODE_TRANSITION", "planId 与当前 Plan Episode 不匹配")
         active_id = self._plan_state.active_plan_id
         if self._question_future is not None and not self._question_future.done():
             self._question_future.cancel()
-        self.session_manager.append_collaboration_mode_change("default", plan_id=active_id)
-        self._plan_state.mode = "default"
-        self._plan_state.phase = "cancelled"
-        self._plan_state.pending_question = None
-        self._refresh_collaboration_runtime()
+        self.session_manager.append_collaboration_mode_change(
+            "default", plan_id=active_id, reason="user",
+        )
+        self._sync_plan_state()
         self._emit_event({
             "type": "collaboration_mode_changed", "mode": "default",
             "phase": "cancelled", "plan_id": active_id,
@@ -590,6 +671,8 @@ class AgentSession:
             raise PlanModeError("INVALID_MODE_TRANSITION", "结构化问题只能在 Plan Mode 使用")
         if self._plan_state.pending_question is not None:
             raise PlanModeError("QUESTION_ALREADY_PENDING", "已有一个问题等待回答")
+        if self._plan_state.phase != "drafting":
+            raise PlanModeError("INVALID_MODE_TRANSITION", "结构化问题只能在 Plan drafting 状态使用")
         plan_id = self._plan_state.active_plan_id
         self.session_manager.append_plan_question(
             plan_id=plan_id, question_id=question.question_id,
@@ -597,8 +680,8 @@ class AgentSession:
             options=[asdict(option) for option in question.options],
             allow_custom=question.allow_custom,
         )
-        self._plan_state.phase = "awaiting_answer"
-        self._plan_state.pending_question = question
+        self.session_manager.flush()
+        self._sync_plan_state()
         self._emit_event({
             "type": "plan_question_requested", "plan_id": plan_id,
             "question": question.to_payload(),
@@ -641,8 +724,8 @@ class AgentSession:
         answer_entry = self.session_manager.append_plan_question_answer(
             plan_id=plan_id, question_id=question_id, answer=answer,
         )
-        self._plan_state.pending_question = None
-        self._plan_state.phase = "drafting"
+        self.session_manager.flush()
+        self._sync_plan_state()
         self._emit_event({
             "type": "plan_question_answered", "plan_id": plan_id,
             "question_id": question_id, "answer": answer,
@@ -665,10 +748,117 @@ class AgentSession:
         )
         return self._plan_state
 
+    async def _submit_plan(
+        self, tool_call_id: str, title: str, markdown: str,
+    ) -> PlanRevision:
+        """Persist one exact submit_plan call as the next immutable revision."""
+        if (
+            self._plan_state.mode != "plan"
+            or self._plan_state.phase != "drafting"
+            or not self._plan_state.active_plan_id
+        ):
+            raise PlanModeError(
+                "INVALID_MODE_TRANSITION",
+                "submit_plan 只能在 Plan drafting 状态使用",
+            )
+        source_message_id = self._validate_submit_source_message(
+            tool_call_id,
+            title=title,
+            markdown=markdown,
+        )
+        revision_number = (
+            self._plan_state.latest_revision.revision + 1
+            if self._plan_state.latest_revision is not None else 1
+        )
+        revision = create_plan_revision(
+            plan_id=self._plan_state.active_plan_id,
+            revision=revision_number,
+            title=title,
+            markdown=markdown,
+            source_message_id=source_message_id,
+            submitted_by_tool_call_id=tool_call_id,
+        )
+        self.session_manager.append_plan_revision(
+            plan_id=revision.plan_id,
+            revision=revision.revision,
+            title=revision.title,
+            markdown=revision.markdown,
+            digest=revision.digest,
+            source_message_id=revision.source_message_id,
+            schema_version=revision.schema_version,
+            submitted_by_tool_call_id=revision.submitted_by_tool_call_id,
+            origin_session_id=revision.origin_session_id,
+        )
+        self.session_manager.flush()
+        self._sync_plan_state()
+        self._emit_event({"type": "plan_ready", "plan": revision.to_payload()})
+        return revision
+
+    def _validate_submit_source_message(
+        self,
+        tool_call_id: str,
+        *,
+        title: str,
+        markdown: str,
+    ) -> str:
+        """Return the persisted source only for an exact, exclusive call."""
+        from agent_core.session.types import SessionMessageEntry
+
+        branch = self.session_manager.get_branch()
+        if any(
+            getattr(entry, "submitted_by_tool_call_id", None) == tool_call_id
+            and getattr(entry, "origin_session_id", None) is None
+            for entry in branch
+        ):
+            raise PlanModeError("PLAN_SUBMIT_REUSED", "此 submit_plan 调用已经提交过计划")
+        for entry in reversed(branch):
+            if not isinstance(entry, SessionMessageEntry) or entry.message is None:
+                continue
+            if getattr(entry.message, "role", None) != "assistant":
+                continue
+            tool_calls = [
+                block
+                for block in getattr(entry.message, "content", [])
+                if getattr(block, "type", None) == "toolCall"
+            ]
+            if not any(
+                getattr(block, "type", None) == "toolCall"
+                and getattr(block, "id", None) == tool_call_id
+                for block in tool_calls
+            ):
+                continue
+            if entry is not branch[-1]:
+                raise PlanModeError("PLAN_SOURCE_MISMATCH", "submit_plan 必须来自当前 assistant message")
+            if getattr(entry.message, "stop_reason", None) in {"aborted", "error", "length"}:
+                raise PlanModeError("PLAN_SUBMIT_INCOMPLETE", "中止或截断的回复不能提交计划")
+            if (
+                len(tool_calls) != 1
+                or getattr(tool_calls[0], "name", None) != "submit_plan"
+            ):
+                raise PlanModeError(
+                    "PLAN_SUBMIT_NOT_EXCLUSIVE",
+                    "submit_plan 必须是 assistant message 中唯一的工具调用",
+                )
+            arguments = getattr(tool_calls[0], "arguments", None)
+            if (
+                not isinstance(arguments, dict)
+                or arguments.get("title") != title
+                or arguments.get("markdown") != markdown
+            ):
+                raise PlanModeError(
+                    "PLAN_SOURCE_MISMATCH",
+                    "submit_plan 参数与已持久化 tool call 不匹配",
+                )
+            return entry.id
+        raise PlanModeError(
+            "PLAN_SOURCE_MISSING",
+            "submit_plan 的 assistant message 尚未持久化",
+        )
+
     async def execute_plan(
         self, plan_id: str, revision: int, digest: str, run_id: str | None = None,
     ) -> PlanRevision:
-        if self._is_processing:
+        if self._is_processing or self._active_plan_run_id is not None:
             raise PlanModeError("RUN_IN_PROGRESS", "任务运行中，不能执行计划")
         latest = self._plan_state.latest_revision
         if self._plan_state.mode != "plan" or self._plan_state.phase != "ready" or latest is None:
@@ -680,28 +870,37 @@ class AgentSession:
             })
             raise PlanModeError("STALE_PLAN_REVISION", "只能执行最新的 Plan revision")
 
+        run_id = run_id or uuid.uuid4().hex
         started_entry = self.session_manager.append_plan_run(
             plan_id=plan_id, revision=revision, digest=digest,
             status="started", run_id=run_id,
         )
-        self._plan_state.mode = "default"
-        self._plan_state.phase = "executing"
+        try:
+            self.session_manager.flush()
+        except BaseException:
+            # A durable started entry may exist, but this runtime has not
+            # acquired the run. Replaying it must lock execution as uncertain.
+            self._sync_plan_state()
+            raise
+        self._active_plan_run_id = run_id
         self._plan_abort_requested = False
-        self._refresh_collaboration_runtime()
+        self._last_assistant_message = None
+        self._sync_plan_state()
         self._emit_event({
             "type": "plan_execution_started", "plan": latest.to_payload(),
             "run_id": run_id,
         })
-        await self._extract_plan_memory(latest, started_entry, completed=False)
         execution_prompt = (
             "<confirmed_plan_execution>\n"
-            f"plan_id: {plan_id}\nrevision: {revision}\ndigest: {digest}\n\n"
+            f"plan_id: {plan_id}\nrevision: {revision}\ndigest: {digest}\ntitle: {latest.title}\n\n"
             f"{latest.markdown}\n"
             "</confirmed_plan_execution>\n"
             "Execute this exact confirmed plan now."
         )
         try:
-            await self.prompt(execution_prompt)
+            await self._extract_accepted_plan_memory(latest, started_entry)
+            if not self._plan_abort_requested:
+                await self.prompt(execution_prompt, _plan_run_id=run_id)
         except asyncio.CancelledError:
             self._finish_plan_run(latest, "aborted", run_id=run_id)
             raise
@@ -720,20 +919,109 @@ class AgentSession:
                 ),
             )
         else:
-            completed_entry = self._finish_plan_run(latest, "completed", run_id=run_id)
-            await self._extract_plan_memory(latest, completed_entry, completed=True)
+            self._finish_plan_run(latest, "completed", run_id=run_id)
         return latest
+
+    def handoff_plan_to_new_session(
+        self,
+        plan_id: str,
+        revision: int,
+        digest: str,
+        *,
+        attach: bool = True,
+    ) -> SessionManager:
+        """Persist a clean child session containing only one confirmed plan.
+
+        The child is made durable before the source records the handoff.  A
+        failure between those writes therefore leaves the source ready and
+        preserves the child as an inspectable, unfinished handoff.
+        """
+        if self._is_processing or self._active_plan_run_id is not None:
+            raise PlanModeError("RUN_IN_PROGRESS", "任务运行中，不能交接计划")
+        latest = self._plan_state.latest_revision
+        if (
+            self._plan_state.mode != "plan"
+            or self._plan_state.phase != "ready"
+            or latest is None
+        ):
+            raise PlanModeError("PLAN_NOT_READY", "当前没有可交接的计划")
+        if (
+            plan_id != latest.plan_id
+            or revision != latest.revision
+            or digest != latest.digest
+        ):
+            raise PlanModeError(
+                "STALE_PLAN_REVISION",
+                "只能交接最新的 Plan revision",
+            )
+
+        source = self.session_manager
+        target = SessionManager.create(
+            cwd=self.cwd,
+            agent_dir=source.agent_dir,
+            sessions_dir=source.sessions_dir,
+            in_memory=source.in_memory,
+            parent_session=source.header.id,
+        )
+        target.append_collaboration_mode_change(
+            "plan",
+            plan_id=latest.plan_id,
+            reason="handoff",
+            related_session_id=source.header.id,
+        )
+        target.append_plan_revision(
+            plan_id=latest.plan_id,
+            revision=latest.revision,
+            title=latest.title,
+            markdown=latest.markdown,
+            digest=latest.digest,
+            source_message_id=latest.source_message_id,
+            schema_version=latest.schema_version,
+            submitted_by_tool_call_id=latest.submitted_by_tool_call_id,
+            origin_session_id=source.header.id,
+        )
+        target.flush()
+
+        source.flush()
+        source.append_collaboration_mode_change(
+            "default",
+            plan_id=latest.plan_id,
+            reason="handoff",
+            related_session_id=target.header.id,
+        )
+        self._sync_plan_state()
+        self._emit_event({
+            "type": "plan_handoff_created",
+            "source_session_id": source.header.id,
+            "target_session_id": target.header.id,
+            "plan": latest.to_payload(),
+        })
+
+        if attach:
+            self._attach_session_manager(target)
+        return target
 
     def _finish_plan_run(
         self, plan: PlanRevision, status: Literal["completed", "failed", "aborted"],
         *, run_id: str | None, error: str | None = None,
     ) -> Any:
-        entry = self.session_manager.append_plan_run(
-            plan_id=plan.plan_id, revision=plan.revision, digest=plan.digest,
-            status=status, run_id=run_id, error=error,
+        assistant_message_id = (
+            self._latest_assistant_entry_id() if self._last_assistant_message is not None else None
         )
-        self._plan_state.mode = "default"
-        self._plan_state.phase = status
+        stop_reason = getattr(self._last_assistant_message, "stop_reason", None)
+        try:
+            entry = self.session_manager.append_plan_run(
+                plan_id=plan.plan_id, revision=plan.revision, digest=plan.digest,
+                status=status, run_id=run_id, error=error,
+                assistant_message_id=assistant_message_id,
+                stop_reason=stop_reason,
+            )
+            self.session_manager.flush()
+        finally:
+            # Even failed persistence ends live ownership. If the terminal
+            # append failed, the reducer now exposes the orphaned started run.
+            self._active_plan_run_id = None
+            self._sync_plan_state()
         event_suffix = {"completed": "completed", "failed": "failed", "aborted": "aborted"}[status]
         self._emit_event({
             "type": f"plan_execution_{event_suffix}", "plan": plan.to_payload(),
@@ -741,10 +1029,22 @@ class AgentSession:
         })
         return entry
 
-    async def _extract_plan_memory(
-        self, plan: PlanRevision, entry: Any, *, completed: bool,
+    def _latest_assistant_entry_id(self) -> str | None:
+        from agent_core.session.types import SessionMessageEntry
+
+        for entry in reversed(self.session_manager.get_branch()):
+            if (
+                isinstance(entry, SessionMessageEntry)
+                and entry.message is not None
+                and getattr(entry.message, "role", None) == "assistant"
+            ):
+                return entry.id
+        return None
+
+    async def _extract_accepted_plan_memory(
+        self, plan: PlanRevision, entry: Any,
     ) -> None:
-        """Extract only from an explicitly accepted immutable Plan revision."""
+        """Store the accepted decision, never an inferred completion claim."""
         if self.memory_service is None or self.memory_identity is None:
             return
         from coding_agent.memory.types import CompletedTask, MemoryEvidence
@@ -752,15 +1052,15 @@ class AgentSession:
         evidence = MemoryEvidence(
             id=entry.id,
             text=plan.markdown,
-            source_kind="plan_completed" if completed else "accepted_plan",
+            source_kind="accepted_plan",
             timestamp=entry.timestamp,
         )
         task = CompletedTask(
             identity=self.memory_identity,
             session_id=self.session_manager.header.id,
             evidence=[evidence],
-            final_response=_assistant_text(self._last_assistant_message) if completed else "",
-            mode="plan_completed" if completed else "plan_accepted",
+            final_response="",
+            mode="plan_accepted",
             success=True,
             ended_at=entry.timestamp,
         )
@@ -771,9 +1071,7 @@ class AgentSession:
             self._emit_event({"type": "memory_extraction_failed", "error_code": "PLAN_MEMORY"})
 
     def refresh_plan_state_from_branch(self) -> PlanState:
-        self._plan_state = reduce_plan_state(self.session_manager.get_branch())
-        self._refresh_collaboration_runtime()
-        return self._plan_state
+        return self._sync_plan_state(emit=False)
 
     # ── Prompt ────────────────────────────────────────────────────────────
 
@@ -786,6 +1084,7 @@ class AgentSession:
         _memory_query: str | None = None,
         _memory_evidence: list[Any] | None = None,
         _memory_mode: str | None = None,
+        _plan_run_id: str | None = None,
     ) -> None:
         """Send a user message and run the agent loop.
 
@@ -797,6 +1096,16 @@ class AgentSession:
         """
         if self._is_processing:
             raise RuntimeError("Agent is already processing a prompt.")
+        if (
+            self._active_plan_run_id is not None
+            and _plan_run_id != self._active_plan_run_id
+        ):
+            raise PlanModeError("RUN_IN_PROGRESS", "已有 Plan run 正在执行")
+        if self._plan_state.phase in {"uncertain", "recovery_error"}:
+            raise PlanModeError(
+                "PLAN_RECOVERY_REQUIRED",
+                "当前 Plan 状态需要先查看详情、重新规划或取消",
+            )
         if isinstance(message, str) and message.lstrip().startswith("<confirmed_plan_execution>"):
             _retrieve_memory = False
             _extract_memory = False
@@ -810,17 +1119,6 @@ class AgentSession:
                 "QUESTION_NOT_PENDING",
                 "请先通过结构化问题控件回答当前 Plan 问题",
             )
-        if self._plan_state.mode == "plan" and self._plan_state.phase == "ready":
-            # Ordinary user text is feedback, never execution authorization.
-            # The persisted user message reproduces this transition on resume.
-            self._plan_state.phase = "drafting"
-            self._emit_event({
-                "type": "collaboration_mode_changed",
-                "mode": "plan",
-                "phase": "drafting",
-                "plan_id": self._plan_state.active_plan_id,
-            })
-
         branch_before = {entry.id for entry in self.session_manager.get_branch()}
         task_mode = _memory_mode or self._plan_state.mode
         query = _memory_query if _memory_query is not None else _message_text(message)
@@ -1026,6 +1324,8 @@ class AgentSession:
         flushed before it is detached; subsequent messages can therefore never
         leak into the old JSONL file.
         """
+        if self._is_processing or self._active_plan_run_id is not None:
+            raise PlanModeError("RUN_IN_PROGRESS", "任务运行中，不能新建会话")
         previous = self.session_manager
         if not previous.in_memory and previous.has_meaningful_activity():
             previous.flush()
@@ -1036,15 +1336,24 @@ class AgentSession:
             sessions_dir=previous.sessions_dir,
             in_memory=previous.in_memory,
         )
+        self._attach_session_manager(new_manager)
+        return new_manager
+
+    def _attach_session_manager(self, manager: SessionManager) -> None:
+        """Attach one manager and reset all session-local runtime state."""
         self._agent.reset()
-        self._agent.attach_session(new_manager)
-        self.session_manager = new_manager
+        self._agent.clear_all_queues()
+        self._agent.attach_session(manager)
+        self.session_manager = manager
+        if hasattr(self, "_compaction_orchestrator"):
+            self._compaction_orchestrator.session_manager = manager
         self._last_assistant_message = None
         self._turn_index = 0
-        self._plan_state = PlanState()
         self._question_future = None
-        self._refresh_collaboration_runtime()
-        return new_manager
+        self._question_signal_task = None
+        self._active_plan_run_id = None
+        self._plan_abort_requested = False
+        self._sync_plan_state()
 
     async def abort(self) -> None:
         """Abort the current agent run."""
@@ -1121,10 +1430,11 @@ class AgentSession:
         """
         if self._bash_tool is None:
             return {"error": "No bash tool available"}
-        if self._plan_state.mode == "plan" and not is_plan_safe_shell_command(command, self.cwd):
+        if self._plan_state.mode == "plan" or self._plan_state.phase == "uncertain":
             self._emit_event({
                 "type": "plan_policy_blocked", "code": "PLAN_POLICY_BLOCKED",
-                "tool_name": "bash", "reason": "PLAN_POLICY_BLOCKED: Plan Mode 禁止该命令",
+                "tool_name": "bash",
+                "reason": "PLAN_POLICY_BLOCKED: Plan Mode 禁止通用 Shell",
             })
             return {"error": "PLAN_POLICY_BLOCKED", "code": "PLAN_POLICY_BLOCKED"}
         try:
@@ -1267,43 +1577,6 @@ class AgentSession:
                 None if context.thinking_level == "off" else context.thinking_level
             )
         self.refresh_plan_state_from_branch()
-        self._recover_latest_complete_plan()
-
-    def _recover_latest_complete_plan(self) -> None:
-        """Upgrade the latest bare plan in a resumed Plan episode to ready.
-
-        Older clients persisted the assistant Markdown but silently skipped a
-        revision when the model omitted the control envelope. Only the newest
-        assistant response in the active episode is considered, so later user
-        feedback cannot accidentally revive an obsolete plan.
-        """
-        if (
-            self._plan_state.mode != "plan"
-            or self._plan_state.latest_revision is not None
-            or not self._plan_state.active_plan_id
-        ):
-            return
-
-        from agent_core.session.types import (
-            CollaborationModeChangeEntry,
-            SessionMessageEntry,
-        )
-
-        active_plan_id = self._plan_state.active_plan_id
-        for entry in reversed(self.session_manager.get_branch()):
-            if (
-                isinstance(entry, CollaborationModeChangeEntry)
-                and entry.mode == "plan"
-                and entry.plan_id == active_plan_id
-            ):
-                break
-            if isinstance(entry, SessionMessageEntry) and entry.message is not None:
-                role = getattr(entry.message, "role", None)
-                if role == "user":
-                    break
-                if role == "assistant":
-                    self._capture_plan_revision(entry.message)
-                    break
 
     # ── Internal: event forwarding ────────────────────────────────────────
 
@@ -1319,7 +1592,8 @@ class AgentSession:
             msg = event.get("message")
             if msg is not None and getattr(msg, "role", None) == "assistant":
                 self._last_assistant_message = msg
-                self._capture_plan_revision(msg)
+            if msg is not None and getattr(msg, "role", None) in {"user", "assistant"}:
+                self._sync_plan_state()
 
         # Emit compaction events for the UI.
         if etype == "message_end":
@@ -1336,42 +1610,6 @@ class AgentSession:
 
         # Forward to external listeners.
         self._emit_event(event)
-
-    def _capture_plan_revision(self, message: Any) -> None:
-        """Validate a completed assistant plan before publishing ``plan_ready``."""
-        if self._plan_state.mode != "plan" or not self._plan_state.active_plan_id:
-            return
-        if getattr(message, "stop_reason", None) == "error":
-            return
-        text = _assistant_text(message)
-        prepared_reply = prepare_plan_reply(text)
-        if prepared_reply is None:
-            return
-        revision_number = (
-            self._plan_state.latest_revision.revision + 1
-            if self._plan_state.latest_revision is not None else 1
-        )
-        try:
-            revision = validate_proposed_plan(
-                prepared_reply, plan_id=self._plan_state.active_plan_id,
-                revision=revision_number,
-                source_message_id=str(getattr(message, "id", "")),
-            )
-        except PlanModeError as exc:
-            self._emit_event({
-                "type": "plan_validation_failed", "code": exc.code,
-                "message": str(exc), "plan_id": self._plan_state.active_plan_id,
-            })
-            return
-        self.session_manager.append_plan_revision(
-            plan_id=revision.plan_id, revision=revision.revision,
-            title=revision.title, markdown=revision.markdown,
-            digest=revision.digest, source_message_id=revision.source_message_id,
-        )
-        self._plan_state.phase = "ready"
-        self._plan_state.pending_question = None
-        self._plan_state.latest_revision = revision
-        self._emit_event({"type": "plan_ready", "plan": revision.to_payload()})
 
     def _emit_event(self, event: Any) -> None:
         """Emit an event to all registered listeners.
@@ -1429,7 +1667,14 @@ class AgentSession:
         def _stream(model: Model, context, options=None):
             effective_options: dict[str, Any] = dict(options or {})
             effective_context = context
-            if self.web_search_enabled and model.provider == "deepseek":
+            search_allowed = (
+                self._plan_state.mode == "default"
+                and self._plan_state.phase not in {"uncertain", "recovery_error"}
+                and any(tool.name == "web_search" for tool in (context.tools or []))
+            )
+            if not search_allowed:
+                effective_options.pop("web_search", None)
+            if self.web_search_enabled and model.provider == "deepseek" and search_allowed:
                 # DeepSeek's Responses API owns web_search server-side. Keep
                 # the application tool registered for UI/provider switching,
                 # but do not expose a duplicate function tool to DeepSeek.

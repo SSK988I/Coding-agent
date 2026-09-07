@@ -11,7 +11,7 @@ from typing import Any
 
 from agent_llm import TextContent
 
-from agent_core.types import AgentToolResult
+from agent_core.types import AgentToolResult, PlanAccess
 
 
 READ_SCHEMA: dict = {
@@ -47,6 +47,7 @@ class ReadTool:
 
     name: str = "read"
     effect: str = "read"
+    plan_access: PlanAccess = "observe"
     label: str = "read"
     description: str = "Read the contents of a file."
     parameters: dict = READ_SCHEMA

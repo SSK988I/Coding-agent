@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import os
 from pathlib import Path
+import re
+import shlex
 import time
 from typing import Any, Awaitable, Callable, cast
 import uuid
@@ -18,7 +20,7 @@ from coding_agent.core.context_files import load_project_context_files
 from coding_agent.core.credentials import CredentialStore
 from coding_agent.core.providers import _all_providers, get_configured_models
 from coding_agent.core.retry import RetryPolicy
-from coding_agent.core.plan_mode import PlanModeError, is_plan_safe_shell_command
+from coding_agent.core.plan_mode import PlanModeError
 from coding_agent.core.settings import SettingsManager
 from coding_agent.core.slash_commands import get_active_commands
 from coding_agent.desktop.protocol import PROTOCOL_VERSION, RpcError, to_jsonable
@@ -74,6 +76,7 @@ class DesktopRuntime:
             "plan.answer": self._plan_answer,
             "plan.cancel": self._plan_cancel,
             "plan.execute": self._plan_execute,
+            "plan.handoff": self._plan_handoff,
             "memory.status": self._memory_status,
             "memory.list": self._memory_list,
             "memory.conflicts": self._memory_conflicts,
@@ -255,6 +258,8 @@ class DesktopRuntime:
             "sessionId": session.session_manager.header.id,
             "messages": to_jsonable(session.state.messages),
             "stats": to_jsonable(session.get_stats()),
+            "collaborationMode": session.collaboration_mode,
+            "planState": session.plan_state.to_payload(),
         }
 
     async def _session_clear(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -390,12 +395,16 @@ class DesktopRuntime:
                 self._run_task = None
 
     async def _plan_cancel(self, params: dict[str, Any]) -> dict[str, Any]:
-        self._ensure_no_active_run("任务运行时不能取消规划")
+        session = self._require_session()
+        if session.plan_state.phase != "awaiting_answer":
+            self._ensure_no_active_run("任务运行时不能取消规划")
         plan_id = params.get("planId")
-        if not isinstance(plan_id, str) or not plan_id:
+        if plan_id is not None and (not isinstance(plan_id, str) or not plan_id):
+            raise RpcError("INVALID_PARAMS", "plan.cancel 需要有效 planId")
+        if plan_id is None and session.plan_state.phase != "recovery_error":
             raise RpcError("INVALID_PARAMS", "plan.cancel 需要 planId")
         try:
-            self._require_session().cancel_plan_mode(plan_id)
+            session.cancel_plan_mode(plan_id)
         except PlanModeError as exc:
             raise RpcError(exc.code, str(exc)) from exc
         return await self._workspace_payload_with_memory()
@@ -422,6 +431,35 @@ class DesktopRuntime:
             self._drive_plan_execution(session, plan_id, revision, digest, run_id)
         )
         return {"accepted": True, "runId": run_id}
+
+    async def _plan_handoff(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Create and open a fresh session containing only the confirmed plan.
+
+        The core writes the child, records the source handoff, and atomically
+        reattaches this live AgentSession.  No second open/initialization step
+        can strand the desktop after the source has been finalized.
+        """
+        self._ensure_no_active_run("任务运行时不能交接计划")
+        plan_id = params.get("planId")
+        revision = params.get("revision")
+        digest = params.get("digest")
+        if (
+            not isinstance(plan_id, str) or not isinstance(revision, int)
+            or not isinstance(digest, str)
+        ):
+            raise RpcError("INVALID_PARAMS", "plan.handoff 需要 planId、revision 和 digest")
+
+        session = self._require_session()
+        try:
+            session.handoff_plan_to_new_session(
+                plan_id, revision, digest, attach=True,
+            )
+        except PlanModeError as exc:
+            raise RpcError(exc.code, str(exc)) from exc
+
+        payload = self._workspace_payload()
+        self._publish("session.changed", payload)
+        return payload
 
     async def _drive_plan_execution(
         self, session: AgentSession, plan_id: str, revision: int,
@@ -497,7 +535,7 @@ class DesktopRuntime:
     ) -> BeforeToolCallResult | None:
         if context.tool_call.name not in _APPROVAL_TOOLS:
             return None
-        if context.tool_call.name == "bash" and is_plan_safe_shell_command(
+        if context.tool_call.name == "bash" and _is_default_approval_safe_shell_command(
             str(context.args.get("command", "")),
             str(self._workspace or Path.cwd()),
         ):
@@ -871,6 +909,140 @@ class DesktopRuntime:
         return self._session
 
 
+_DEFAULT_CONTROL_TOKENS = (";", "||", "`", "$(", ">", "<", "\n", "\r")
+_DEFAULT_SHELL_SPLIT_RE = re.compile(r"\s*(?:\|\||&&|\|)\s*")
+_DEFAULT_SAFE_FD_REDIRECTION_RE = re.compile(r"(?<!\S)(?:2>&1|1>&2)(?=\s|$)")
+_DEFAULT_READ_COMMANDS = {
+    "pwd", "ls", "dir", "cat", "head", "tail", "wc", "sort", "uniq",
+    "cut", "grep", "rg", "fd", "find", "where", "which", "type",
+    "get-content", "select-string", "get-childitem", "git",
+}
+_DEFAULT_READ_ONLY_GIT = {
+    "status", "diff", "show", "log", "branch", "rev-parse", "ls-files",
+    "ls-tree", "cat-file", "grep", "blame", "remote", "tag", "describe",
+}
+_DEFAULT_VALIDATION_EXECUTABLES = {"pytest", "ruff", "pyright", "mypy"}
+_DEFAULT_SAFE_PACKAGE_SCRIPTS = {"test", "typecheck", "lint", "check", "build"}
+_DEFAULT_DANGEROUS_FIND_FLAGS = {"-delete", "-exec", "-execdir", "-ok", "-okdir"}
+
+
+def _is_default_approval_safe_shell_command(command: str, cwd: str) -> bool:
+    """Preserve the desktop's Default-mode approval shortcut.
+
+    Plan Mode no longer uses a shell allowlist: its runtime tool policy prevents
+    Bash from being registered and blocks denied tools again before execution.
+    This classifier is deliberately local to the desktop approval adapter so
+    tightening Plan Mode does not silently change established Default behavior.
+    """
+    command = _DEFAULT_SAFE_FD_REDIRECTION_RE.sub("", command.strip())
+    if not command or any(token in command for token in _DEFAULT_CONTROL_TOKENS):
+        return False
+    if re.search(r"(?:^|\s)\.\.(?:[\\/]|(?:\s|$))", command):
+        return False
+    segments = _DEFAULT_SHELL_SPLIT_RE.split(command)
+    if not segments or any(not segment.strip() for segment in segments):
+        return False
+    for segment in segments:
+        try:
+            tokens = shlex.split(segment, posix=True)
+        except ValueError:
+            return False
+        if not tokens or not _is_default_approval_safe_segment(tokens, cwd):
+            return False
+    return True
+
+
+def _is_default_approval_safe_segment(tokens: list[str], cwd: str) -> bool:
+    executable = tokens[0].replace("\\", "/").rsplit("/", 1)[-1].casefold()
+    if executable.endswith(".exe"):
+        executable = executable[:-4]
+    args = tokens[1:]
+    if executable == "cd":
+        return len(args) == 1 and _default_path_stays_in_workspace(args[0], cwd)
+    if executable == "git":
+        positional = [item for item in args if not item.startswith("-")]
+        if not positional or positional[0].casefold() not in _DEFAULT_READ_ONLY_GIT:
+            return False
+        if positional[0].casefold() == "branch" and len(positional) > 1:
+            return False
+        if any(
+            item in {"-c", "-o", "--paginate"}
+            or item.startswith(("--output", "--exec-path", "--open-files-in-pager"))
+            for item in args
+        ):
+            return False
+    elif executable in _DEFAULT_READ_COMMANDS:
+        if executable == "find" and any(
+            item.casefold() in _DEFAULT_DANGEROUS_FIND_FLAGS for item in args
+        ):
+            return False
+        if executable == "rg" and any(
+            item == "--pre" or item.startswith("--pre=") for item in args
+        ):
+            return False
+        if executable == "sort" and any(
+            item == "-o" or item.startswith("--output") for item in args
+        ):
+            return False
+        if executable == "uniq" and len(
+            [item for item in args if not item.startswith("-")]
+        ) > 1:
+            return False
+    elif executable in _DEFAULT_VALIDATION_EXECUTABLES:
+        pass
+    elif executable in {"pnpm", "npm", "yarn"}:
+        lowered = {item.casefold() for item in args if not item.startswith("-")}
+        if (
+            lowered.isdisjoint(_DEFAULT_SAFE_PACKAGE_SCRIPTS)
+            or lowered & {"add", "install", "exec", "publish"}
+        ):
+            return False
+    elif executable == "uv":
+        if not _is_default_approval_safe_uv(args):
+            return False
+    else:
+        return False
+    return all(
+        _default_path_stays_in_workspace(token, cwd)
+        for token in args
+        if _default_looks_like_path(token)
+    )
+
+
+def _is_default_approval_safe_uv(args: list[str]) -> bool:
+    lowered = [item.casefold() for item in args if not item.startswith("-")]
+    if not lowered:
+        return False
+    if lowered[0] == "build":
+        return True
+    if lowered[0] != "run" or len(lowered) < 2:
+        return False
+    if lowered[1] in _DEFAULT_VALIDATION_EXECUTABLES:
+        return True
+    return lowered[1:3] == ["python", "scripts/check_versions.py"]
+
+
+def _default_looks_like_path(token: str) -> bool:
+    if token.startswith("-"):
+        return False
+    return (
+        "/" in token or "\\" in token or token in {".", ".."}
+        or bool(re.match(r"^[A-Za-z]:", token))
+    )
+
+
+def _default_path_stays_in_workspace(token: str, cwd: str) -> bool:
+    if any(char in token for char in "*?[]{}"):
+        token = token.split("*", 1)[0].split("?", 1)[0] or "."
+    try:
+        root = Path(cwd).resolve()
+        candidate = Path(token)
+        resolved = candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
+        return os.path.commonpath((str(root), str(resolved))) == str(root)
+    except (OSError, ValueError):
+        return False
+
+
 def _is_read_only_bash_command(command: str) -> bool:
-    """Compatibility alias for the shared Plan/safe-shell classifier."""
-    return is_plan_safe_shell_command(command, os.getcwd())
+    """Compatibility alias retained for desktop protocol tests/extensions."""
+    return _is_default_approval_safe_shell_command(command, os.getcwd())

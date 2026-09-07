@@ -68,5 +68,4 @@ Desktop.ini
 .zcode/
 .codex/
 
-# 本地开发文档
-/docs/
+# Plan Mode 规范和架构决策属于产品契约，随代码版本化。

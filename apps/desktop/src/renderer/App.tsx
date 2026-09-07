@@ -4,8 +4,9 @@ import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import remarkGfm from "remark-gfm";
 import type {
   RuntimeEvent,
-  PlanQuestionPayload,
   PlanRevisionPayload,
+  PlanStatePayload,
+  SessionSnapshotPayload,
   SessionInfo,
   WorkspacePayload,
 } from "../shared/types";
@@ -36,6 +37,8 @@ interface CommandOption {
   label: string;
   description: string;
 }
+
+type PendingPlanAction = "execute" | "handoff" | null;
 
 const COMMAND_ICONS: Record<string, string> = {
   help: "?",
@@ -122,11 +125,11 @@ const TimelineCompactionCard = memo(function TimelineCompactionCard({
   );
 });
 
-const TimelinePlanCard = memo(function TimelinePlanCard({ plan }: { plan: PlanRevisionPayload }) {
+const TimelinePlanCard = memo(function TimelinePlanCard({ plan, badge }: { plan: PlanRevisionPayload; badge: string }) {
   return (
     <section className="plan-card" data-testid="plan-card">
       <div className="plan-card-header">
-        <span className="plan-badge">PLAN</span>
+        <span className="plan-badge">{badge}</span>
         <strong>{plan.title}</strong>
         <span>revision {plan.revision} · {plan.digest.slice(0, 12)}</span>
       </div>
@@ -235,6 +238,7 @@ export function App() {
   const [customPlanAnswer, setCustomPlanAnswer] = useState("");
   const [supplementingPlanDigest, setSupplementingPlanDigest] = useState<string | null>(null);
   const virtuosoRef = useRef<VirtuosoHandle>(null);
+  const [pendingPlanAction, setPendingPlanAction] = useState<PendingPlanAction>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const didBootstrap = useRef(false);
   const rafQueue = useRef<RuntimeEvent[]>([]);
@@ -242,6 +246,7 @@ export function App() {
   const localItemSequence = useRef(0);
   const activeCompactionId = useRef<string | null>(null);
   const compactingRef = useRef(false);
+  const workspaceSessionIdRef = useRef<string | null>(null);
 
   const refreshSessions = async () => {
     try {
@@ -260,6 +265,7 @@ export function App() {
   };
 
   const applyWorkspace = (payload: WorkspacePayload, restoreTimeline = true) => {
+    workspaceSessionIdRef.current = payload.sessionId;
     setWorkspace(payload);
     if (restoreTimeline) {
       setTimelineState(createTimelineStateFromMessages(payload.messages, payload.sessionId));
@@ -268,6 +274,7 @@ export function App() {
     setModelPickerOpen(false);
     setCustomPlanAnswer("");
     setSupplementingPlanDigest(null);
+    setPendingPlanAction(null);
     activeCompactionId.current = null;
     compactingRef.current = false;
     setCompacting(false);
@@ -275,6 +282,26 @@ export function App() {
     setError(null);
     void refreshSessions();
     void refreshCommands();
+  };
+
+  const applySessionSnapshot = (snapshot: SessionSnapshotPayload) => {
+    if (workspaceSessionIdRef.current !== snapshot.sessionId) return;
+    setWorkspace((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        collaborationMode: snapshot.collaborationMode,
+        planState: snapshot.planState,
+        messages: snapshot.messages,
+      };
+    });
+    setTimelineState(createTimelineStateFromMessages(snapshot.messages, snapshot.sessionId));
+  };
+
+  const refreshSessionSnapshot = async () => {
+    const snapshot = await window.agent.request<SessionSnapshotPayload>("session.snapshot");
+    applySessionSnapshot(snapshot);
+    return snapshot;
   };
 
   const beginCompaction = (reason: string): string => {
@@ -383,10 +410,12 @@ export function App() {
     const { type, payload } = envelope.event;
     if (type === "run.started") {
       setRunning(true);
+      setPendingPlanAction(null);
       return;
     }
     if (type === "run.completed" || type === "run.cancelled" || type === "run.failed") {
       setRunning(false);
+      setPendingPlanAction(null);
       if (type === "run.failed") setError(String(payload.message ?? "运行失败"));
       void refreshSessions();
       return;
@@ -422,57 +451,27 @@ export function App() {
         memory: { ...current.memory, ...(payload as unknown as WorkspacePayload["memory"]) },
       } : current);
     }
-    if (type === "collaboration_mode_changed") {
-      const mode = payload.mode === "plan" ? "plan" : "default";
-      setWorkspace((current) => current ? {
-        ...current,
-        collaborationMode: mode,
-        planState: {
-          ...current.planState,
-          phase: String(payload.phase ?? (mode === "plan" ? "drafting" : "cancelled")) as WorkspacePayload["planState"]["phase"],
-          activePlanId: String(payload.plan_id ?? current.planState.activePlanId ?? "") || null,
-          pendingQuestion: mode === "default" ? null : current.planState.pendingQuestion,
-        },
-      } : current);
+    if (type === "plan_state_changed" || type === "plan.stateChanged") {
+      const state = payload.state as PlanStatePayload | undefined;
+      if (!state || typeof state.phase !== "string") return;
+      const payloadSessionId = typeof payload.sessionId === "string"
+        ? payload.sessionId
+        : typeof payload.session_id === "string" ? payload.session_id : envelope.sessionId;
+      const payloadMode = payload.collaboration_mode === "plan" ? "plan"
+        : payload.collaboration_mode === "default" ? "default" : undefined;
+      setWorkspace((current) => {
+        if (!current || (payloadSessionId && payloadSessionId !== current.sessionId)) return current;
+        return {
+          ...current,
+          collaborationMode: state.mode ?? payloadMode ?? current.collaborationMode,
+          planState: state,
+        };
+      });
+      if (state.phase !== "ready") setSupplementingPlanDigest(null);
+      return;
     }
-    if (type === "plan_question_requested") {
-      const question = payload.question as PlanQuestionPayload;
-      setWorkspace((current) => current ? {
-        ...current,
-        collaborationMode: "plan",
-        planState: { ...current.planState, phase: "awaiting_answer", pendingQuestion: question },
-      } : current);
-    }
-    if (type === "plan_question_answered") {
-      setWorkspace((current) => current ? {
-        ...current,
-        planState: { ...current.planState, phase: "drafting", pendingQuestion: null },
-      } : current);
-    }
-    if (type === "plan_ready") {
-      const plan = payload.plan as PlanRevisionPayload;
-      setSupplementingPlanDigest(null);
-      setWorkspace((current) => current ? {
-        ...current,
-        collaborationMode: "plan",
-        planState: { ...current.planState, phase: "ready", pendingQuestion: null, latestRevision: plan },
-      } : current);
-    }
-    if (type === "plan_execution_started") {
-      setWorkspace((current) => current ? {
-        ...current,
-        collaborationMode: "default",
-        planState: { ...current.planState, phase: "executing", pendingQuestion: null },
-      } : current);
-    }
-    if (type === "plan_execution_completed" || type === "plan_execution_failed" || type === "plan_execution_aborted") {
-      const phase = type.replace("plan_execution_", "") as "completed" | "failed" | "aborted";
-      setWorkspace((current) => current ? {
-        ...current,
-        collaborationMode: "default",
-        planState: { ...current.planState, phase },
-      } : current);
-    }
+    // Granular Plan events remain on the wire for external older clients.
+    // Built-in clients never reconstruct state from them.
   };
 
   const chooseWorkspace = async () => {
@@ -763,7 +762,8 @@ export function App() {
   };
 
   const enterPlanMode = async () => {
-    if (!workspace || running || compacting || workspace.collaborationMode === "plan") return;
+    if (!workspace || running || compacting
+      || (workspace.collaborationMode === "plan" && workspace.planState.phase !== "recovery_error")) return;
     try {
       applyWorkspace(await window.agent.request<WorkspacePayload>("mode.enterPlan"));
     } catch (reason) {
@@ -773,7 +773,8 @@ export function App() {
 
   const cancelPlan = async () => {
     const planId = workspace?.planState.activePlanId;
-    if (!planId || running || compacting) return;
+    if (!workspace || (!planId && workspace.planState.phase !== "recovery_error")
+      || (running && workspace.planState.phase !== "awaiting_answer") || compacting) return;
     try {
       applyWorkspace(await window.agent.request<WorkspacePayload>("plan.cancel", { planId }));
     } catch (reason) {
@@ -791,10 +792,6 @@ export function App() {
         answer: answer.trim(),
       });
       setCustomPlanAnswer("");
-      setWorkspace((current) => current ? {
-        ...current,
-        planState: { ...current.planState, phase: "drafting", pendingQuestion: null },
-      } : current);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     }
@@ -805,19 +802,49 @@ export function App() {
     if (!plan || running || compacting || workspace?.planState.phase !== "ready") return;
     setError(null);
     setRunning(true);
-    setWorkspace((current) => current ? {
-      ...current,
-      collaborationMode: "default",
-      planState: { ...current.planState, phase: "executing", pendingQuestion: null },
-    } : current);
+    setPendingPlanAction("execute");
     try {
       await window.agent.request("plan.execute", {
         planId: plan.planId,
         revision: plan.revision,
         digest: plan.digest,
       });
+      await refreshSessionSnapshot();
     } catch (reason) {
       setRunning(false);
+      setPendingPlanAction(null);
+      try {
+        await refreshSessionSnapshot();
+      } catch {
+        // Keep the RPC error as the actionable message.  The last authoritative
+        // snapshot remains visible when rehydration is itself unavailable.
+      }
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  };
+
+  const handoffPlan = async () => {
+    const plan = workspace?.planState.latestRevision;
+    if (!plan || running || compacting || workspace?.planState.phase !== "ready") return;
+    setError(null);
+    setRunning(true);
+    setPendingPlanAction("handoff");
+    try {
+      const payload = await window.agent.request<WorkspacePayload>("plan.handoff", {
+        planId: plan.planId,
+        revision: plan.revision,
+        digest: plan.digest,
+      });
+      setRunning(false);
+      applyWorkspace(payload);
+    } catch (reason) {
+      setRunning(false);
+      setPendingPlanAction(null);
+      try {
+        await refreshSessionSnapshot();
+      } catch {
+        // Preserve the last authoritative state if the runtime is unavailable.
+      }
       setError(reason instanceof Error ? reason.message : String(reason));
     }
   };
@@ -945,22 +972,34 @@ export function App() {
   const readyPlan = workspace?.planState.phase === "ready"
     ? workspace.planState.latestRevision
     : null;
+  const visiblePlan = workspace?.planState.latestRevision ?? null;
   const awaitingPlanDecision = Boolean(
     readyPlan && supplementingPlanDigest !== readyPlan.digest,
   );
+  const planStatusPhase = workspace?.planState.phase;
+  const planStatusMessage = planStatusPhase === "uncertain"
+    ? "上一次执行没有可靠的终态记录，无法判断是否完成。请先检查工作区和运行记录，再决定是否重新规划或执行。"
+    : planStatusPhase === "recovery_error"
+      ? "Plan 状态记录校验失败。为避免执行错误或被篡改的 revision，当前计划已被锁定。"
+      : null;
+  const planBadgeLabel = planStatusPhase === "ready" ? "PLAN READY"
+    : planStatusPhase === "uncertain" ? "PLAN UNCERTAIN"
+      : planStatusPhase === "recovery_error" ? "PLAN RECOVERY" : "PLAN";
 
   const timelineItems = useMemo(() => selectTimelineItems(timelineState), [timelineState]);
-  const renderTimelineItems = useMemo<RenderTimelineItem[]>(() => readyPlan
+  const renderedPlan = ["ready", "uncertain", "recovery_error"].includes(planStatusPhase ?? "")
+    ? visiblePlan : null;
+  const renderTimelineItems = useMemo<RenderTimelineItem[]>(() => renderedPlan
     ? [
         ...timelineItems,
         {
-          id: `plan:${readyPlan.planId}:${readyPlan.revision}:${readyPlan.digest}`,
+          id: `plan:${renderedPlan.planId}:${renderedPlan.revision}:${renderedPlan.digest}`,
           kind: "plan",
           order: timelineState.lastOrder + 1,
-          plan: readyPlan,
+          plan: renderedPlan,
         },
       ]
-    : timelineItems, [readyPlan, timelineItems, timelineState.lastOrder]);
+    : timelineItems, [renderedPlan, timelineItems, timelineState.lastOrder]);
   const virtuosoComponents = useMemo(() => ({
     Header: () => <div className="timeline-spacer timeline-spacer--top" aria-hidden="true" />,
     Footer: () => <div className="timeline-spacer timeline-spacer--bottom" aria-hidden="true" />,
@@ -983,7 +1022,7 @@ export function App() {
     if (item.kind === "plan") {
       return (
         <div className="timeline-row">
-          <TimelinePlanCard plan={item.plan} />
+          <TimelinePlanCard plan={item.plan} badge={planBadgeLabel} />
         </div>
       );
     }
@@ -1010,7 +1049,7 @@ export function App() {
         />
       </div>
     );
-  }, [resolveApproval, workspace?.path]);
+  }, [resolveApproval, workspace?.path, planBadgeLabel]);
   const lastTimelineSignature = (() => {
     const last = renderTimelineItems.at(-1);
     if (!last) return "empty";
@@ -1153,26 +1192,56 @@ export function App() {
                     <button onClick={() => void answerPlanQuestion(customPlanAnswer)} disabled={!customPlanAnswer.trim()}>提交</button>
                   </div>
                 )}
+                <button onClick={() => void cancelPlan()} disabled={compacting}>取消规划</button>
               </section>
             )}
             {readyPlan && awaitingPlanDecision && (
               <section className="plan-question plan-decision" data-testid="plan-decision">
                 <div className="plan-question-header">
-                  <span className="plan-badge">PLAN</span>
+                  <span className="plan-badge">PLAN READY</span>
                   <strong>下一步</strong>
                 </div>
-                <p>计划已完成，下一步怎么做？</p>
+                <p>计划已提交，下一步怎么做？</p>
                 <div className="plan-options">
                   <button onClick={() => void executePlan()} disabled={running || compacting}>
-                    <strong>执行方案</strong>
+                    <strong>{pendingPlanAction === "execute" ? "正在确认…" : "执行方案"}</strong>
                     <span>确认 revision {readyPlan.revision} 并立即切回 Default 执行</span>
                   </button>
+                  <button onClick={() => void handoffPlan()} disabled={running || compacting}>
+                    <strong>{pendingPlanAction === "handoff" ? "正在创建…" : "新会话复核"}</strong>
+                    <span>只把这个 revision 交给新会话，打开后再次确认再执行</span>
+                  </button>
                   <button onClick={supplementPlan} disabled={running || compacting}>
-                    <strong>补充想法</strong>
+                    <strong>继续修改</strong>
                     <span>保持 Plan Mode，在输入框中说明要补充或修改的内容</span>
                   </button>
                 </div>
                 <button className="plan-decision-cancel" onClick={() => void cancelPlan()} disabled={running || compacting}>取消规划</button>
+              </section>
+            )}
+            {workspace?.planState.legacyCandidate && (
+              <section className="plan-status" data-testid="plan-legacy">
+                <p>检测到旧版计划候选文本，尚未形成可执行 revision。请继续规划，并通过 submit_plan 重新提交后再确认执行。</p>
+              </section>
+            )}
+            {planStatusMessage && (
+              <section className={`plan-status ${planStatusPhase}`} data-testid="plan-status">
+                <div className="plan-question-header">
+                  <span className="plan-badge">{planBadgeLabel}</span>
+                  <strong>{planStatusPhase === "uncertain" ? "执行状态不确定" : "计划恢复失败"}</strong>
+                </div>
+                <p>{planStatusMessage}</p>
+                {workspace?.planState.recoveryError && (
+                  <pre>{workspace.planState.recoveryError.code}: {workspace.planState.recoveryError.message}</pre>
+                )}
+                <details>
+                  <summary>查看记录详情</summary>
+                  <pre>{JSON.stringify(workspace?.planState.latestRun ?? workspace?.planState.recoveryError, null, 2)}</pre>
+                </details>
+                <div className="plan-options">
+                  <button onClick={() => void enterPlanMode()} disabled={running || compacting}>重新规划</button>
+                  <button onClick={() => void cancelPlan()} disabled={running || compacting}>取消规划</button>
+                </div>
               </section>
             )}
             {commandMenuOpen && (
@@ -1236,9 +1305,9 @@ export function App() {
                   : supplementingPlanDigest === readyPlan?.digest
                     ? "补充你的想法或修改要求…"
                     : awaitingPlanDecision
-                      ? "请先选择执行方案或补充想法"
+                      ? "请先选择执行、新会话复核或继续修改"
                       : "描述你想完成的任务…"}
-                disabled={!workspace || awaitingPlanDecision || compacting}
+                disabled={!workspace || awaitingPlanDecision || compacting || Boolean(planStatusMessage)}
                 rows={3}
               />
               <div className="composer-footer">
@@ -1255,7 +1324,9 @@ export function App() {
                     onClick={() => void enterPlanMode()}
                     disabled={!workspace || running || compacting}
                   >Plan</button>
-                  {workspace?.collaborationMode === "plan" && <span className="plan-badge">PLAN</span>}
+                  {(workspace?.collaborationMode === "plan" || planStatusMessage) && (
+                    <span className="plan-badge">{planBadgeLabel}</span>
+                  )}
                 </div>
                 <span>Enter 发送 · Shift+Enter 换行</span>
                 {running ? (

@@ -62,6 +62,8 @@ class Args:
     agent_mode: str | None = None
     answer_plan_question: str | None = None
     execute_plan: int | None = None
+    #: ``0`` means use the latest ready revision; positive values pin one.
+    handoff_plan: int | None = None
     cancel_plan: bool = False
     export_path: str | None = None
     list_models: str | None = None  # None=off, ""=all, "str"=search
@@ -115,6 +117,21 @@ def _validate_thinking(value: str) -> str:
 def _parse_comma_list(value: str) -> list[str]:
     """解析逗号分隔的列表参数，并过滤空字符串。"""
     return [s.strip() for s in value.split(",") if s.strip()]
+
+
+def _parse_positive_revision(value: str | int) -> int:
+    """Parse an explicitly supplied Plan revision.
+
+    ``0`` is reserved internally as the ``--handoff-plan`` "latest" sentinel
+    and is never accepted from command-line text.
+    """
+    try:
+        revision = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("Plan revision 必须是正整数") from exc
+    if revision < 1:
+        raise argparse.ArgumentTypeError("Plan revision 必须是正整数")
+    return revision
 
 
 # ─── Parser construction ──────────────────────────────────────────────────
@@ -300,8 +317,16 @@ def build_parser() -> argparse.ArgumentParser:
     plan_control.add_argument(
         "--execute-plan",
         metavar="REVISION",
-        type=int,
+        type=_parse_positive_revision,
         help="执行恢复会话中的指定最新 Plan revision",
+    )
+    plan_control.add_argument(
+        "--handoff-plan",
+        metavar="REVISION",
+        nargs="?",
+        const=0,
+        type=_parse_positive_revision,
+        help="将指定（默认最新）Plan revision 交接到新会话复核，不立即执行",
     )
     plan_control.add_argument(
         "--cancel-plan",
@@ -459,6 +484,7 @@ def _apply_namespace(args: Args, ns: argparse.Namespace) -> None:
     args.agent_mode = ns.agent_mode
     args.answer_plan_question = ns.answer_plan_question
     args.execute_plan = ns.execute_plan
+    args.handoff_plan = ns.handoff_plan
     args.cancel_plan = ns.cancel_plan
     args.export_path = ns.export_path
     args.list_models = ns.list_models  # None=off, ""=all, "str"=search
@@ -488,7 +514,12 @@ def resolve_app_mode(args: Args) -> str:
     """
     if args.print_mode:
         return "print"
-    if args.answer_plan_question or args.execute_plan is not None or args.cancel_plan:
+    if (
+        args.answer_plan_question
+        or args.execute_plan is not None
+        or args.handoff_plan is not None
+        or args.cancel_plan
+    ):
         return "print"
     if getattr(args, "output_mode", "text") == "json":
         return "print"

@@ -27,7 +27,7 @@ from typing import Any
 from agent_llm import TextContent
 
 from agent_core.tools._mutation import file_mutation_lock
-from agent_core.types import AgentToolResult
+from agent_core.types import AgentToolResult, PlanAccess
 
 EDIT_SCHEMA: dict = {
     "type": "object",
@@ -306,6 +306,7 @@ class EditTool:
 
     name: str = "edit"
     effect: str = "write"
+    plan_access: PlanAccess = "deny"
     label: str = "edit"
     description: str = (
         "Edit a single file using exact text replacement. Every edits[].oldText "

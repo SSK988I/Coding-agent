@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 from agent_core import SessionManager
-from agent_llm import AssistantMessage, Model, ModelCost, TextContent, UserMessage
+from agent_llm import AssistantMessage, Model, ModelCost, TextContent, ToolCall, UserMessage
 
 from coding_agent.core.agent_session import AgentSession, AgentSessionConfig
 from coding_agent.memory.types import MemoryContext, MemoryIdentity
@@ -72,6 +72,15 @@ class _MemoryService:
                 await self.worker_task
             except asyncio.CancelledError:
                 pass
+
+
+def _submit(session: AgentSession, title: str, markdown: str) -> None:
+    call = ToolCall(
+        id="submit-memory", name="submit_plan",
+        arguments={"title": title, "markdown": markdown},
+    )
+    session.session_manager.append_message(AssistantMessage(content=[call], stop_reason="tool_use"))
+    asyncio.run(session._submit_plan(call.id, title, markdown))
 
 
 def test_prompt_retrieves_transient_context_and_queues_user_evidence(tmp_path: Path) -> None:
@@ -320,12 +329,12 @@ Run tests.
 ## Assumptions
 Local only.
 </proposed_plan>"""
-    session._capture_plan_revision(AssistantMessage(content=[TextContent(text=plan_text)]))
+    _submit(session, "Memory plan", plan_text)
     latest = session.plan_state.latest_revision
     assert latest is not None
     assert memory.tasks == []
 
-    async def fake_execute_prompt(_message: str) -> None:
+    async def fake_execute_prompt(_message: str, **_kwargs) -> None:
         session._last_assistant_message = AssistantMessage(
             content=[TextContent(text="implemented")], stop_reason="stop",
         )
@@ -333,9 +342,9 @@ Local only.
     session.prompt = fake_execute_prompt  # type: ignore[method-assign]
     asyncio.run(session.execute_plan(latest.plan_id, latest.revision, latest.digest))
 
-    assert [task.mode for task in memory.tasks] == ["plan_accepted", "plan_completed"]
+    assert [task.mode for task in memory.tasks] == ["plan_accepted"]
     assert memory.tasks[0].evidence[0].source_kind == "accepted_plan"
-    assert memory.tasks[1].evidence[0].source_kind == "plan_completed"
+    assert session.plan_state.phase == "settled"
 
 
 def test_aborted_plan_execution_does_not_create_completed_memory(tmp_path: Path) -> None:
@@ -363,11 +372,11 @@ Run tests.
 ## Assumptions
 Local only.
 </proposed_plan>"""
-    session._capture_plan_revision(AssistantMessage(content=[TextContent(text=plan_text)]))
+    _submit(session, "Abort plan", plan_text)
     latest = session.plan_state.latest_revision
     assert latest is not None
 
-    async def fake_execute_prompt(_message: str) -> None:
+    async def fake_execute_prompt(_message: str, **_kwargs) -> None:
         session._last_assistant_message = AssistantMessage(
             content=[TextContent(text="aborted")], stop_reason="aborted",
         )

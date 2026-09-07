@@ -449,9 +449,13 @@ def main(argv: list[str] | None = None) -> int:
             print("错误：--answer-plan-question 必须且只能附带一个位置参数作为答案。", file=sys.stderr)
             return 2
         control_answer = args.messages[0]
-    elif args.execute_plan is not None or args.cancel_plan:
+    elif (
+        args.execute_plan is not None
+        or args.handoff_plan is not None
+        or args.cancel_plan
+    ):
         if args.messages or args.file_args or stdin_content is not None:
-            print("错误：执行或取消计划时不能附带普通提示词。", file=sys.stderr)
+            print("错误：执行、交接或取消计划时不能附带普通提示词。", file=sys.stderr)
             return 2
 
     file_text = ""
@@ -537,16 +541,22 @@ def main(argv: list[str] | None = None) -> int:
         and session.collaboration_mode == "plan"
         and not args.cancel_plan
         and args.execute_plan is None
+        and args.handoff_plan is None
     ):
         print(
             "错误：恢复中的 Plan 会话不能用 --agent-mode default 绕过确认；"
-            "请使用 --cancel-plan 或 --execute-plan。",
+            "请使用 --cancel-plan、--execute-plan 或 --handoff-plan。",
             file=sys.stderr,
         )
         session.dispose()
         return 2
 
-    if args.answer_plan_question or args.execute_plan is not None or args.cancel_plan:
+    if (
+        args.answer_plan_question
+        or args.execute_plan is not None
+        or args.handoff_plan is not None
+        or args.cancel_plan
+    ):
         return _run_plan_control(
             session, args, answer=control_answer, mode=args.output_mode,
         )
@@ -734,6 +744,19 @@ def _run_plan_control(
                 await session.answer_plan_question(args.answer_plan_question, answer or "")
             elif args.cancel_plan:
                 session.cancel_plan_mode(session.plan_state.active_plan_id)
+            elif args.handoff_plan is not None:
+                latest = session.plan_state.latest_revision
+                if latest is None:
+                    raise PlanModeError("PLAN_NOT_READY", "当前没有可交接的计划")
+                requested_revision = args.handoff_plan or latest.revision
+                target = session.handoff_plan_to_new_session(
+                    latest.plan_id, requested_revision, latest.digest,
+                )
+                if mode == "text":
+                    print(
+                        f"Plan 已交接到新会话 {target.header.id}；请在新会话复核后执行。",
+                        file=sys.stderr,
+                    )
             else:
                 latest = session.plan_state.latest_revision
                 requested_revision = args.execute_plan
@@ -751,7 +774,9 @@ def _run_plan_control(
         if mode == "text":
             sys.stdout.write("\n")
             _print_plan_resume_hint(session)
-        return 1 if session.plan_state.phase in {"failed", "aborted"} else 0
+        return 1 if session.plan_state.phase in {
+            "failed", "aborted", "uncertain", "recovery_error",
+        } else 0
 
     async def _entry() -> int:
         try:
@@ -777,13 +802,27 @@ def _print_plan_resume_hint(session: AgentSession) -> None:
             f"--answer-plan-question {question.question_id} \"<answer>\"",
             file=sys.stderr,
         )
-    elif state.mode == "plan" and state.latest_revision is not None:
+    elif state.phase == "ready" and state.latest_revision is not None:
         revision = state.latest_revision
         print(
             f"下一步：coding-agent --session {session_id} --execute-plan {revision.revision} "
-            f"（或 --cancel-plan）",
+            f"（或 --handoff-plan {revision.revision} / --cancel-plan）",
             file=sys.stderr,
         )
+    elif state.phase == "drafting":
+        print(
+            f"下一步：coding-agent --session {session_id} -p \"继续完善并提交计划\"",
+            file=sys.stderr,
+        )
+    elif state.phase == "uncertain":
+        print(
+            "Plan 执行终态未知；不会自动重试。请恢复会话检查记录，或显式开始新的规划。",
+            file=sys.stderr,
+        )
+    elif state.phase == "recovery_error":
+        error = getattr(state, "recovery_error", None)
+        detail = getattr(error, "message", "持久化 Plan 状态校验失败")
+        print(f"Plan 恢复失败：{detail}", file=sys.stderr)
 
 
 def _json_default(obj: Any) -> Any:

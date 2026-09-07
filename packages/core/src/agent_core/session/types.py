@@ -141,6 +141,8 @@ class CollaborationModeChangeEntry(SessionEntry):
     type: Literal["collaboration_mode_change"] = "collaboration_mode_change"
     mode: Literal["default", "plan"] = "default"
     plan_id: str | None = None
+    reason: Literal["user", "handoff"] | None = None
+    related_session_id: str | None = None
 
 
 @dataclass(kw_only=True)
@@ -177,6 +179,9 @@ class PlanRevisionEntry(SessionEntry):
     markdown: str = ""
     digest: str = ""
     source_message_id: str = ""
+    schema_version: int = 0
+    submitted_by_tool_call_id: str = ""
+    origin_session_id: str | None = None
 
 
 @dataclass(kw_only=True)
@@ -190,6 +195,8 @@ class PlanRunEntry(SessionEntry):
     status: Literal["started", "completed", "failed", "aborted"] = "started"
     run_id: str | None = None
     error: str | None = None
+    assistant_message_id: str | None = None
+    stop_reason: str | None = None
 
 
 # ─── 会话树节点（供 UI 渲染） ──────────────────────────────────────────

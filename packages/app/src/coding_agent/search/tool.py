@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from agent_core import AgentToolResult
+from agent_core.types import PlanAccess
 from agent_llm import TextContent
 
 from coding_agent.search.backend import SearchBackend
@@ -15,6 +16,7 @@ class WebSearchTool:
     name = "web_search"
     label = "web search"
     effect = "read"
+    plan_access: PlanAccess = "deny"
     execution_mode = "parallel"
     description = (
         "Search the public web for current information and return source URLs. "

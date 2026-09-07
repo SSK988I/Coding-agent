@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 import subprocess
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 from coding_agent.modes.interactive.components.footer import FooterComponent
 
@@ -59,7 +60,8 @@ class FakeSession:
     """Minimal session stub for footer render tests."""
 
     def __init__(self, *, model=None, thinking_level="high", entries=None,
-                 tokens_in=0, tokens_out=0, cost=0.0, cwd="."):
+                 tokens_in=0, tokens_out=0, cost=0.0, cwd=".",
+                 collaboration_mode="default", plan_phase="idle"):
         self.model = model or _FakeModel()
         self.thinking_level = thinking_level
         self.cwd = cwd
@@ -67,6 +69,8 @@ class FakeSession:
         self._tokens_in = tokens_in
         self._tokens_out = tokens_out
         self._cost = cost
+        self.collaboration_mode = collaboration_mode
+        self.plan_state = SimpleNamespace(phase=plan_phase)
         self.session_manager = type("SM", (), {"get_branch": self._branch})()
 
     def _branch(self):
@@ -80,8 +84,7 @@ class FakeSession:
 
 def _make(**kw) -> "tuple[FooterComponent, FakeSession]":
     sess = FakeSession(**kw)
-    # Stub out git so refresh doesn't actually run git in tests.
-    sess.cwd = "."
+    # Construct without __init__, so refresh_git_branch never spawns Git.
     footer = FooterComponent.__new__(FooterComponent)
     footer._session = sess
     footer._theme = _theme()
@@ -108,6 +111,37 @@ def test_no_thinking_when_model_not_reasoning():
     footer, _ = _make(model=_FakeModel(reasoning=False), thinking_level="high")
     line = _strip(footer.render(120)[0])
     assert "thinking" not in line
+
+
+# ── Plan state ─────────────────────────────────────────────────────────
+
+
+def test_plan_footer_labels_are_state_aware():
+    cases = {
+        "drafting": "plan",
+        "awaiting_answer": "plan",
+        "ready": "plan ready",
+        "executing": "plan",
+        "uncertain": "plan uncertain",
+        "recovery_error": "plan recovery",
+    }
+    for phase, expected in cases.items():
+        mode = "plan" if phase in {"drafting", "awaiting_answer", "ready"} else "default"
+        footer, _ = _make(collaboration_mode=mode, plan_phase=phase)
+        line = _strip(footer.render(120)[0])
+        assert expected in line
+        assert "mode plan" not in line
+
+
+def test_plan_recovery_label_survives_narrow_footer():
+    footer, _ = _make(
+        collaboration_mode="default",
+        plan_phase="recovery_error",
+        model=_FakeModel(id="very-long-model-name"),
+        cwd="C:/a/very/long/project/path/that/would/hide/the/state",
+    )
+    line = _strip(footer.render(24)[0])
+    assert "plan recovery" in line
 
 
 # ── tokens + context ───────────────────────────────────────────────────
