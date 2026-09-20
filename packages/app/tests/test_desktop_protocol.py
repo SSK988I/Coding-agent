@@ -28,6 +28,26 @@ def test_to_jsonable_handles_runtime_values(tmp_path: Path) -> None:
     assert sorted(value["values"]) == ["read", "write"]
 
 
+@pytest.mark.parametrize("outcome", ["completed", "failed", "cancelled"])
+def test_desktop_run_projects_agent_outcome_not_coroutine_return(outcome: str) -> None:
+    import asyncio
+
+    events: list[dict] = []
+    runtime = DesktopRuntime(events.append)
+
+    async def prompt(_text):
+        pass  # Provider failures can be returned as messages rather than raised.
+
+    session = SimpleNamespace(
+        prompt=prompt, get_stats=lambda: {},
+        agent=SimpleNamespace(last_run_status=outcome, state=SimpleNamespace(error_message="provider failed")),
+    )
+    asyncio.run(runtime._drive_run(session, "hello", "run-1"))
+    assert events[-1]["event"]["type"] == f"run.{outcome}"
+    if outcome == "failed":
+        assert events[-1]["event"]["payload"]["message"] == "provider failed"
+
+
 def test_parse_request_accepts_versioned_rpc() -> None:
     request = parse_request('{"v":1,"id":"1","method":"runtime.ping"}')
     assert request["params"] == {}
@@ -96,7 +116,7 @@ def test_desktop_command_catalog_only_exposes_supported_commands() -> None:
     commands = asyncio.run(DesktopRuntime(lambda _event: None)._command_list({}))
 
     assert [command["name"] for command in commands] == [
-        "help", "clear", "model", "compact", "session", "new",
+        "help", "clear", "model", "compact", "subagents", "session", "new",
         "plan", "cancel-plan", "execute-plan", "memory",
     ]
 

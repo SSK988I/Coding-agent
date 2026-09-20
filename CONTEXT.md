@@ -16,6 +16,9 @@ Coding Agent is one local programming agent with two presentation adapters: a te
 - **Session branch**: the active root-to-leaf JSONL entry path used to rebuild messages, settings, and Plan State.
 - **Development tool**: read/write/shell tool exposed to the model.
 - **Control tool**: host interaction such as `request_user_input`; it remains available when development tools are disabled.
+- **Context pivot**: user-directed compaction into a next-phase brief on the same branch. It changes model context, not Plan authorization or the original history.
+- **Read-only subagent**: a bounded independent investigation or review. It receives an explicit brief and reports findings; it cannot inherit parent write/control capabilities.
+- **Tool outcome**: the runtime's terminal result, distinct from task verification. Missing evidence stays unknown after recovery.
 
 ## Ownership boundaries
 

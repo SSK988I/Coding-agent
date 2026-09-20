@@ -79,15 +79,25 @@ async def _summarize_via_stream(
         options["reasoning"] = reasoning
 
     event_stream = stream_fn(model, context, options or None)
-    # Drain.
-    async for _ in event_stream:
-        pass
-    final = await event_stream.result()
+    try:
+        async for _ in event_stream:
+            pass
+        final = await event_stream.result()
+    finally:
+        close = getattr(event_stream, "aclose", None)
+        if close is not None:
+            await close()
+    if getattr(final, "stop_reason", "stop") != "stop":
+        raise ValueError("Summary did not finish successfully; original context retained")
     # Extract text.
     text = ""
     for b in getattr(final, "content", []) or []:
         if getattr(b, "type", None) == "text":
             text += getattr(b, "text", "") or ""
+    if not text.strip():
+        raise ValueError("Summary is empty; original context retained")
+    if len(text.encode("utf-8")) > 65536:
+        raise ValueError("Summary exceeds 64 KiB; original context retained")
     return text
 
 

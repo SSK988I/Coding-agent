@@ -168,7 +168,7 @@ uv run coding-agent --session <session-id> --handoff-plan [revision]
 uv run coding-agent --session <session-id> --cancel-plan
 ```
 
-Plan State is reduced from the active JSONL v4 branch and can be resumed by either the CLI or desktop client. A bare `/plan` restores state-aware controls for drafting, pending questions, ready revisions, active execution, or recovery. Ready plans can be executed in place or handed to a clean child session for a second review; supplemental text returns the episode to drafting and never authorizes execution. `settled` means the Agent turn ended, not that its result was verified, and cancelling/stopping does not roll back effects already performed. See the [Plan Mode Specification](docs/specs/plan-mode.md) and [architecture decision](docs/adr/0001-centralize-collaboration-mode-policy.md).
+Plan State is reduced from the active JSONL v4 branch and can be resumed by either the CLI or desktop client. In Default mode, `/plan` enters Plan directly and leaves the editor ready for the user's objective; while already in Plan, `/plan` opens the state-aware controls for drafting, pending questions, ready revisions, active execution, or recovery. Ready plans can be executed in place or handed to a clean child session for a second review; supplemental text returns the episode to drafting and never authorizes execution. `settled` means the Agent turn ended, not that its result was verified, and cancelling/stopping does not roll back effects already performed. See the [Plan Mode Specification](docs/specs/plan-mode.md) and [architecture decision](docs/adr/0001-centralize-collaboration-mode-policy.md).
 
 ### Provider and model selection
 
@@ -237,9 +237,11 @@ Images can only be sent to models whose catalog entries declare `image` input su
 | `find` | Find files by name or pattern |
 | `ls` | List directory contents |
 | `bash` | Execute shell commands |
+| `subagent_spawn` | Start a bounded read-only investigation or review with an independent context |
+| `subagent_status`, `subagent_wait`, `subagent_cancel` | Inspect, wait for, or stop a task on the active session branch |
 | `web_search` | Search the public web through native DeepSeek Responses or the configured Remote MCP fallback; enabled by default |
 
-Tools expose their name, description, JSON Schema parameters, and asynchronous execution method through a common interface. The agent runtime validates arguments before execution and emits start, update, and end events. Embedding frontends can use before/after hooks for approval, auditing, or result transformation.
+Tools expose their name, description, JSON Schema parameters, and asynchronous execution method through a common interface. The agent runtime validates arguments and approval before emitting the running event. Terminal results distinguish failure, cancellation, timeout, denial and unknown outcomes; a nonzero shell exit is a failure. Embedding frontends can use before/after hooks for approval, auditing, or result transformation.
 
 ## Terminal commands
 
@@ -296,6 +298,36 @@ Session files are append-only. In addition to user and assistant messages, they 
 If a task is interrupted before a tool finishes, the next LLM request inserts an error `toolResult` for the missing result at the model boundary. This prevents providers from rejecting an incomplete `tool_calls` history without overwriting the original JSONL file.
 
 ## Architecture
+
+### Long tasks and independent review
+
+Both interactive clients support these commands:
+
+```text
+/compact
+/compact implement the selected design and focus on verification
+/subagents spawn inspect the cancellation path and cite file/line evidence
+/subagents review check the plan for missing failure cases
+/subagents show TASK_ID
+/subagents cancel TASK_ID
+```
+
+Plain `/compact` keeps the existing recent-context behavior. A direction turns
+it into a next-phase brief: the active model context is replaced, while the
+same session's original JSONL history and Plan state are retained. It does not
+start the next phase. Esc in the TUI or **停止压缩** on desktop cancels it.
+
+Read-only subagents receive the supplied brief, not the parent conversation.
+They can read/search files and use structured Git readers, but cannot write,
+run shell commands, execute tests/builds, change Plan state or delegate again.
+Use `/subagents` to inspect tasks. The ready Plan controls also offer a
+read-only review without a session handoff or execution confirmation.
+
+Task reports are advisory. A restored task without a live owner is shown as
+unknown and is never restarted automatically. Limits, persistence and RPC
+contracts are documented in [Long-task runtime](docs/specs/long-task-runtime.md).
+
+## Package layout
 
 ```text
 Coding-agent/

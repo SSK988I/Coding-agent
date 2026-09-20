@@ -10,7 +10,8 @@
     "build:renderer": "vite build",
     "build": "pnpm run build:electron && pnpm run build:renderer",
     "typecheck": "tsc -p tsconfig.electron.json --noEmit && tsc -p tsconfig.renderer.json --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:smoke": "pnpm build && electron tests/electron.smoke.cjs"
   },
   "dependencies": {
     "react": "^19.2.8",

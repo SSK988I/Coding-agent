@@ -64,6 +64,7 @@ def retrying_stream(
     async def _drive() -> None:
         for attempt in range(policy.max_retries + 1):
             inner = factory()
+            outer.track_child(inner)
             buffered: list[AssistantMessageEvent] = []
             emitted_content = False
             terminal: AssistantMessageEvent | None = None
@@ -129,7 +130,7 @@ def retrying_stream(
             outer.end(error or final)
             return
 
-    asyncio.ensure_future(_drive())
+    outer.set_producer(asyncio.ensure_future(_drive()))
     return outer
 
 

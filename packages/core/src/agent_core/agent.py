@@ -17,7 +17,7 @@ steering, follow-up messages, and queue clearing.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Literal
 
 from agent_llm import AssistantMessage, Message, Model, TextContent, Usage, UsageCost
 
@@ -115,6 +115,7 @@ class Agent:
         )
         self._listeners: list[Callable[[AgentEvent, asyncio.Event], "Awaitable[None] | None"]] = []
         self._active_run: _ActiveRun | None = None
+        self.last_run_status: Literal["completed", "failed", "cancelled"] | None = None
         self.convert_to_llm = convert_to_llm
         self.stream_fn = stream_fn
         self.get_api_key = get_api_key
@@ -234,6 +235,7 @@ class Agent:
         self._state.streaming_message = None
         self._state.pending_tool_calls = set()
         self._state.error_message = None
+        self.last_run_status = None
 
     def load_messages(self, messages: list) -> None:
         """Replace the transcript with the given messages (for session resume).
@@ -295,6 +297,7 @@ class Agent:
         abort_event = asyncio.Event()
         done = asyncio.Event()
         self._active_run = _ActiveRun(abort_event=abort_event, done=done)
+        self.last_run_status = None
 
         self._state.is_streaming = True
         self._state.streaming_message = None
@@ -302,9 +305,16 @@ class Agent:
 
         try:
             await executor(abort_event)
+        except asyncio.CancelledError:
+            abort_event.set()
+            raise
         except Exception as e:  # noqa: BLE001
             await self._handle_run_failure(e, abort_event.is_set())
         finally:
+            if abort_event.is_set():
+                self.last_run_status = "cancelled"
+            elif self.last_run_status is None:
+                self.last_run_status = "completed"
             self._finish_run()
 
     async def _handle_run_failure(self, error: Any, aborted: bool) -> None:
@@ -343,6 +353,12 @@ class Agent:
             self._state.streaming_message = event["message"]
         elif etype == "message_end":
             self._state.streaming_message = None
+            message = event["message"]
+            if getattr(message, "role", None) == "assistant":
+                if getattr(message, "stop_reason", None) == "error":
+                    self.last_run_status = "failed"
+                elif getattr(message, "stop_reason", None) == "aborted":
+                    self.last_run_status = "cancelled"
             self._state.messages.append(event["message"])
             # Persist user + assistant messages to the session (if attached).
             if self.session_manager is not None:

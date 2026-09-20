@@ -43,6 +43,31 @@ class EventStream(Generic[T, R]):
         self._queue: asyncio.Queue[T | None] = asyncio.Queue()
         self._done = False
         self._result_future: asyncio.Future[R] = asyncio.get_event_loop().create_future()
+        self._producer: asyncio.Future[Any] | None = None
+        self._children: list[EventStream] = []
+
+    def set_producer(self, producer: asyncio.Future[Any]) -> None:
+        """Give the consumer ownership of the background producer's lifetime."""
+        self._producer = producer
+
+    def track_child(self, child: EventStream) -> None:
+        self._children.append(child)
+
+    async def aclose(self) -> None:
+        """Stop the producer and its delegated streams when consumption ends."""
+        producer = self._producer
+        if producer is not None and producer is not asyncio.current_task():
+            if not producer.done() and not self._done:
+                producer.cancel()
+            try:
+                await producer
+            except asyncio.CancelledError:
+                pass
+        for child in self._children:
+            close = getattr(child, "aclose", None)
+            if close is not None:
+                await close()
+        self._children.clear()
 
     # ── 生产者 API ──────────────────────────────────────────────────────
 
@@ -110,6 +135,12 @@ class AssistantMessageEventStream(EventStream[AssistantMessageEvent, AssistantMe
     def __init__(self) -> None:
         super().__init__(is_complete=_is_terminal_event, extract_result=_extract_terminal_message)
 
+    async def aclose(self) -> None:
+        await super().aclose()
+        if not self._done:
+            message = AssistantMessage(stop_reason="aborted", error_message="Stream cancelled")
+            self.push({"type": "error", "reason": "aborted", "error": message})
+
 
 def _is_terminal_event(event: AssistantMessageEvent) -> bool:
     return event.get("type") in ("done", "error")
@@ -164,6 +195,8 @@ def lazy_stream(
     async def _drive() -> None:
         try:
             inner = await setup()
+            if isinstance(inner, EventStream):
+                outer.track_child(inner)
             async for event in inner:
                 outer.push(event)
             outer.end()
@@ -174,5 +207,5 @@ def lazy_stream(
 
     # 在运行中的 loop 上 fire-and-forget 这个驱动协程。异常都在 _drive
     # 内部处理了,所以这里不会冒出未处理任务错误。
-    asyncio.ensure_future(_drive())
+    outer.set_producer(asyncio.ensure_future(_drive()))
     return outer

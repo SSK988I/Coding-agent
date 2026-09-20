@@ -70,14 +70,21 @@ or aborting the wait preserves the pending question for another client.
 
 A bare `/plan` is state-aware:
 
-- `idle`: start a new Plan Episode.
+- Default mode (`idle`, `settled`, `failed`, `aborted` or `cancelled`): start a
+  new Plan Episode and leave the editor ready for the user's objective; no
+  action menu is opened on entry.
 - `drafting`: continue, ask the assistant to submit, or cancel.
 - `awaiting_answer`: restore the pending question or cancel.
 - `ready`: supplement, execute here, hand off for clean-session review, or
   cancel.
 - `executing`: inspect status or request stop.
 - `uncertain` / `recovery_error`: inspect details, start a new Plan Episode, or
-  cancel. The old run is never retried automatically.
+  cancel. The old run is never retried automatically. `executing` and these
+  recovery states take precedence over the projected collaboration mode.
+
+The TUI and desktop client use the same state decision. Drafting controls are
+opened only by an explicit second `/plan` (or the equivalent Plan action); a
+startup, resume or state event keeps the drafting editor available.
 
 `/cancel-plan` and `/execute-plan` remain compatibility aliases. Non-interactive
 controls are:
@@ -173,9 +180,28 @@ snapshot. `session.snapshot` likewise includes `collaborationMode` and
 optimistically advance mode or phase.
 
 TUI startup, session creation, branch switching and handoff all rehydrate the
-question/action component from Core state. The footer displays `plan`,
-`plan ready`, `plan uncertain` or `plan recovery`. Desktop uses the same
-snapshot and refetches it after a rejected control request.
+question, ready or recovery component from Core state; drafting keeps the
+editor available until the user explicitly runs `/plan` again. The footer
+displays `plan`, `plan ready`, `plan uncertain` or `plan recovery`. Desktop
+uses the same snapshot and refetches it after a rejected control request.
+
+Clicking **整理并提交** immediately shows progress and a stop control. The
+indicator lasts until submission, a structured question, cancellation or a
+failed/finished run. If a run ends without `submit_plan`, the UI explicitly says
+that no plan was submitted and offers continuing or submitting again.
+
+Read-only subagent review is also available from the ready controls (in the
+desktop sidebar). It leaves the exact ready revision and its confirmation
+unchanged. The child receives a review brief, not a cloned planning conversation;
+its report is not an execution authorization. During drafting, the model may
+use `subagent_spawn/status/wait/cancel` under the same Plan gate. Child tools
+are limited to fresh built-in readers and structured Git tools; no Plan controls
+are registered in the child.
+
+`/compact <direction>` preserves the active branch's Plan state and original
+entries while replacing the model context with a next-phase brief. It does not
+hand off or execute. See [Long-task runtime](long-task-runtime.md) for task limits
+and recovery behavior.
 
 ## Acceptance criteria
 
