@@ -21,7 +21,12 @@ from agent_core.session.prompts import (
     UPDATE_SUMMARIZATION_PROMPT,
     serialize_conversation,
 )
-from agent_core.session.types import CompactionDetails, CompactionPreparation, CompactionResult
+from agent_core.session.types import (
+    CompactionDetails,
+    CompactionPreparation,
+    CompactionResult,
+    validate_compaction_summary,
+)
 from agent_core.types import StreamFn
 
 __all__ = ["compact", "generate_summary", "format_file_operations"]
@@ -96,8 +101,7 @@ async def _summarize_via_stream(
             text += getattr(b, "text", "") or ""
     if not text.strip():
         raise ValueError("Summary is empty; original context retained")
-    if len(text.encode("utf-8")) > 65536:
-        raise ValueError("Summary exceeds 64 KiB; original context retained")
+    validate_compaction_summary(text)
     return text
 
 
@@ -182,6 +186,7 @@ async def compact(
         )
 
     summary += format_file_operations(preparation.file_ops)
+    validate_compaction_summary(summary)
 
     details: CompactionDetails | None = None
     if preparation.file_ops is not None:

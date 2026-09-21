@@ -51,6 +51,7 @@ from agent_core.session.types import (
     SessionTreeNode,
     SubagentTaskEntry,
     ThinkingLevelChangeEntry,
+    validate_compaction_summary,
 )
 
 __all__ = ["SessionManager"]
@@ -282,6 +283,7 @@ class SessionManager:
         from_hook: bool = False,
     ) -> CompactionEntry:
         """Append a compaction marker."""
+        validate_compaction_summary(result.summary)
         entry = CompactionEntry(
             type="compaction",
             id=self._next_entry_id(),

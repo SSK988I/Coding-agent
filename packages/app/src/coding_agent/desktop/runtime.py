@@ -541,7 +541,7 @@ class DesktopRuntime:
         text = params.get("text")
         if not isinstance(text, str) or not text.strip():
             raise RpcError("INVALID_PARAMS", "run.steer 需要非空 text")
-        session = self._require_session()
+        session = self._require_queueable_run(params)
         session.agent.steer(text)
         return {"queued": True}
 
@@ -549,9 +549,25 @@ class DesktopRuntime:
         text = params.get("text")
         if not isinstance(text, str) or not text.strip():
             raise RpcError("INVALID_PARAMS", "run.followUp 需要非空 text")
-        session = self._require_session()
+        session = self._require_queueable_run(params)
         session.agent.follow_up(text)
         return {"queued": True}
+
+    def _require_queueable_run(self, params: dict[str, Any]) -> AgentSession:
+        session = self._require_session()
+        for key in ("runId", "sessionId"):
+            if key in params and (not isinstance(params[key], str) or not params[key]):
+                raise RpcError("INVALID_PARAMS", f"{key} 必须是非空字符串")
+        if self._run_task is None or self._run_task.done() or self._run_id is None:
+            raise RpcError("NO_ACTIVE_RUN", "没有可接收补充指令的运行")
+        if (
+            ("runId" in params and params["runId"] != self._run_id)
+            or ("sessionId" in params and params["sessionId"] != session.session_manager.header.id)
+        ):
+            raise RpcError("STALE_RUN", "运行或会话已变化，请刷新后重试")
+        if not session.agent.is_accepting_messages:
+            raise RpcError("RUN_NOT_ACCEPTING_MESSAGES", "当前运行正在准备、收尾或停止，不能接收补充指令")
+        return session
 
     async def _before_tool_call(
         self,

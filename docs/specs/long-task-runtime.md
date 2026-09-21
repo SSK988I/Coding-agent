@@ -53,6 +53,29 @@ Desktop calls `session.compact` with an optional `direction`, displays progress,
 and uses `run.abort` to stop it. TUI uses the same Core method and Esc. No new
 session is created by compaction.
 
+## Desktop control requests and queued input
+
+The stdio reader keeps accepting requests while a handler is waiting. Ordinary
+state changes run in arrival order. `run.abort`, `approval.resolve`,
+`run.steer`, `run.followUp`, `runtime.ping` and subagent wait/cancel requests
+run outside that queue, so compaction and child waits cannot block stopping work.
+Responses may arrive out of order and retain their request IDs.
+
+EOF or `runtime.dispose` cancels and joins outstanding request handlers before
+closing the session. Queued state changes are discarded on disconnect.
+
+Steering and follow-up strings become user messages before entering the Agent
+queues. Steering is consumed before the next model turn; follow-up is consumed
+when the current inner loop ends. Consumed messages use the normal transcript
+and persistence path. `queued: true` acknowledges acceptance, not consumption:
+cancellation, failure or a terminating control tool can end the run first.
+
+Desktop queue requests require a live, accepting Agent loop. Calls during
+preparation, cleanup or cancellation are rejected. Callers can include `runId`
+and `sessionId` to reject stale targets; omitting them addresses the current run
+for compatibility. Remaining input is cleared when a run ends or its transcript
+is replaced, so it cannot enter a later task or restored session.
+
 ## Read-only subagents
 
 The parent can use `subagent_spawn`, `subagent_status`, `subagent_wait` and
@@ -109,6 +132,10 @@ Session operations do not undo filesystem, Git or external side effects.
 ## Offline verification
 
 Core tests use fake streams, temporary repositories and session files. Desktop
+transport tests drive the actual stdio loop and a subprocess over OS pipes,
+covering cancellation during compaction, child waits, response IDs, serialized
+state changes, shutdown and delivery of queued input to the model and transcript.
+They make no provider calls. Renderer
 Vitest covers action routing, immediate feedback, authoritative recovery and stale
 session events. `pnpm test:smoke` in `apps/desktop` builds the production renderer
 and drives a hidden Electron window with a fixture-only bridge and blocked network.

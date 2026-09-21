@@ -29,6 +29,7 @@ from agent_core.session.types import (
     CompactionPreparation,
     CompactionResult,
     CompactionSettings,
+    validate_compaction_summary,
 )
 
 __all__ = [
@@ -183,6 +184,7 @@ class CompactionOrchestrator:
                 if result.details is None:
                     result.details = CompactionDetails()
                 result.details.context_pivot_direction = direction
+            validate_compaction_summary(result.summary)
             # Materialize any buffered history first. append_compaction then
             # persists before committing a new in-memory context.
             manager.flush()

@@ -156,6 +156,12 @@ class Agent:
         """Active run's abort signal, if a run is active."""
         return self._active_run.abort_event if self._active_run else None
 
+    @property
+    def is_accepting_messages(self) -> bool:
+        """Whether an active loop can still consume steering/follow-up input."""
+        run = self._active_run
+        return run is not None and run.accepting_messages and not run.abort_event.is_set()
+
     # ── queues (steering / follow-up) ─────────────────────────────────
 
     def steer(self, message) -> None:
@@ -164,7 +170,8 @@ class Agent:
         Steering messages are injected before the next assistant turn —
         i.e. they cut in line on the current run while it is still looping.
         """
-        self._steering_queue.enqueue(message)
+        for item in self._normalize_prompt_input(message):
+            self._steering_queue.enqueue(item)
 
     def follow_up(self, message) -> None:
         """Enqueue a follow-up message.
@@ -173,7 +180,8 @@ class Agent:
         stops (no more tool calls, no steering pending), starting a new
         inner run.
         """
-        self._follow_up_queue.enqueue(message)
+        for item in self._normalize_prompt_input(message):
+            self._follow_up_queue.enqueue(item)
 
     def clear_steering_queue(self) -> None:
         self._steering_queue.clear()
@@ -230,6 +238,7 @@ class Agent:
         If a session_manager is attached, ``detach_session`` first so the
         session file is left intact (callers start a fresh session separately).
         """
+        self.clear_all_queues()
         self._state.messages = []
         self._state.is_streaming = False
         self._state.streaming_message = None
@@ -244,6 +253,7 @@ class Agent:
         may start with a CompactionSummaryMessage). Does not persist again —
         the caller is responsible for reattaching/creating a session if needed.
         """
+        self.clear_all_queues()
         self._state.messages = list(messages)
 
     def attach_session(self, session_manager: Any) -> None:
@@ -334,6 +344,9 @@ class Agent:
         await self._process_events({"type": "agent_end", "messages": [failure]})
 
     def _finish_run(self) -> None:
+        # Errors, cancellation and terminating control tools can leave input
+        # unconsumed. It belongs to this run, never the next unrelated prompt.
+        self.clear_all_queues()
         self._state.is_streaming = False
         self._state.streaming_message = None
         self._state.pending_tool_calls = set()
@@ -395,6 +408,8 @@ class Agent:
                         pass
         elif etype == "agent_end":
             self._state.streaming_message = None
+            if self._active_run is not None:
+                self._active_run.accepting_messages = False
 
         # Forward to listeners.
         signal = self._active_run.abort_event if self._active_run else asyncio.Event()
@@ -412,6 +427,7 @@ class _ActiveRun:
     def __init__(self, *, abort_event: asyncio.Event, done: asyncio.Event) -> None:
         self.abort_event = abort_event
         self.done = done
+        self.accepting_messages = True
 
 
 def _make_async_convert(

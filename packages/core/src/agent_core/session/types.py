@@ -15,6 +15,13 @@ from typing import Any, Literal
 from agent_llm import Message
 
 CURRENT_SESSION_VERSION = 4
+MAX_COMPACTION_SUMMARY_BYTES = 64 * 1024
+
+
+def validate_compaction_summary(summary: str) -> None:
+    """Reject new compaction records whose final UTF-8 payload exceeds 64 KiB."""
+    if len(summary.encode("utf-8")) > MAX_COMPACTION_SUMMARY_BYTES:
+        raise ValueError("Summary exceeds 64 KiB; original context retained")
 
 #: Discriminator values for entry types.
 EntryType = Literal[

@@ -24,7 +24,10 @@ from agent_llm import (
 
 from agent_core import Agent, CompactionSettings, SessionManager
 from agent_core.compaction_orchestrator import CompactionOrchestrator
+from agent_core.session.compaction import FileOperations
 from agent_core.session.messages import CompactionSummaryMessage
+from agent_core.session.summarize import compact
+from agent_core.session.types import CompactionPreparation
 
 
 def _run(coro):
@@ -153,6 +156,42 @@ def test_context_pivot_rejects_invalid_summary(tmp_path, summary):
     assert not _run(compactor.context_pivot("implement")).performed
     assert sm.get_latest_compaction_entry() is None
     assert agent.state.messages == original
+
+
+def test_context_pivot_rechecks_size_after_adding_brief(tmp_path):
+    agent, sm, compactor = _setup(tmp_path, summary="x" * 65536)
+    sm.append_message(UserMessage(content="research"))
+    original = sm.build_session_context().messages
+    agent.load_messages(original)
+
+    outcome = _run(compactor.context_pivot("implement"))
+
+    assert not outcome.performed
+    assert outcome.error == "Summary exceeds 64 KiB; original context retained"
+    assert sm.get_latest_compaction_entry() is None
+    assert agent.state.messages == original
+
+
+def test_compact_rechecks_size_after_adding_file_operations():
+    file_ops = FileOperations()
+    file_ops.read.add("/project/a.py")
+    preparation = CompactionPreparation(
+        first_kept_entry_id="entry-1",
+        messages_to_summarize=[UserMessage(content="research")],
+        turn_prefix_messages=[],
+        is_split_turn=False,
+        tokens_before=10,
+        previous_summary=None,
+        file_ops=file_ops,
+        settings=CompactionSettings(),
+    )
+
+    with pytest.raises(ValueError, match="exceeds 64 KiB"):
+        _run(compact(
+            preparation,
+            model=_model(),
+            stream_fn=_make_fake_stream_fn("x" * 65536),
+        ))
 
 
 def test_context_pivot_cancel_closes_producer_and_retains_context(tmp_path):
