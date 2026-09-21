@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from agent_llm import (
     AssistantMessage,
     Model,
@@ -22,7 +24,10 @@ from agent_llm import (
 
 from agent_core import Agent, CompactionSettings, SessionManager
 from agent_core.compaction_orchestrator import CompactionOrchestrator
+from agent_core.session.compaction import FileOperations
 from agent_core.session.messages import CompactionSummaryMessage
+from agent_core.session.summarize import compact
+from agent_core.session.types import CompactionPreparation
 
 
 def _run(coro):
@@ -89,6 +94,171 @@ def _setup(
 
 
 # ─── manual_compact ───────────────────────────────────────────────────
+
+
+def test_context_pivot_keeps_session_and_replaces_all_active_history(tmp_path: Path):
+    agent, sm, compactor = _setup(tmp_path, summary="Keep the decision and next steps.")
+    old_ids = [sm.append_message(UserMessage(content="research noise")).id]
+    sm.append_message(AssistantMessage(content=[TextContent(text="decision: use existing runtime")]))
+    agent.load_messages(sm.build_session_context().messages)
+    original_session = sm.header.id
+    observed = []
+
+    def stream(model, context, options=None):
+        observed.append(context)
+        return _FakeStream("Keep the decision and next steps.")
+
+    agent.stream_fn = stream
+    outcome = _run(compactor.context_pivot("implement the selected approach"))
+    assert outcome.performed and outcome.reason == "pivot"
+    assert sm.header.id == original_session
+    assert len(agent.state.messages) == 1
+    assert isinstance(agent.state.messages[0], CompactionSummaryMessage)
+    assert "implement the selected approach" in agent.state.messages[0].summary
+    assert "implement the selected approach" in observed[0].messages[0].content
+    assert old_ids[0] in [entry.id for entry in sm.entries]  # History is not deleted.
+    marker = sm.get_latest_compaction_entry()
+    assert marker.first_kept_entry_id == marker.id
+    assert marker.details.context_pivot_direction == "implement the selected approach"
+    reopened = SessionManager.open(sm.path)
+    assert len(reopened.build_session_context().messages) == 1
+    assert reopened.get_latest_compaction_entry().details.context_pivot_direction == marker.details.context_pivot_direction
+
+
+@pytest.mark.parametrize("stop_reason", ["error", "aborted", "length"])
+def test_context_pivot_rejects_unsuccessful_summary_without_changing_history(tmp_path: Path, stop_reason: str):
+    agent, sm, compactor = _setup(tmp_path)
+    sm.append_message(UserMessage(content="research"))
+    original = sm.build_session_context().messages
+    agent.load_messages(original)
+
+    def stream(*args, **kwargs):
+        result = _FakeStream("partial or failed summary")
+        result._final.stop_reason = stop_reason
+        return result
+
+    agent.stream_fn = stream
+    events = []
+    compactor.on_event = events.append
+    outcome = _run(compactor.context_pivot("review"))
+    assert not outcome.performed
+    assert sm.get_latest_compaction_entry() is None
+    assert agent.state.messages == original
+    assert [event["type"] for event in events] == ["compaction_start", "compaction_end"]
+
+
+@pytest.mark.parametrize("summary", ["", "  ", "x" * 65537], ids=["empty", "whitespace", "oversize"])
+def test_context_pivot_rejects_invalid_summary(tmp_path, summary):
+    agent, sm, compactor = _setup(tmp_path, summary=summary)
+    sm.append_message(UserMessage(content="research"))
+    agent.load_messages(sm.build_session_context().messages)
+    original = list(agent.state.messages)
+    assert not _run(compactor.context_pivot("implement")).performed
+    assert sm.get_latest_compaction_entry() is None
+    assert agent.state.messages == original
+
+
+def test_context_pivot_rechecks_size_after_adding_brief(tmp_path):
+    agent, sm, compactor = _setup(tmp_path, summary="x" * 65536)
+    sm.append_message(UserMessage(content="research"))
+    original = sm.build_session_context().messages
+    agent.load_messages(original)
+
+    outcome = _run(compactor.context_pivot("implement"))
+
+    assert not outcome.performed
+    assert outcome.error == "Summary exceeds 64 KiB; original context retained"
+    assert sm.get_latest_compaction_entry() is None
+    assert agent.state.messages == original
+
+
+def test_compact_rechecks_size_after_adding_file_operations():
+    file_ops = FileOperations()
+    file_ops.read.add("/project/a.py")
+    preparation = CompactionPreparation(
+        first_kept_entry_id="entry-1",
+        messages_to_summarize=[UserMessage(content="research")],
+        turn_prefix_messages=[],
+        is_split_turn=False,
+        tokens_before=10,
+        previous_summary=None,
+        file_ops=file_ops,
+        settings=CompactionSettings(),
+    )
+
+    with pytest.raises(ValueError, match="exceeds 64 KiB"):
+        _run(compact(
+            preparation,
+            model=_model(),
+            stream_fn=_make_fake_stream_fn("x" * 65536),
+        ))
+
+
+def test_context_pivot_cancel_closes_producer_and_retains_context(tmp_path):
+    from agent_llm import AssistantMessageEventStream
+
+    async def scenario():
+        agent, sm, compactor = _setup(tmp_path)
+        sm.append_message(UserMessage(content="research"))
+        agent.load_messages(sm.build_session_context().messages)
+        original = list(agent.state.messages)
+        started, closed = asyncio.Event(), asyncio.Event()
+
+        def stream(*_args):
+            result = AssistantMessageEventStream()
+
+            async def produce():
+                try:
+                    started.set()
+                    await asyncio.Event().wait()
+                finally:
+                    closed.set()
+
+            result.set_producer(asyncio.create_task(produce()))
+            return result
+
+        agent.stream_fn = stream
+        events = []
+        compactor.on_event = events.append
+        task = asyncio.create_task(compactor.context_pivot("implement"))
+        await started.wait()
+        assert not (await compactor.context_pivot("duplicate")).performed
+        compactor.abort()
+        result = await asyncio.wait_for(task, timeout=1)
+        assert not result.performed and result.error == "Compaction aborted"
+        assert closed.is_set()
+        assert sm.get_latest_compaction_entry() is None
+        assert agent.state.messages == original
+        assert not compactor.is_compacting
+        assert events[-1]["aborted"] is True
+
+    _run(scenario())
+
+
+def test_context_pivot_discards_result_after_branch_change(tmp_path):
+    async def scenario():
+        agent, sm, compactor = _setup(tmp_path)
+        first = sm.append_message(UserMessage(content="first"))
+        sm.append_message(UserMessage(content="second"))
+        started, finish = asyncio.Event(), asyncio.Event()
+
+        class SlowSummary(_FakeStream):
+            async def result(self):
+                started.set()
+                await finish.wait()
+                return await super().result()
+
+        agent.stream_fn = lambda *_: SlowSummary("stale")
+        task = asyncio.create_task(compactor.context_pivot("implement"))
+        await started.wait()
+        sm.set_leaf_id(first.id)
+        finish.set()
+        outcome = await task
+        assert not outcome.performed
+        assert "branch changed" in outcome.error
+        assert sm.get_latest_compaction_entry() is None
+
+    _run(scenario())
 
 def test_manual_compact_persists_entry_and_rebuilds_transcript(tmp_path: Path):
     agent, sm, compactor = _setup(tmp_path, keep_recent=50)  # force summarization

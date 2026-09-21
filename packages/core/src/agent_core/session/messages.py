@@ -62,6 +62,7 @@ def repair_incomplete_tool_calls(messages: list[Message]) -> list[Message]:
                 tool_name=tool_name,
                 content=[TextContent(text="Tool execution was interrupted before completion.")],
                 is_error=True,
+                status="uncertain",
             ))
         pending.clear()
 

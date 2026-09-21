@@ -9,7 +9,9 @@ import type {
   SessionSnapshotPayload,
   SessionInfo,
   WorkspacePayload,
+  SubagentTaskPayload,
 } from "../shared/types";
+import { SubagentPanel } from "./components/SubagentPanel";
 import { ToolCard } from "./components/tool-card";
 import {
   createTimelineState,
@@ -38,7 +40,12 @@ interface CommandOption {
   description: string;
 }
 
-type PendingPlanAction = "execute" | "handoff" | null;
+type PendingPlanAction = "execute" | "handoff" | "submit" | null;
+
+interface PlanSubmission {
+  sessionId: string;
+  runId: string | null;
+}
 
 const COMMAND_ICONS: Record<string, string> = {
   help: "?",
@@ -107,7 +114,9 @@ const TimelineCompactionCard = memo(function TimelineCompactionCard({
         <strong>{COMPACTION_LABELS[compaction.status]}</strong>
         {compaction.status === "running" && <span className="compaction-spinner" aria-hidden="true" />}
       </div>
-      {compaction.status === "running" && <p>正在整理较早的对话并生成可恢复摘要，请稍候。</p>}
+      {compaction.status === "running" && <p>{compaction.reason === "pivot"
+        ? "正在面向下一阶段整理当前上下文，历史记录仍会保留。"
+        : "正在整理较早的对话并生成可恢复摘要，请稍候。"}</p>}
       {compaction.summary && compaction.reason !== "persisted" && <p>{compaction.summary}</p>}
       {compaction.summary && compaction.reason === "persisted" && (
         <details>
@@ -237,8 +246,11 @@ export function App() {
   const [isAtBottom, setIsAtBottom] = useState(true);
   const [customPlanAnswer, setCustomPlanAnswer] = useState("");
   const [supplementingPlanDigest, setSupplementingPlanDigest] = useState<string | null>(null);
+  const [planCommandMenuOpen, setPlanCommandMenuOpen] = useState(false);
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const [pendingPlanAction, setPendingPlanAction] = useState<PendingPlanAction>(null);
+  const [planSubmissionNotice, setPlanSubmissionNotice] = useState<string | null>(null);
+  const planSubmissionRef = useRef<PlanSubmission | null>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const didBootstrap = useRef(false);
   const rafQueue = useRef<RuntimeEvent[]>([]);
@@ -274,7 +286,11 @@ export function App() {
     setModelPickerOpen(false);
     setCustomPlanAnswer("");
     setSupplementingPlanDigest(null);
+    setPlanCommandMenuOpen(false);
     setPendingPlanAction(null);
+    if (planSubmissionRef.current) setRunning(false);
+    planSubmissionRef.current = null;
+    setPlanSubmissionNotice(null);
     activeCompactionId.current = null;
     compactingRef.current = false;
     setCompacting(false);
@@ -408,14 +424,28 @@ export function App() {
 
   const handleRuntimeSideEffects = (envelope: RuntimeEvent) => {
     const { type, payload } = envelope.event;
+    if (type !== "session.changed" && envelope.sessionId
+      && envelope.sessionId !== workspaceSessionIdRef.current) return;
+    const activeSubmission = planSubmissionRef.current;
+    if (type.startsWith("run.") && activeSubmission?.runId
+      && envelope.runId !== activeSubmission.runId) return;
     if (type === "run.started") {
+      const submission = planSubmissionRef.current;
+      if (submission && !submission.runId) submission.runId = envelope.runId;
       setRunning(true);
-      setPendingPlanAction(null);
+      // Plan submission needs a persistent progress affordance after its menu
+      // closes. Other actions move immediately to their phase-specific UI.
+      setPendingPlanAction((current) => current === "submit" ? current : null);
       return;
     }
     if (type === "run.completed" || type === "run.cancelled" || type === "run.failed") {
       setRunning(false);
-      setPendingPlanAction(null);
+      const submission = planSubmissionRef.current;
+      if (submission && (!submission.runId || submission.runId === envelope.runId)) {
+        void finishPlanSubmission(submission, type);
+      } else {
+        setPendingPlanAction(null);
+      }
       if (type === "run.failed") setError(String(payload.message ?? "运行失败"));
       void refreshSessions();
       return;
@@ -441,6 +471,9 @@ export function App() {
     if (type === "session.changed") {
       applyWorkspace(payload as unknown as WorkspacePayload, false);
     }
+    if (type === "subagent.stateChanged" && Array.isArray(payload.tasks)) {
+      setWorkspace((current) => current ? { ...current, subagents: payload.tasks as SubagentTaskPayload[] } : current);
+    }
     if (type === "model.changed") {
       const model = payload as unknown as WorkspacePayload["model"];
       setWorkspace((current) => current ? { ...current, model } : current);
@@ -457,6 +490,7 @@ export function App() {
       const payloadSessionId = typeof payload.sessionId === "string"
         ? payload.sessionId
         : typeof payload.session_id === "string" ? payload.session_id : envelope.sessionId;
+      if (payloadSessionId && payloadSessionId !== workspaceSessionIdRef.current) return;
       const payloadMode = payload.collaboration_mode === "plan" ? "plan"
         : payload.collaboration_mode === "default" ? "default" : undefined;
       setWorkspace((current) => {
@@ -468,6 +502,11 @@ export function App() {
         };
       });
       if (state.phase !== "ready") setSupplementingPlanDigest(null);
+      // A state event is authoritative rehydration, not a request to keep a
+      // transient command menu open. Drafting can reopen its actions only
+      // through an explicit second /plan command.
+      setPlanCommandMenuOpen(false);
+      if (state.phase !== "drafting") setPlanSubmissionNotice(null);
       return;
     }
     // Granular Plan events remain on the wire for external older clients.
@@ -503,6 +542,40 @@ export function App() {
     setModelPickerOpen(true);
   };
 
+  const manageSubagents = async (action: string, value = "") => {
+    const owner = workspaceSessionIdRef.current;
+    try {
+      if (action === "spawn" || action === "review") {
+        await window.agent.request("subagent.spawn", { task: value, purpose: action === "review" ? "review" : "investigate" });
+      } else if (action === "cancel") {
+        await window.agent.request("subagent.cancel", { taskId: value });
+      } else if (action === "wait") {
+        await window.agent.request("subagent.wait", { taskId: value });
+      } else if (action === "status") {
+        const task = await window.agent.request<SubagentTaskPayload>("subagent.status", { taskId: value });
+        addNotice(`${task.prompt}\n\n${task.output || task.error || task.status}`);
+      } else if (action && action !== "list" && action !== "show") {
+        addNotice("用法：/subagents list | spawn <任务> | review <任务> | status <id> | wait <id> | show <id> | cancel <id>");
+        return;
+      }
+      const tasks = await window.agent.request<SubagentTaskPayload[]>("subagent.list");
+      if (workspaceSessionIdRef.current !== owner) return;
+      setWorkspace((current) => current ? { ...current, subagents: tasks } : current);
+      setSidebarOpen(true);
+      if (action === "show") {
+        const task = tasks.find((item) => item.taskId === value);
+        addNotice(task ? `${task.prompt}\n\n${task.output || task.error || task.status}` : "当前分支没有这个子代理任务。");
+      }
+    } catch (reason) {
+      if (workspaceSessionIdRef.current !== owner) return;
+      setError(reason instanceof Error ? reason.message : String(reason));
+      try {
+        const tasks = await window.agent.request<SubagentTaskPayload[]>("subagent.list");
+        if (workspaceSessionIdRef.current === owner) setWorkspace((current) => current ? { ...current, subagents: tasks } : current);
+      } catch { /* Preserve the last authoritative snapshot if refresh also fails. */ }
+    }
+  };
+
   const executeSlashCommand = async (name: string, args = "") => {
     setInput("");
     setCommandMenuOpen(false);
@@ -516,11 +589,18 @@ export function App() {
         applyWorkspace(await window.agent.request<WorkspacePayload>("session.new"));
         return;
       }
+      if (name === "subagents") {
+        const match = args.trim().match(/^(\S+)(?:\s+([\s\S]*))?$/);
+        await manageSubagents(match?.[1] ?? "list", match?.[2] ?? "");
+        return;
+      }
       if (name === "compact") {
         if (compactingRef.current) return;
-        beginCompaction("manual");
+        beginCompaction(args.trim() ? "pivot" : "manual");
         try {
-          const result = await window.agent.request<Record<string, unknown>>("session.compact");
+          const result = args.trim()
+            ? await window.agent.request<Record<string, unknown>>("session.compact", { direction: args.trim() })
+            : await window.agent.request<Record<string, unknown>>("session.compact");
           if (result.performed) {
             finishCompaction("completed", String(result.summary_preview ?? ""));
           } else {
@@ -561,7 +641,7 @@ export function App() {
         return;
       }
       if (name === "plan") {
-        await enterPlanMode();
+        await handlePlanCommand();
         return;
       }
       if (name === "cancel-plan") {
@@ -727,7 +807,7 @@ export function App() {
   const submit = async (event?: FormEvent) => {
     event?.preventDefault();
     const text = input.trim();
-    if (!text || !workspace || running || compacting) return;
+    if (!text || !workspace || running || compacting || planSubmissionRef.current) return;
     if (text.startsWith("/")) {
       const [rawName, ...rest] = text.slice(1).split(/\s+/);
       const command = commandOptions.find((item) => item.name === rawName.toLocaleLowerCase());
@@ -771,6 +851,42 @@ export function App() {
     }
   };
 
+  const handlePlanCommand = async () => {
+    if (!workspace || running || compacting) return;
+    const phase = workspace.planState.phase;
+    const mode = workspace.planState.mode ?? workspace.collaborationMode;
+
+    // These states represent an active execution or an unresolved recovery
+    // record, even when the reducer projects collaboration mode as Default.
+    if (phase === "executing") {
+      setPlanCommandMenuOpen(true);
+      return;
+    }
+    if (phase === "uncertain" || phase === "recovery_error") {
+      // The recovery card is always rendered from the authoritative snapshot;
+      // reopening it here keeps /plan useful without starting a new episode.
+      setPlanCommandMenuOpen(false);
+      return;
+    }
+
+    if (mode !== "plan") {
+      setPlanCommandMenuOpen(false);
+      await enterPlanMode();
+      requestAnimationFrame(() => composerRef.current?.focus());
+      return;
+    }
+
+    // Ready and awaiting-answer already have their phase-specific cards. Only
+    // drafting needs an explicit menu because it otherwise leaves the editor
+    // unobstructed after entering Plan Mode.
+    if (phase === "ready") {
+      // /plan is also the way to reopen the ready actions after the user has
+      // entered the supplemental-editing view.
+      setSupplementingPlanDigest(null);
+    }
+    setPlanCommandMenuOpen(phase === "drafting");
+  };
+
   const cancelPlan = async () => {
     const planId = workspace?.planState.activePlanId;
     if (!workspace || (!planId && workspace.planState.phase !== "recovery_error")
@@ -778,6 +894,11 @@ export function App() {
     try {
       applyWorkspace(await window.agent.request<WorkspacePayload>("plan.cancel", { planId }));
     } catch (reason) {
+      try {
+        await refreshSessionSnapshot();
+      } catch {
+        // Preserve the local error when the runtime cannot provide a fresh snapshot.
+      }
       setError(reason instanceof Error ? reason.message : String(reason));
     }
   };
@@ -793,6 +914,11 @@ export function App() {
       });
       setCustomPlanAnswer("");
     } catch (reason) {
+      try {
+        await refreshSessionSnapshot();
+      } catch {
+        // Preserve the local error when the runtime cannot provide a fresh snapshot.
+      }
       setError(reason instanceof Error ? reason.message : String(reason));
     }
   };
@@ -854,6 +980,98 @@ export function App() {
     if (!plan || running || compacting || workspace?.planState.phase !== "ready") return;
     setSupplementingPlanDigest(plan.digest);
     requestAnimationFrame(() => composerRef.current?.focus());
+  };
+
+  const continuePlanDrafting = () => {
+    setPlanCommandMenuOpen(false);
+    setPlanSubmissionNotice(null);
+    requestAnimationFrame(() => composerRef.current?.focus());
+  };
+
+  const abortPlanExecution = async () => {
+    if (compacting) return;
+    let abortError: unknown = null;
+    try {
+      await window.agent.request("run.abort");
+    } catch (reason) {
+      abortError = reason;
+    }
+    try {
+      await refreshSessionSnapshot();
+    } catch {
+      // Keep the last authoritative state when rehydration is unavailable.
+    }
+    if (abortError !== null) {
+      const reason = abortError;
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  };
+
+  const finishPlanSubmission = async (submission: PlanSubmission, outcome: string) => {
+    try {
+      // A normal end can be plain model text, not a successful submit_plan.
+      // Rehydrate before choosing the ready, question or retry controls.
+      const snapshot = await window.agent.request<SessionSnapshotPayload>("session.snapshot");
+      if (planSubmissionRef.current !== submission
+        || snapshot.sessionId !== submission.sessionId) return;
+      applySessionSnapshot(snapshot);
+      const stillDrafting = snapshot.planState.phase === "drafting"
+        && (snapshot.planState.mode ?? snapshot.collaborationMode) === "plan";
+      setPlanCommandMenuOpen(stillDrafting);
+      if (stillDrafting && outcome !== "run.failed") {
+        setPlanSubmissionNotice(outcome === "run.cancelled"
+          ? "已停止整理，尚未提交计划。可以继续规划，或再次整理并提交。"
+          : "本轮已结束，但尚未提交计划。可以继续规划，或再次整理并提交。");
+      }
+    } catch (reason) {
+      if (planSubmissionRef.current === submission) {
+        const detail = `无法刷新计划状态：${reason instanceof Error ? reason.message : String(reason)}`;
+        setError((current) => current ? `${current}；${detail}` : detail);
+      }
+    } finally {
+      if (planSubmissionRef.current === submission) {
+        planSubmissionRef.current = null;
+        setPendingPlanAction(null);
+      }
+    }
+  };
+
+  const requestPlanSubmission = async () => {
+    if (!workspace || running || compacting || planSubmissionRef.current
+      || workspace.planState.phase !== "drafting") return;
+    const submission: PlanSubmission = { sessionId: workspace.sessionId, runId: null };
+    planSubmissionRef.current = submission;
+    const text = "请基于当前讨论整理一份决策完备的实施计划，并仅通过 submit_plan 控制工具提交；不要执行计划。";
+    setPlanCommandMenuOpen(false);
+    setPlanSubmissionNotice(null);
+    setInput("");
+    setError(null);
+    const timestamp = Date.now();
+    const id = `user-${timestamp}-${++localItemSequence.current}`;
+    setTimelineState((current) => appendTimelineItem(current, (order): TimelineMessageItem => ({
+      id,
+      kind: "message",
+      order,
+      revision: 0,
+      sessionId: workspace.sessionId,
+      runId: null,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      role: "user",
+      text,
+      thinking: "",
+    })));
+    setRunning(true);
+    setPendingPlanAction("submit");
+    try {
+      const result = await window.agent.request<{ runId: string }>("run.start", { text });
+      if (planSubmissionRef.current === submission) submission.runId = result.runId;
+    } catch (reason) {
+      if (planSubmissionRef.current !== submission) return;
+      setRunning(false);
+      setError(reason instanceof Error ? reason.message : String(reason));
+      await finishPlanSubmission(submission, "run.failed");
+    }
   };
 
   const selectModel = async (model: ModelOption) => {
@@ -1102,6 +1320,12 @@ export function App() {
             ))}
             {!sessions.length && <div className="empty-sidebar">发送第一条消息后，会话会保存到 JSONL。</div>}
           </div>
+          {workspace && <SubagentPanel key={workspace.sessionId} tasks={workspace.subagents ?? []}
+            onCancel={(taskId) => manageSubagents("cancel", taskId)}
+            onReview={workspace.planState.phase === "ready" && workspace.planState.latestRevision && !running && !compacting
+              ? () => manageSubagents("review", `只读复核下列计划：检查遗漏、风险和代码依据，不执行、不修改或提交计划。\n${workspace.planState.latestRevision?.markdown}`)
+              : undefined}
+          />}
           {workspace && (
             <div className="workspace-meta">
               <span>模型</span>
@@ -1193,6 +1417,71 @@ export function App() {
                   </div>
                 )}
                 <button onClick={() => void cancelPlan()} disabled={compacting}>取消规划</button>
+              </section>
+            )}
+            {planCommandMenuOpen
+              && workspace?.collaborationMode === "plan"
+              && workspace.planState.phase === "drafting" && (
+              <section className="plan-question plan-mode-menu" data-testid="plan-mode-menu">
+                <div className="plan-question-header">
+                  <span className="plan-badge">PLAN</span>
+                  <strong>当前正在规划</strong>
+                </div>
+                <p>请选择接下来要执行的 Plan 操作。</p>
+                <div className="plan-options">
+                  <button onClick={continuePlanDrafting} disabled={running || compacting}>
+                    <strong>继续规划</strong>
+                    <span>返回输入框，继续补充需求或约束</span>
+                  </button>
+                  <button onClick={() => void requestPlanSubmission()} disabled={running || compacting}>
+                    <strong>{pendingPlanAction === "submit" ? "正在整理…" : "整理并提交"}</strong>
+                    <span>让 Agent 将当前讨论整理为可复核方案</span>
+                  </button>
+                  <button onClick={() => void cancelPlan()} disabled={running || compacting}>
+                    <strong>取消规划</strong>
+                    <span>切回 Default，不执行任何方案</span>
+                  </button>
+                </div>
+              </section>
+            )}
+            {planSubmissionNotice && workspace?.planState.phase === "drafting" && (
+              <section className="plan-status" data-testid="plan-submission-notice" role="status">
+                <p>{planSubmissionNotice}</p>
+              </section>
+            )}
+            {pendingPlanAction === "submit"
+              && workspace?.planState.phase === "drafting" && (
+              <section
+                className="plan-status submitting"
+                data-testid="plan-submitting"
+                role="status"
+                aria-live="polite"
+              >
+                <div className="plan-question-header">
+                  <span className="plan-badge">PLAN</span>
+                  <strong>正在整理并提交计划</strong>
+                  <span className="plan-spinner" aria-hidden="true" />
+                </div>
+                <p>正在整理当前讨论；提交成功后会显示计划和确认选项，不会自动执行。可点击下方“停止”中断。</p>
+              </section>
+            )}
+            {workspace?.planState.phase === "executing" && (
+              <section className="plan-status executing" data-testid="plan-executing">
+                <div className="plan-question-header">
+                  <span className="plan-badge">PLAN EXECUTING</span>
+                  <strong>正在执行已确认方案</strong>
+                </div>
+                <p>运行仍在进行中。停止操作不会回滚已经产生的文件或外部副作用。</p>
+                {workspace.planState.activePlanId && (
+                  <pre>planId: {workspace.planState.activePlanId}{workspace.planState.latestRun?.runId
+                    ? `\nrunId: ${workspace.planState.latestRun.runId}` : ""}</pre>
+                )}
+                <div className="plan-options">
+                  <button onClick={() => void abortPlanExecution()} disabled={!running || compacting}>
+                    <strong>停止执行</strong>
+                    <span>请求中止当前执行回合</span>
+                  </button>
+                </div>
               </section>
             )}
             {readyPlan && awaitingPlanDecision && (
@@ -1304,10 +1593,12 @@ export function App() {
                   ? "请先打开工作区"
                   : supplementingPlanDigest === readyPlan?.digest
                     ? "补充你的想法或修改要求…"
+                    : planCommandMenuOpen
+                      ? "请先选择 Plan 操作"
                     : awaitingPlanDecision
                       ? "请先选择执行、新会话复核或继续修改"
                       : "描述你想完成的任务…"}
-                disabled={!workspace || awaitingPlanDecision || compacting || Boolean(planStatusMessage)}
+                disabled={!workspace || awaitingPlanDecision || planCommandMenuOpen || compacting || Boolean(planStatusMessage)}
                 rows={3}
               />
               <div className="composer-footer">
@@ -1330,9 +1621,11 @@ export function App() {
                 </div>
                 <span>Enter 发送 · Shift+Enter 换行</span>
                 {running ? (
-                  <button type="button" className="stop-button" onClick={() => window.agent.request("run.abort")}>■ 停止</button>
+                  <button type="button" className="stop-button" onClick={() => void abortPlanExecution()}>■ 停止</button>
                 ) : compacting ? (
-                  <button type="button" className="send-button" disabled>压缩中…</button>
+                  <button type="button" className="stop-button" onClick={() => {
+                    void window.agent.request("run.abort").catch((reason) => setError(String(reason)));
+                  }}>■ 停止压缩</button>
                 ) : (
                   <button type="submit" className="send-button" disabled={!input.trim() || !workspace}>发送 ↑</button>
                 )}

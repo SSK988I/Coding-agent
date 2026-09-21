@@ -35,6 +35,21 @@ export interface WorkspacePayload {
   collaborationMode: "default" | "plan";
   planState: PlanStatePayload;
   memory: MemoryStatePayload;
+  subagents?: SubagentTaskPayload[];
+}
+
+export interface SubagentTaskPayload {
+  taskId: string;
+  sessionId: string;
+  purpose: "investigate" | "review";
+  prompt: string;
+  status: "queued" | "running" | "completed" | "failed" | "cancelled" | "timed_out" | "uncertain";
+  turns: number;
+  lastTool: string | null;
+  output: string;
+  error: string | null;
+  maxTurns: number;
+  timeoutSeconds: number;
 }
 
 export interface MemoryStatePayload {
@@ -120,9 +135,15 @@ export interface SessionSnapshotPayload {
   stats: Record<string, unknown>;
   collaborationMode: "default" | "plan";
   planState: PlanStatePayload;
+  subagents?: SubagentTaskPayload[];
 }
 
 export interface AgentMessage {
+  tool_call_id?: string;
+  tool_name?: string;
+  details?: unknown;
+  is_error?: boolean;
+  status?: string | null;
   role: string;
   content: string | ContentBlock[];
   summary?: string;

@@ -528,7 +528,9 @@ def _wire_coroutine(stream: AssistantMessageEventStream, coroutine: Any) -> None
             stream.push({"type": "error", "reason": "error", "error": message})
             stream.end(message)
 
-    asyncio.ensure_future(_run())
+    producer = asyncio.ensure_future(_run())
+    producer.add_done_callback(lambda _: coroutine.close())
+    stream.set_producer(producer)
 
 
 def stream_simple(

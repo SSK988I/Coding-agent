@@ -648,7 +648,9 @@ def _wire_generator(stream: AssistantMessageEventStream, coro) -> None:
             stream.push({"type": "error", "reason": "error", "error": msg})
             stream.end(msg)
 
-    asyncio.ensure_future(_run())
+    producer = asyncio.ensure_future(_run())
+    producer.add_done_callback(lambda _: coro.close())
+    stream.set_producer(producer)
 
 
 # ─── stream_simple ─────────────────────────────────────────────────────

@@ -33,6 +33,47 @@ const assistant = (
 ): AgentMessage => ({ role: "assistant", content, ...extra });
 
 describe("timeline state", () => {
+  it("does not show execution until Core admits the tool", () => {
+    let state = reduceRuntimeEventBatch(createTimelineState(), [
+      runtimeEvent(1, "tool_execution_start", { tool_call_id: "t", tool_name: "bash", status: "pending" }),
+    ]);
+    expect(selectTimelineItems(state)[0]).toMatchObject({ status: "pending" });
+    state = reduceRuntimeEventBatch(state, [
+      runtimeEvent(2, "approval.requested", { approvalId: "a", toolCallId: "t", toolName: "bash", args: {} }),
+    ]);
+    expect(selectTimelineItems(state)[0]).toMatchObject({ status: "approval" });
+    state = reduceRuntimeEventBatch(state, [
+      runtimeEvent(3, "tool_execution_running", { tool_call_id: "t" }),
+    ]);
+    expect(selectTimelineItems(state)[0]).toMatchObject({ status: "running", approval: undefined });
+  });
+
+  it.each(["failed", "cancelled", "timed_out", "blocked", "completed"])(
+    "preserves the %s outcome live and after JSONL rehydration", (status) => {
+      const expected = status === "failed" ? "error" : status === "completed" ? "done" : status;
+      const message: AgentMessage = { role: "toolResult", tool_call_id: "t", tool_name: "bash",
+        content: [{ type: "text", text: "result" }], status, is_error: status !== "completed" };
+      const live = reduceRuntimeEventBatch(createTimelineState(), [
+        runtimeEvent(1, "tool_execution_start", { tool_call_id: "t", tool_name: "bash", status: "pending" }),
+        runtimeEvent(2, "tool_execution_running", { tool_call_id: "t" }),
+        runtimeEvent(3, "tool_execution_end", { tool_call_id: "t", result: message, status, is_error: message.is_error }),
+        runtimeEvent(4, "tool_execution_update", { tool_call_id: "t", partial_result: "late output" }),
+      ]);
+      expect(selectTimelineItems(live)[0]).toMatchObject({ status: expected, result: message });
+      const restored = createTimelineStateFromMessages([
+        assistant([{ type: "toolCall", id: "t", name: "bash", arguments: { command: "exit 7" } }]), message,
+      ]);
+      expect(selectTimelineItems(restored)[0]).toMatchObject({ status: expected, args: { command: "exit 7" } });
+    },
+  );
+
+  it("does not invent a terminal result for an interrupted persisted call", () => {
+    const restored = createTimelineStateFromMessages([
+      assistant([{ type: "toolCall", id: "t", name: "write", arguments: {} }]),
+    ]);
+    expect(selectTimelineItems(restored)[0]).toMatchObject({ status: "uncertain" });
+  });
+
   it("hydrates messages and compactions into one normalized ordered store", () => {
     const state = createTimelineStateFromMessages([
       { role: "user", content: "hello", timestamp: 10 },
@@ -300,7 +341,7 @@ describe("timeline state", () => {
     expect(items[0]).toMatchObject({
       toolCallId: "shell-1",
       name: "bash",
-      status: "error",
+      status: "timed_out",
       result: "工具审批已超时",
       revision: 2,
     });

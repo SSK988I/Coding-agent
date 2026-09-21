@@ -49,7 +49,9 @@ from agent_core.session.types import (
     SessionInfoEntry,
     SessionMessageEntry,
     SessionTreeNode,
+    SubagentTaskEntry,
     ThinkingLevelChangeEntry,
+    validate_compaction_summary,
 )
 
 __all__ = ["SessionManager"]
@@ -281,6 +283,7 @@ class SessionManager:
         from_hook: bool = False,
     ) -> CompactionEntry:
         """Append a compaction marker."""
+        validate_compaction_summary(result.summary)
         entry = CompactionEntry(
             type="compaction",
             id=self._next_entry_id(),
@@ -292,6 +295,10 @@ class SessionManager:
             details=result.details,
             from_hook=from_hook,
         )
+        if result.details is not None and result.details.context_pivot_direction is not None:
+            # A pivot replaces the entire active context. The marker itself is
+            # a real, stable cut point; history remains on the same branch.
+            entry.first_kept_entry_id = entry.id
         self._commit(entry)
         return entry
 
@@ -404,6 +411,14 @@ class SessionManager:
         return entry
 
     # ─── commit: in-memory + on-disk ──────────────────────────────────
+
+    def append_subagent_task(self, task: dict[str, Any]) -> SubagentTaskEntry:
+        entry = SubagentTaskEntry(
+            id=self._next_entry_id(), parent_id=self._parent_for_new_entry(),
+            timestamp=iso_now(), task=copy.deepcopy(task),
+        )
+        self._commit(entry)
+        return entry
 
     def _commit(self, entry: SessionEntry) -> None:
         """Add to memory and persist. Handles flush-on-first-assistant."""

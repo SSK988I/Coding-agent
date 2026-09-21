@@ -19,11 +19,12 @@ class PlanActionsComponent:
         self._plan = plan
         self._on_action = on_action
         self._on_close = on_close
-        self._list = SelectList(max_visible=4)
+        self._list = SelectList(max_visible=5)
         self._list.set_items([
             SelectItem(value="supplement", label="补充想法", description="保留 Plan Mode，在输入框补充修改要求"),
             SelectItem(value="execute", label="当前会话执行", description="确认当前 revision 并立即切回 Default 执行"),
             SelectItem(value="handoff", label="新会话复核", description="仅交接已确认方案，在干净会话中再次确认"),
+            SelectItem(value="review", label="只读子代理复核", description="独立检查当前方案，返回报告，不执行或修改计划"),
             SelectItem(value="cancel", label="取消规划", description="切回 Default，不执行计划"),
         ])
         self.focused = True

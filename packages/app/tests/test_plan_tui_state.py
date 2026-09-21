@@ -1,6 +1,7 @@
 """State projection tests for Plan controls in the terminal UI."""
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -13,7 +14,7 @@ from coding_agent.modes.interactive.interactive_mode import InteractiveMode
     [
         ("awaiting_answer", "pending_question", "question"),
         ("ready", "latest_revision", "ready"),
-        ("drafting", None, "drafting"),
+        ("drafting", None, "closed"),
         ("executing", None, "executing"),
         ("uncertain", None, "uncertain"),
         ("recovery_error", None, "recovery_error"),
@@ -26,6 +27,7 @@ def test_rehydrate_routes_authoritative_plan_phase(
     marker = object()
     state = SimpleNamespace(
         phase=phase,
+        mode="plan" if phase in {"drafting", "awaiting_answer", "ready"} else "default",
         pending_question=marker if field == "pending_question" else None,
         latest_revision=marker if field == "latest_revision" else None,
     )
@@ -46,17 +48,37 @@ def test_rehydrate_routes_authoritative_plan_phase(
 def test_bare_plan_in_drafting_reopens_actions_without_new_episode() -> None:
     calls: list[str] = []
     session = SimpleNamespace(
-        plan_state=SimpleNamespace(phase="drafting"),
+        plan_state=SimpleNamespace(phase="drafting", mode="plan"),
         enter_plan_mode=lambda: calls.append("enter"),
     )
     mode = SimpleNamespace(
         _session=session,
+        _mount_plan_phase_menu=lambda phase: calls.append(phase),
         _render_plan_state_controls=lambda: calls.append("render"),
     )
 
     InteractiveMode._cmd_plan(mode)  # type: ignore[arg-type]
 
-    assert calls == ["render"]
+    assert calls == ["drafting"]
+
+
+def test_bare_plan_in_default_enters_without_mounting_drafting_menu() -> None:
+    calls: list[str] = []
+    session = SimpleNamespace(
+        plan_state=SimpleNamespace(phase="idle", mode="default"),
+        enter_plan_mode=lambda: calls.append("enter"),
+    )
+    mode = SimpleNamespace(
+        _session=session,
+        _refresh_footer=lambda: calls.append("footer"),
+        _update_editor_border_color=lambda: calls.append("border"),
+        _restore_editor=lambda: calls.append("restore"),
+        _add_system_message=lambda value: calls.append(value),
+    )
+
+    InteractiveMode._cmd_plan(mode)  # type: ignore[arg-type]
+
+    assert calls == ["enter", "footer", "border", "已进入计划模式。", "restore"]
 
 
 def test_bare_plan_with_pending_question_offers_answer_or_cancel_menu() -> None:
@@ -160,7 +182,73 @@ def test_legacy_candidate_has_visible_resubmission_requirement() -> None:
         ),
         _add_system_message=texts.append,
         _mount_plan_phase_menu=lambda _phase: None,
+        _close_plan_controls=lambda: None,
     )
     InteractiveMode._render_plan_state_controls(mode)  # type: ignore[arg-type]
     InteractiveMode._render_plan_state_controls(mode)  # type: ignore[arg-type]
     assert len(texts) == 1 and "submit_plan" in texts[0]
+
+
+def test_submission_shows_progress_before_first_event_and_clears_on_exit() -> None:
+    from test_interactive_events import _make_mode
+
+    mode = _make_mode()
+    messages: list[str] = []
+    mode._session.plan_state = SimpleNamespace(phase="drafting")
+    mode.editor = SimpleNamespace(disable_submit=False)
+    mode._add_user_message = lambda text: None
+    mode._add_system_message = messages.append
+    mode._refresh_footer = lambda: None
+    mode._render_plan_state_controls = lambda: None
+
+    async def respond(_prompt: str) -> None:
+        # No agent_start or message_start has arrived yet: the click itself
+        # must already have provided visible feedback.
+        assert mode.editor.disable_submit
+        assert mode._active_status_indicator is not None
+        assert "正在整理并提交计划" in "".join(mode.status_container.render(100))
+        mode._on_agent_event({"type": "agent_start"})
+        assert "正在整理并提交计划" in "".join(mode.status_container.render(100))
+        # Duplicate clicks must not start another request.
+        await InteractiveMode._request_plan_submission(mode)
+
+    mode._respond = respond
+    asyncio.run(InteractiveMode._request_plan_submission(mode))
+
+    assert not mode._is_responding
+    assert not mode.editor.disable_submit
+    assert mode._active_status_indicator is None
+    assert any("尚未提交计划" in text for text in messages)
+
+
+@pytest.mark.parametrize("phase", ["drafting", "ready", "awaiting_answer"])
+def test_submission_cleanup_and_feedback_follow_core_phase(phase: str) -> None:
+    from test_interactive_events import _make_mode
+
+    mode = _make_mode()
+    messages: list[str] = []
+    mode._session.plan_state = SimpleNamespace(phase="drafting")
+    mode.editor = SimpleNamespace(disable_submit=False)
+    mode._add_user_message = lambda text: None
+    mode._add_system_message = messages.append
+    mode._refresh_footer = lambda: None
+    rendered: list[str] = []
+    mode._render_plan_state_controls = lambda: rendered.append(mode._session.plan_state.phase)
+
+    async def respond(_prompt: str) -> None:
+        mode._session.plan_state.phase = phase
+        if phase == "drafting":
+            raise asyncio.CancelledError
+
+    mode._respond = respond
+    if phase == "drafting":
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(InteractiveMode._request_plan_submission(mode))
+    else:
+        asyncio.run(InteractiveMode._request_plan_submission(mode))
+
+    assert rendered == [phase]
+    assert not mode._is_responding
+    assert not mode.editor.disable_submit
+    assert mode._active_status_indicator is None
+    assert any("尚未提交计划" in text for text in messages) == (phase == "drafting")

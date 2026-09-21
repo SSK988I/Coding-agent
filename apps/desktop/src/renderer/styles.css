@@ -325,7 +325,18 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #8e8a82; outli
   box-shadow: 0 6px 22px rgba(98, 78, 24, .07);
 }
 .plan-status.recovery_error { border-color: #d39a92; background: #fff5f3; }
+.plan-status.submitting { border-color: #c8b98b; background: #fffcf2; }
 .plan-status p { margin: 10px 0 0; color: #5d5035; font-size: 11px; line-height: 1.6; }
+.plan-spinner {
+  width: 11px;
+  height: 11px;
+  margin-left: auto;
+  border: 2px solid #dfd4b5;
+  border-top-color: #8b7542;
+  border-radius: 50%;
+  animation: compaction-spin .8s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) { .plan-spinner { animation: none; } }
 .plan-status pre {
   max-height: 120px;
   margin: 9px 0 0;
@@ -499,3 +510,13 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #8e8a82; outli
   .timeline-row, .composer-wrap { padding-left: 34px; padding-right: 24px; }
   .command-list > button { grid-template-columns: 29px 120px minmax(0, 1fr); }
 }
+.subagent-panel { padding: 12px; border-top: 1px solid var(--line); overflow-y: auto; max-height: 40vh; }
+.subagent-panel h3 { font-size: 13px; margin: 0 0 8px; }
+.subagent-panel p, .subagent-panel small { font-size: 12px; overflow-wrap: anywhere; }
+.subagent-task { padding: 8px 0; }
+.subagent-task summary { cursor: pointer; font-size: 12px; }
+.subagent-task summary span { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; opacity: .7; overflow-wrap: anywhere; }
+.subagent-brief { margin: 8px 0; }
+.subagent-brief p { white-space: pre-wrap; }
+.subagent-task pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
+.subagent-task button { margin: 8px 0; }

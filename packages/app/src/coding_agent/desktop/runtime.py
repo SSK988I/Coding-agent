@@ -23,6 +23,7 @@ from coding_agent.core.retry import RetryPolicy
 from coding_agent.core.plan_mode import PlanModeError
 from coding_agent.core.settings import SettingsManager
 from coding_agent.core.slash_commands import get_active_commands
+from coding_agent.core.subagents import SubagentError
 from coding_agent.desktop.protocol import PROTOCOL_VERSION, RpcError, to_jsonable
 
 EventEmitter = Callable[[dict[str, Any]], None]
@@ -31,10 +32,11 @@ _DESKTOP_COMMANDS = {
     "help": ("帮助", "查看桌面端可用命令"),
     "new": ("新会话", "创建一个新的会话"),
     "model": ("模型", "选择或切换当前模型"),
-    "compact": ("压缩上下文", "立即压缩较早的会话内容"),
+    "compact": ("压缩上下文", "压缩会话；/compact <下一阶段目标> 可定向整理"),
+    "subagents": ("只读子代理", "查看、启动、审查或停止独立调查任务"),
     "clear": ("清空对话", "清空当前窗口和 Agent 上下文"),
     "session": ("会话状态", "查看当前会话统计信息"),
-    "plan": ("计划模式", "进入 Plan Mode"),
+    "plan": ("计划模式", "进入 Plan Mode 或显示当前 Plan 操作"),
     "cancel-plan": ("取消规划", "退出 Plan Mode，不执行计划"),
     "execute-plan": ("执行计划", "执行最新的 Plan revision"),
     "memory": ("长期记忆", "查看和管理长期偏好、事实与项目经验"),
@@ -88,18 +90,26 @@ class DesktopRuntime:
             "webSearch.status": self._web_search_status,
             "webSearch.setEnabled": self._web_search_set_enabled,
             "session.compact": self._session_compact,
+            "subagent.spawn": self._subagent_spawn,
+            "subagent.list": self._subagent_list,
+            "subagent.status": self._subagent_status,
+            "subagent.wait": self._subagent_wait,
+            "subagent.cancel": self._subagent_cancel,
             "runtime.dispose": self._dispose_command,
         }
         handler = handlers.get(method)
         if handler is None:
             raise RpcError("METHOD_NOT_FOUND", f"未知方法：{method}")
-        return await handler(params)
+        try:
+            return await handler(params)
+        except SubagentError as exc:
+            raise RpcError(exc.code, str(exc)) from exc
 
     async def _ping(self, params: dict[str, Any]) -> dict[str, Any]:
         del params
         return {
             "protocolVersion": PROTOCOL_VERSION, "status": "ready",
-            "capabilities": ["plan_mode_v1", "memory_v1", "memory_v2", "web_search_v1"],
+            "capabilities": ["plan_mode_v1", "memory_v1", "memory_v2", "web_search_v1", "context_pivot_v1", "readonly_subagents_v1"],
         }
 
     async def _workspace_open(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -121,6 +131,8 @@ class DesktopRuntime:
         session_id: str | None = None,
         resume: bool = False,
     ) -> None:
+        if self._session is not None and getattr(self._session, "is_compacting", False):
+            raise RpcError("COMPACTION_IN_PROGRESS", "请先停止压缩，再切换会话")
         await self._stop_active_run()
         await self._dispose_session()
 
@@ -260,12 +272,12 @@ class DesktopRuntime:
             "stats": to_jsonable(session.get_stats()),
             "collaborationMode": session.collaboration_mode,
             "planState": session.plan_state.to_payload(),
+            "subagents": self._subagent_payload(session),
         }
 
     async def _session_clear(self, params: dict[str, Any]) -> dict[str, Any]:
         del params
-        if self._run_task is not None and not self._run_task.done():
-            raise RpcError("RUN_IN_PROGRESS", "任务运行时不能清空会话")
+        self._ensure_no_active_run("任务运行时不能清空会话")
         self._require_session().agent.reset()
         payload = await self._workspace_payload_with_memory()
         self._publish("session.changed", payload)
@@ -311,8 +323,7 @@ class DesktopRuntime:
         ]
 
     async def _model_select(self, params: dict[str, Any]) -> dict[str, Any]:
-        if self._run_task is not None and not self._run_task.done():
-            raise RpcError("RUN_IN_PROGRESS", "任务运行时不能切换模型")
+        self._ensure_no_active_run("任务运行时不能切换模型")
         model_id = params.get("modelId")
         provider_id = params.get("provider")
         if not isinstance(model_id, str) or not isinstance(provider_id, str):
@@ -342,8 +353,7 @@ class DesktopRuntime:
             raise RpcError("INVALID_PARAMS", "run.start 需要非空 text")
         if text.lstrip().startswith("/"):
             raise RpcError("SLASH_COMMAND", "斜杠命令需要由桌面端处理，不能作为提示词发送给模型")
-        if self._run_task is not None and not self._run_task.done():
-            raise RpcError("RUN_IN_PROGRESS", "当前已有任务正在运行")
+        self._ensure_no_active_run("当前已有任务正在运行")
         run_id = uuid.uuid4().hex
         self._run_id = run_id
         self._run_task = asyncio.create_task(self._drive_run(session, text, run_id))
@@ -383,12 +393,14 @@ class DesktopRuntime:
         self._publish("run.started", {"planAnswer": True}, run_id=run_id)
         try:
             await session.answer_plan_question(question_id, answer)
+        except asyncio.CancelledError:
+            self._publish("run.cancelled", {}, run_id=run_id)
         except PlanModeError as exc:
             self._publish("run.failed", {"code": exc.code, "message": str(exc)}, run_id=run_id)
         except Exception as exc:  # noqa: BLE001 - runtime boundary
             self._publish("run.failed", {"message": str(exc)}, run_id=run_id)
         else:
-            self._publish("run.completed", {"stats": to_jsonable(session.get_stats())}, run_id=run_id)
+            self._publish_prompt_outcome(session, run_id)
         finally:
             if self._run_id == run_id:
                 self._run_id = None
@@ -495,19 +507,32 @@ class DesktopRuntime:
         except Exception as exc:  # noqa: BLE001 - runtime boundary
             self._publish("run.failed", {"message": str(exc)}, run_id=run_id)
         else:
-            self._publish(
-                "run.completed",
-                {"stats": to_jsonable(session.get_stats())},
-                run_id=run_id,
-            )
+            self._publish_prompt_outcome(session, run_id)
         finally:
             if self._run_id == run_id:
                 self._run_id = None
                 self._run_task = None
 
+    def _publish_prompt_outcome(self, session: AgentSession, run_id: str) -> None:
+        status = session.agent.last_run_status
+        if status == "cancelled":
+            self._publish("run.cancelled", {}, run_id=run_id)
+        elif status == "failed":
+            self._publish("run.failed", {
+                "message": session.agent.state.error_message or "模型回合失败",
+            }, run_id=run_id)
+        else:
+            self._publish("run.completed", {"stats": to_jsonable(session.get_stats())}, run_id=run_id)
+
     async def _run_abort(self, params: dict[str, Any]) -> dict[str, Any]:
         del params
+        if self._session is not None and getattr(self._session, "is_compacting", False):
+            self._session.abort_compaction()
+            return {"aborted": True}
         if self._session is None or self._run_task is None or self._run_task.done():
+            if self._session is not None and getattr(self._session, "subagents", None) is not None and self._session.subagents.has_active:
+                await self._session.subagents.aclose()
+                return {"aborted": True}
             return {"aborted": False}
         await self._abort_active_run()
         return {"aborted": True}
@@ -516,7 +541,7 @@ class DesktopRuntime:
         text = params.get("text")
         if not isinstance(text, str) or not text.strip():
             raise RpcError("INVALID_PARAMS", "run.steer 需要非空 text")
-        session = self._require_session()
+        session = self._require_queueable_run(params)
         session.agent.steer(text)
         return {"queued": True}
 
@@ -524,9 +549,25 @@ class DesktopRuntime:
         text = params.get("text")
         if not isinstance(text, str) or not text.strip():
             raise RpcError("INVALID_PARAMS", "run.followUp 需要非空 text")
-        session = self._require_session()
+        session = self._require_queueable_run(params)
         session.agent.follow_up(text)
         return {"queued": True}
+
+    def _require_queueable_run(self, params: dict[str, Any]) -> AgentSession:
+        session = self._require_session()
+        for key in ("runId", "sessionId"):
+            if key in params and (not isinstance(params[key], str) or not params[key]):
+                raise RpcError("INVALID_PARAMS", f"{key} 必须是非空字符串")
+        if self._run_task is None or self._run_task.done() or self._run_id is None:
+            raise RpcError("NO_ACTIVE_RUN", "没有可接收补充指令的运行")
+        if (
+            ("runId" in params and params["runId"] != self._run_id)
+            or ("sessionId" in params and params["sessionId"] != session.session_manager.header.id)
+        ):
+            raise RpcError("STALE_RUN", "运行或会话已变化，请刷新后重试")
+        if not session.agent.is_accepting_messages:
+            raise RpcError("RUN_NOT_ACCEPTING_MESSAGES", "当前运行正在准备、收尾或停止，不能接收补充指令")
+        return session
 
     async def _before_tool_call(
         self,
@@ -564,12 +605,14 @@ class DesktopRuntime:
                     "approval.expired",
                     {"approvalId": approval_id, "toolCallId": context.tool_call.id},
                 )
-                return BeforeToolCallResult(block=True, reason="工具审批已超时")
+                return BeforeToolCallResult(block=True, reason="工具审批已超时", status="timed_out")
             approved = future in done and future.result()
             if approved:
                 return None
             reason = "运行已停止" if signal.is_set() else "用户拒绝了工具执行"
-            return BeforeToolCallResult(block=True, reason=reason)
+            return BeforeToolCallResult(
+                block=True, reason=reason, status="cancelled" if signal.is_set() else "blocked",
+            )
         finally:
             signal_task.cancel()
             self._approvals.pop(approval_id, None)
@@ -586,9 +629,17 @@ class DesktopRuntime:
         return {"resolved": True}
 
     async def _session_compact(self, params: dict[str, Any]) -> dict[str, Any]:
-        del params
         self._ensure_no_active_run("任务运行时不能手动压缩上下文")
-        result = await self._require_session().compact("manual")
+        direction = params.get("direction")
+        if direction is not None and (
+            not isinstance(direction, str) or not direction.strip() or len(direction) > 2000
+        ):
+            raise RpcError("INVALID_PARAMS", "下一阶段目标需要 1–2000 个字符")
+        session = self._require_session()
+        result = (
+            await session.compact("pivot", direction=direction)
+            if direction is not None else await session.compact("manual")
+        )
         if result.get("performed"):
             # Rehydrate the renderer from the same persisted context it will see
             # after a session switch. This replaces the transient progress card
@@ -596,6 +647,45 @@ class DesktopRuntime:
             payload = await self._workspace_payload_with_memory()
             self._publish("session.changed", payload)
         return result
+
+    @staticmethod
+    def _subagent_payload(session: AgentSession) -> list[dict[str, Any]]:
+        manager = getattr(session, "subagents", None)
+        return manager.snapshot() if manager is not None else []
+
+    async def _subagent_list(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+        del params
+        return self._require_session().subagents.snapshot()
+
+    async def _subagent_status(self, params: dict[str, Any]) -> dict[str, Any] | list[dict[str, Any]]:
+        task_id = params.get("taskId")
+        if task_id is None:
+            return self._require_session().subagents.snapshot()
+        if not isinstance(task_id, str) or not task_id:
+            raise RpcError("INVALID_PARAMS", "subagent.status 的 taskId 无效")
+        return self._require_session().subagents.get(task_id)
+
+    async def _subagent_wait(self, params: dict[str, Any]) -> dict[str, Any]:
+        task_id = params.get("taskId")
+        timeout = params.get("timeoutSeconds", 20)
+        if not isinstance(task_id, str) or not task_id:
+            raise RpcError("INVALID_PARAMS", "subagent.wait 需要 taskId")
+        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
+            raise RpcError("INVALID_PARAMS", "subagent.wait 的 timeoutSeconds 无效")
+        return await self._require_session().subagents.wait(task_id, timeout)
+
+    async def _subagent_spawn(self, params: dict[str, Any]) -> dict[str, Any]:
+        task = params.get("task")
+        purpose = params.get("purpose", "investigate")
+        if not isinstance(task, str) or not isinstance(purpose, str):
+            raise RpcError("INVALID_PARAMS", "subagent.spawn 需要 task 和可选 purpose")
+        return self._require_session().subagents.spawn(task, purpose)
+
+    async def _subagent_cancel(self, params: dict[str, Any]) -> dict[str, Any]:
+        task_id = params.get("taskId")
+        if not isinstance(task_id, str) or not task_id:
+            raise RpcError("INVALID_PARAMS", "subagent.cancel 需要 taskId")
+        return await self._require_session().subagents.cancel(task_id)
 
     async def _memory_status(self, params: dict[str, Any]) -> dict[str, Any]:
         del params
@@ -876,6 +966,7 @@ class DesktopRuntime:
             "collaborationMode": session.collaboration_mode,
             "planState": session.plan_state.to_payload(),
             "memory": memory,
+            "subagents": self._subagent_payload(session),
             "webSearch": web_search,
         }
 
@@ -895,6 +986,8 @@ class DesktopRuntime:
         return payload
 
     def _ensure_no_active_run(self, message: str) -> None:
+        if self._session is not None and getattr(self._session, "is_compacting", False):
+            raise RpcError("COMPACTION_IN_PROGRESS", "上下文压缩中，请先停止压缩")
         if self._run_task is not None and not self._run_task.done():
             raise RpcError("RUN_IN_PROGRESS", message)
 

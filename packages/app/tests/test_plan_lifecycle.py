@@ -220,6 +220,7 @@ def test_submit_stops_even_with_queued_follow_up(tmp_path):
     asyncio.run(drive(session, "make plan", submission(), seen=contexts))
     assert len(contexts) == 1
     assert session.plan_state.phase == "ready"
+    assert not session.agent.has_queued_messages()
 
 
 def test_unregistered_tool_denial_has_code_and_alternatives(tmp_path):

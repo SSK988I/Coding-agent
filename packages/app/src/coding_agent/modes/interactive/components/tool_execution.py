@@ -47,28 +47,37 @@ class ToolExecutionComponent(Container):
         # Render the initial "executing…" state.
         self._render_pending()
 
-    def set_result(self, result: Any, is_error: bool = False) -> None:
+    def set_result(self, result: Any, is_error: bool = False, status: str | None = None) -> None:
         """Update the card with the tool execution result."""
-        raw = ""
+        raw = result if isinstance(result, str) else ""
         if hasattr(result, "content") and result.content:
             raw = getattr(result.content[0], "text", "")
         preview = self._preview_output(raw)
-        self._render_done(preview, is_error)
+        outcome = status or getattr(result, "status", None) or ("failed" if is_error else "completed")
+        self._render_done(preview, outcome)
 
-    def _render_pending(self) -> None:
+    def set_status(self, status: str) -> None:
+        self._render_pending(status)
+
+    def _render_pending(self, status: str = "pending") -> None:
         """Render the pending (executing) state."""
         args_str = _format_args(self.args)
         label = self._styled("accent", f"⚙ {self.tool_name}")
-        body = self._styled("muted", f"  {args_str}\n  执行中…")
+        description = {"pending": "准备中…", "approval": "等待审批…", "running": "执行中…"}
+        body = self._styled("muted", f"  {args_str}\n  {description.get(status, '准备中…')}")
         self._card.clear()
         self._card.add_child(Text(f"{label}\n{body}", padding_x=0, padding_y=0))
         # Dark blue-grey background while executing.
         self._card.set_bg_fn(self._bg("toolPendingBg"))
 
-    def _render_done(self, preview: str, is_error: bool) -> None:
+    def _render_done(self, preview: str, outcome: str) -> None:
         """Render the completed state (ok or error)."""
+        is_error = outcome != "completed"
         mark = self._styled("error", "✗") if is_error else self._styled("accent", "✓")
-        status = "error" if is_error else "ok"
+        status = {
+            "completed": "ok", "failed": "error", "cancelled": "已取消",
+            "timed_out": "已超时", "blocked": "未获准执行", "uncertain": "结果未知",
+        }.get(outcome, "结果未知")
         head = self._styled("muted", f"{mark} {self.tool_name} → {status}")
         if preview:
             body = self._styled("toolOutput", preview)

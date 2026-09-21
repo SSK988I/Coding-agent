@@ -1,4 +1,5 @@
 import type { AgentMessage, ContentBlock, RuntimeEvent } from "../../shared/types";
+import { isToolActive, projectToolStatus, type ToolDisplayStatus } from "../../shared/toolStatus";
 
 export type TimelineItemKind = "message" | "tool" | "compaction";
 
@@ -37,7 +38,7 @@ export interface TimelineToolItem extends TimelineItemBase {
   name: string;
   args: unknown;
   result?: unknown;
-  status: "running" | "approval" | "done" | "error";
+  status: ToolDisplayStatus;
   approval?: TimelineApproval;
 }
 
@@ -143,8 +144,27 @@ export function timelineItemsFromPersistedMessages(
   messages: readonly AgentMessage[],
   sessionId: string | null = null,
 ): TimelineItem[] {
+  const calls = new Map<string, ContentBlock>();
+  const answered = new Set<string>();
+  for (const message of messages) {
+    if (message.role === "toolResult" && message.tool_call_id) answered.add(message.tool_call_id);
+    if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+    for (const block of message.content) {
+      if (block.type === "toolCall" && block.id) calls.set(block.id, block);
+    }
+  }
   return messages.flatMap<TimelineItem>((message, index): TimelineItem[] => {
     const timestamp = typeof message.timestamp === "number" ? message.timestamp : index;
+    if (message.role === "toolResult") {
+      if (!message.tool_call_id || message.tool_name === "request_user_input") return [];
+      return [{
+        id: toolItemId(message.tool_call_id), kind: "tool", order: index, revision: 0,
+        sessionId, runId: null, createdAt: timestamp, updatedAt: timestamp,
+        toolCallId: message.tool_call_id, name: message.tool_name ?? "tool",
+        args: calls.get(message.tool_call_id)?.arguments ?? {}, result: message,
+        status: projectToolStatus(message.status, message.is_error),
+      }];
+    }
     if (message.role === "compactionSummary") {
       const tokensBefore = message.tokens_before ?? message.tokensBefore;
       return [{
@@ -164,12 +184,21 @@ export function timelineItemsFromPersistedMessages(
     }
     if (message.role !== "user" && message.role !== "assistant") return [];
 
+    const incomplete: TimelineToolItem[] = message.role === "assistant" && Array.isArray(message.content)
+      ? message.content.flatMap((block) => block.type === "toolCall" && block.id
+        && !answered.has(block.id) && block.name !== "request_user_input" ? [{
+          id: toolItemId(block.id), kind: "tool", order: index, revision: 0,
+          sessionId, runId: null, createdAt: timestamp, updatedAt: timestamp,
+          toolCallId: block.id, name: block.name ?? "tool", args: block.arguments ?? {},
+          result: "未找到执行结果；不能据此判断是否产生了副作用。", status: "uncertain",
+        }] : []) : [];
+
     const content = readAgentMessageContent(message);
     if (message.role === "user" && content.text.trimStart().startsWith("/")) return [];
     if (message.role === "user" && content.text.trimStart().startsWith("<confirmed_plan_execution>")) {
       content.text = "执行已确认计划";
     }
-    if (message.role === "assistant" && !content.text && !content.thinking) return [];
+    if (message.role === "assistant" && !content.text && !content.thinking) return incomplete;
 
     return [{
       id: `persisted-${timestamp}-${index}`,
@@ -184,7 +213,7 @@ export function timelineItemsFromPersistedMessages(
       text: content.text,
       thinking: content.thinking,
       status: message.stop_reason,
-    } satisfies TimelineMessageItem];
+    } satisfies TimelineMessageItem, ...incomplete];
   });
 }
 
@@ -307,6 +336,17 @@ export function reduceRuntimeEventBatch(
       continue;
     }
     if (type === "run.completed" || type === "run.cancelled" || type === "run.failed") {
+      for (const [id, item] of Object.entries(entities)) {
+        if (item.kind !== "tool" || item.sessionId !== envelope.sessionId
+          || item.runId !== envelope.runId || !isToolActive(item.status)) continue;
+        pendingToolUpdates.delete(id);
+        entities[id] = {
+          ...item, approval: undefined, status: "uncertain",
+          result: item.result ?? "运行已结束，但未收到工具终态。", revision: item.revision + 1,
+          updatedAt: envelope.timestamp, lastSeq: envelope.seq,
+        };
+        changed = true;
+      }
       if (running) {
         running = false;
         changed = true;
@@ -440,9 +480,19 @@ export function reduceRuntimeEventBatch(
         name: String(payload.tool_name ?? ""),
         args: payload.args,
         result: existingTool?.result,
-        status: "running",
+        status: payload.status === "pending" ? "pending" : "running",
         approval: existingTool?.approval,
       });
+      continue;
+    }
+    if (type === "tool_execution_running") {
+      const id = toolItemId(String(payload.tool_call_id ?? ""));
+      const item = entities[id];
+      if (item?.kind === "tool" && isToolActive(item.status)) {
+        entities[id] = { ...item, status: "running", approval: undefined,
+          revision: item.revision + 1, updatedAt: envelope.timestamp, lastSeq: envelope.seq };
+        changed = true;
+      }
       continue;
     }
     if (type === "tool_execution_update") {
@@ -451,7 +501,7 @@ export function reduceRuntimeEventBatch(
       if (!toolCallId) continue;
       const id = toolItemId(toolCallId);
       const item = entities[id];
-      if (!item || item.kind !== "tool") continue;
+      if (!item || item.kind !== "tool" || !isToolActive(item.status)) continue;
       pendingToolUpdates.set(id, {
         result: payload.partial_result,
         timestamp: envelope.timestamp,
@@ -473,7 +523,7 @@ export function reduceRuntimeEventBatch(
         ...item,
         approval: undefined,
         result: payload.result,
-        status: payload.is_error ? "error" : "done",
+        status: projectToolStatus(payload.status, Boolean(payload.is_error)),
         revision: item.revision + 1,
         updatedAt: envelope.timestamp,
         lastSeq: envelope.seq,
@@ -516,7 +566,7 @@ export function reduceRuntimeEventBatch(
         ...item,
         approval: undefined,
         result: "工具审批已超时",
-        status: "error",
+        status: "timed_out",
         revision: item.revision + 1,
         updatedAt: envelope.timestamp,
         lastSeq: envelope.seq,
