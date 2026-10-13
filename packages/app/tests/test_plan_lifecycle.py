@@ -171,15 +171,112 @@ def test_handoff_review_context_follows_active_branch(tmp_path):
     plan = ready(session)
     target = session.handoff_plan_to_new_session(plan.plan_id, plan.revision, plan.digest)
     handoff_leaf = target.leaf_id
+    source_id = target.header.parent_session
+    assert session.plan_state.handoff_source_session_id == source_id
+    assert not session.plan_state.can_handoff
     assert "<handed_off_plan_for_review>" in session.state.system_prompt
     target.branch(target.entries[0].id)
     session.refresh_plan_state_from_branch()
     assert session.plan_state.phase == "drafting"
+    assert session.plan_state.handoff_source_session_id == source_id
+    assert not session.plan_state.can_handoff
     assert "<handed_off_plan_for_review>" not in session.state.system_prompt
     target.branch(handoff_leaf)
     session.refresh_plan_state_from_branch()
     assert session.plan_state.phase == "ready"
     assert "<handed_off_plan_for_review>" in session.state.system_prompt
+    assert session.plan_state.handoff_source_session_id == source_id
+    assert not session.plan_state.can_handoff
+
+
+@pytest.mark.parametrize("revise", [False, True])
+@pytest.mark.parametrize("reopen", [False, True])
+def test_review_episode_cannot_handoff_again(tmp_path, revise, reopen):
+    session = session_at(tmp_path, disk=True)
+    plan = ready(session)
+    source_id = session.session_manager.header.id
+    target = session.handoff_plan_to_new_session(plan.plan_id, plan.revision, plan.digest)
+    if revise:
+        asyncio.run(drive(session, "Refine the reviewed plan", submission("review-submit")))
+        assert session.plan_state.latest_revision.origin_session_id is None
+    if reopen:
+        session = AgentSession(AgentSessionConfig(
+            model=session.model, cwd=str(tmp_path), session_manager=SessionManager.open(target.path),
+        ))
+    latest = session.plan_state.latest_revision
+    entries_before = list(session.session_manager.entries)
+    files_before = set((tmp_path / "sessions").rglob("*.jsonl"))
+
+    with pytest.raises(PlanModeError) as error:
+        session.handoff_plan_to_new_session(latest.plan_id, latest.revision, latest.digest)
+
+    assert error.value.code == "PLAN_ALREADY_IN_REVIEW"
+    assert session.plan_state.phase == "ready"
+    assert session.plan_state.handoff_source_session_id == source_id
+    assert not session.plan_state.can_handoff
+    assert session.plan_state.to_payload()["canHandoff"] is False
+    assert session.plan_state.to_payload()["handoffSourceSessionId"] == source_id
+    assert session.session_manager.entries == entries_before
+    assert set((tmp_path / "sessions").rglob("*.jsonl")) == files_before
+
+
+def test_independent_new_episode_in_review_session_can_handoff(tmp_path):
+    session = session_at(tmp_path, disk=True)
+    plan = ready(session)
+    assert session.plan_state.can_handoff
+    child = session.handoff_plan_to_new_session(plan.plan_id, plan.revision, plan.digest)
+    review_leaf = child.leaf_id
+    session.cancel_plan_mode()
+    session.enter_plan_mode()
+    new_plan = ready(session)
+    independent_leaf = child.leaf_id
+    restored = SessionManager.open(child.path)
+    session = AgentSession(AgentSessionConfig(
+        model=session.model, cwd=str(tmp_path), session_manager=restored,
+    ))
+
+    assert new_plan.plan_id != plan.plan_id
+    assert session.plan_state.handoff_source_session_id is None
+    assert session.plan_state.can_handoff
+    restored.branch(review_leaf)
+    session.refresh_plan_state_from_branch()
+    assert not session.plan_state.can_handoff
+    restored.branch(independent_leaf)
+    session.refresh_plan_state_from_branch()
+    assert session.plan_state.can_handoff
+    target = session.handoff_plan_to_new_session(new_plan.plan_id, new_plan.revision, new_plan.digest)
+    assert target.header.parent_session == child.header.id
+
+
+def test_handoff_rpc_returns_review_capability_and_blocks_repeat(tmp_path):
+    from coding_agent.desktop.protocol import RpcError
+    from coding_agent.desktop.runtime import DesktopRuntime
+
+    session = session_at(tmp_path, disk=True)
+    plan = ready(session)
+    source_id = session.session_manager.header.id
+    runtime = DesktopRuntime(lambda _event: None)
+    runtime._workspace = tmp_path
+    runtime._session = session
+    params = {"planId": plan.plan_id, "revision": plan.revision, "digest": plan.digest}
+
+    async def run():
+        result = await runtime.dispatch("plan.handoff", params)
+        assert result["sessionId"] != source_id
+        assert result["planState"]["phase"] == "ready"
+        assert result["planState"]["handoffSourceSessionId"] == source_id
+        assert result["planState"]["canHandoff"] is False
+        entries_before = list(session.session_manager.entries)
+        with pytest.raises(RpcError) as error:
+            await runtime.dispatch("plan.handoff", params)
+        assert error.value.code == "PLAN_ALREADY_IN_REVIEW"
+        snapshot = await runtime.dispatch("session.snapshot", {})
+        assert snapshot["sessionId"] == result["sessionId"]
+        assert snapshot["planState"] == result["planState"]
+        assert session.session_manager.entries == entries_before
+        assert not any(isinstance(entry, PlanRunEntry) for entry in entries_before)
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("stop", ["aborted", "error", "length"])

@@ -509,6 +509,7 @@ def main(argv: list[str] | None = None) -> int:
         theme_name=settings.theme,
         collaboration_mode=cast(Any, args.agent_mode or "default"),
         question_behavior="interactive" if app_mode == "interactive" else "deferred",
+        permission_mode=cast(Any, args.permission_mode or (settings.tui_permission_mode if app_mode == "interactive" else None)),
         memory_configured=True,
         memory_enabled=settings.memory_enabled,
         memory_auto_extract=settings.memory_auto_extract,

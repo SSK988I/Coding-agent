@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from agent_tui import load_theme
+import pytest
 
 from coding_agent.core.plan_mode import PlanRevision
 from coding_agent.modes.interactive.components.plan_actions import (
@@ -43,3 +44,21 @@ def test_plan_phase_menus_keep_an_explicit_exit() -> None:
         rendered = "\n".join(component.render(100))
         for label in labels:
             assert label in rendered
+
+
+@pytest.mark.parametrize("origin_session_id", [None, "source-session"])
+def test_review_episode_actions_omit_repeat_handoff(origin_session_id: str | None) -> None:
+    plan = PlanRevision(
+        plan_id="plan-1", revision=2, title="Reviewed plan", markdown="Reviewed body",
+        digest="abcdef0123456789", source_message_id="message-2",
+        origin_session_id=origin_session_id,
+    )
+    component = PlanActionsComponent(
+        load_theme("dark"), plan, lambda _: None, lambda: None, can_handoff=False,
+    )
+    rendered = "\n".join(component.render(100))
+    assert "新会话复核" not in rendered
+    assert "当前会话执行" in rendered
+    assert "补充想法" in rendered
+    assert "只读子代理复核" in rendered
+    assert "取消规划" in rendered

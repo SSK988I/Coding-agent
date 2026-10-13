@@ -59,6 +59,7 @@ BUILTIN_SLASH_COMMANDS: list[BuiltinSlashCommand] = [
     BuiltinSlashCommand("name", "Set session display name"),
     BuiltinSlashCommand("new", "Start a new session"),
     BuiltinSlashCommand("plan", "Enter Plan Mode or show current Plan actions"),
+    BuiltinSlashCommand("permissions", "审批模式：on 开启 bypass / off 恢复审批 / auto；不带参数打开菜单"),
     BuiltinSlashCommand("cancel-plan", "Cancel Plan Mode without executing"),
     BuiltinSlashCommand("execute-plan", "Execute the latest confirmed Plan revision"),
     BuiltinSlashCommand("memory", "Inspect and manage long-term memory"),

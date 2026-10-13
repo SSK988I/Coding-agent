@@ -76,7 +76,7 @@ A bare `/plan` is state-aware:
 - `drafting`: continue, ask the assistant to submit, or cancel.
 - `awaiting_answer`: restore the pending question or cancel.
 - `ready`: supplement, execute here, hand off for clean-session review, or
-  cancel.
+  cancel. A handed-off review episode omits the handoff action.
 - `executing`: inspect status or request stop.
 - `uncertain` / `recovery_error`: inspect details, start a new Plan Episode, or
   cancel. The old run is never retried automatically. `executing` and these
@@ -164,6 +164,17 @@ Handoff validates the exact latest revision, creates a child session whose
 plus origin metadata. Planning conversation, questions and tool output are not
 copied. The child opens in `ready`; execution requires another explicit click
 or `--execute-plan` in that child.
+
+Within that review episode, the user can revise, execute or cancel the plan,
+but cannot hand it off again. Core rejects a repeated handoff with
+`PLAN_ALREADY_IN_REVIEW` before creating another session. Plan State exposes
+`handoffSourceSessionId` and the derived `canHandoff` capability; both clients
+use that snapshot to omit the repeated action. The source is recovered from
+the episode's existing `reason=handoff` entry, not just the latest revision,
+so editing, resubmitting, reopening or switching branches preserves the rule.
+Existing JSONL entries and revision digests are not rewritten. Ending that
+episode and explicitly starting a new, independent plan restores normal
+handoff availability for the new plan.
 
 The source records `reason=handoff` and the target ID only after the target is
 durably created. A failed handoff leaves the source ready. A partially created

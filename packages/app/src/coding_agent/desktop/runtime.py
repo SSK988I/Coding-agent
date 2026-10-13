@@ -2,10 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import os
 from pathlib import Path
-import re
-import shlex
 import time
 from typing import Any, Awaitable, Callable, cast
 import uuid
@@ -25,9 +24,12 @@ from coding_agent.core.settings import SettingsManager
 from coding_agent.core.slash_commands import get_active_commands
 from coding_agent.core.subagents import SubagentError
 from coding_agent.desktop.protocol import PROTOCOL_VERSION, RpcError, to_jsonable
+from coding_agent.core.permissions import (
+    PERMISSION_MODES, PermissionMode, requires_approval,
+    is_approval_safe_shell_command as _is_default_approval_safe_shell_command,
+)
 
 EventEmitter = Callable[[dict[str, Any]], None]
-_APPROVAL_TOOLS = {"bash", "write", "edit"}
 _DESKTOP_COMMANDS = {
     "help": ("帮助", "查看桌面端可用命令"),
     "new": ("新会话", "创建一个新的会话"),
@@ -56,6 +58,8 @@ class DesktopRuntime:
         self._seq = 0
         self._approvals: dict[str, asyncio.Future[bool]] = {}
         self._approval_timeout_seconds = approval_timeout_seconds
+        self._permission_mode: PermissionMode = cast(PermissionMode, SettingsManager().load().desktop_permission_mode)
+        self._native_search_decision: tuple[str, bool] | None = None
 
     async def dispatch(self, method: str, params: dict[str, Any]) -> Any:
         handlers: dict[str, Callable[[dict[str, Any]], Awaitable[Any]]] = {
@@ -74,6 +78,7 @@ class DesktopRuntime:
             "run.steer": self._run_steer,
             "run.followUp": self._run_follow_up,
             "approval.resolve": self._approval_resolve,
+            "permission.setMode": self._permission_set_mode,
             "mode.enterPlan": self._mode_enter_plan,
             "plan.answer": self._plan_answer,
             "plan.cancel": self._plan_cancel,
@@ -109,7 +114,7 @@ class DesktopRuntime:
         del params
         return {
             "protocolVersion": PROTOCOL_VERSION, "status": "ready",
-            "capabilities": ["plan_mode_v1", "memory_v1", "memory_v2", "web_search_v1", "context_pivot_v1", "readonly_subagents_v1"],
+            "capabilities": ["plan_mode_v1", "memory_v1", "memory_v2", "web_search_v1", "context_pivot_v1", "readonly_subagents_v1", "desktop_permissions_v1"],
         }
 
     async def _workspace_open(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -138,6 +143,7 @@ class DesktopRuntime:
 
         settings_manager = SettingsManager()
         settings = settings_manager.load()
+        self._permission_mode = cast(PermissionMode, settings.desktop_permission_mode)
         provider_id = settings.default_provider or "deepseek"
         providers = _all_providers()
         provider = next((item for item in providers if item.id == provider_id), None)
@@ -192,6 +198,7 @@ class DesktopRuntime:
             reasoning=reasoning,
             context_files=context_files,
             before_tool_call=self._before_tool_call,
+            before_native_web_search=self._before_native_web_search,
             retry_policy=RetryPolicy(
                 enabled=settings.auto_retry,
                 max_retries=settings.max_retries,
@@ -273,6 +280,7 @@ class DesktopRuntime:
             "collaborationMode": session.collaboration_mode,
             "planState": session.plan_state.to_payload(),
             "subagents": self._subagent_payload(session),
+            "permissionMode": self._permission_mode,
         }
 
     async def _session_clear(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -574,23 +582,61 @@ class DesktopRuntime:
         context: BeforeToolCallContext,
         signal: asyncio.Event,
     ) -> BeforeToolCallResult | None:
-        if context.tool_call.name not in _APPROVAL_TOOLS:
-            return None
-        if context.tool_call.name == "bash" and _is_default_approval_safe_shell_command(
-            str(context.args.get("command", "")),
-            str(self._workspace or Path.cwd()),
+        if not requires_approval(
+            self._permission_mode, context.tool_call.name, context.args,
+            self._workspace, _is_default_approval_safe_shell_command,
         ):
             return None
+        return await self._request_approval(context, signal)
+
+    async def _permission_set_mode(self, params: dict[str, Any]) -> dict[str, Any]:
+        session = self._require_session()
+        self._ensure_no_active_run("请先停止当前任务，再切换访问权限")
+        if session.subagents.has_active:
+            raise RpcError("SUBAGENT_RUNNING", "请先停止子代理，再切换访问权限")
+        mode = params.get("mode")
+        if not isinstance(mode, str) or mode not in PERMISSION_MODES:
+            raise RpcError("INVALID_PARAMS", "mode 必须是 ask、auto 或 full_access")
+        configured_manager = getattr(getattr(session, "_config", None), "settings_manager", None)
+        settings_manager = configured_manager or SettingsManager()
+        settings = replace(settings_manager.load(), desktop_permission_mode=mode)
+        settings_manager.save(settings)
+        self._permission_mode = cast(PermissionMode, mode)
+        payload = {"sessionId": session.session_manager.header.id, "permissionMode": mode}
+        self._publish("permission.changed", payload)
+        return payload
+
+    async def _before_native_web_search(self, signal: asyncio.Event) -> bool:
+        if self._permission_mode != "ask":
+            return True
+        run_id = self._run_id
+        if run_id is None:
+            return False
+        if self._native_search_decision is not None and self._native_search_decision[0] == run_id:
+            return self._native_search_decision[1]
+        decision = await self._request_approval(None, signal)
+        allowed = decision is None
+        if signal.is_set():
+            raise asyncio.CancelledError
+        self._native_search_decision = (run_id, allowed)
+        return allowed
+
+    async def _request_approval(
+        self, context: BeforeToolCallContext | None, signal: asyncio.Event,
+    ) -> BeforeToolCallResult | None:
         approval_id = uuid.uuid4().hex
         future = asyncio.get_running_loop().create_future()
         self._approvals[approval_id] = future
         self._publish(
-            "approval.requested",
+            "approval.requested" if context is not None else "permission.networkRequested",
             {
                 "approvalId": approval_id,
                 "toolCallId": context.tool_call.id,
                 "toolName": context.tool_call.name,
                 "args": context.args,
+            } if context is not None else {
+                "approvalId": approval_id,
+                "message": "是否允许本次任务使用联网搜索？",
             },
         )
         signal_task = asyncio.create_task(signal.wait())
@@ -603,10 +649,10 @@ class DesktopRuntime:
             if not done:
                 self._publish(
                     "approval.expired",
-                    {"approvalId": approval_id, "toolCallId": context.tool_call.id},
+                    {"approvalId": approval_id, "toolCallId": context.tool_call.id if context else None},
                 )
                 return BeforeToolCallResult(block=True, reason="工具审批已超时", status="timed_out")
-            approved = future in done and future.result()
+            approved = future in done and future.result() and not signal.is_set()
             if approved:
                 return None
             reason = "运行已停止" if signal.is_set() else "用户拒绝了工具执行"
@@ -615,7 +661,10 @@ class DesktopRuntime:
             )
         finally:
             signal_task.cancel()
+            await asyncio.gather(signal_task, return_exceptions=True)
             self._approvals.pop(approval_id, None)
+            if context is None:
+                self._publish("permission.networkResolved", {"approvalId": approval_id})
 
     async def _approval_resolve(self, params: dict[str, Any]) -> dict[str, Any]:
         approval_id = params.get("approvalId")
@@ -877,7 +926,15 @@ class DesktopRuntime:
             try:
                 await task
             except asyncio.CancelledError:
-                pass
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+        except asyncio.CancelledError:
+            # The run may cancel itself while we await its shutdown. That is
+            # not cancellation of the navigation/abort request awaiting it.
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
 
     async def _dispose_session(self) -> None:
         if self._unsubscribe is not None:
@@ -968,6 +1025,7 @@ class DesktopRuntime:
             "memory": memory,
             "subagents": self._subagent_payload(session),
             "webSearch": web_search,
+            "permissionMode": self._permission_mode,
         }
 
     async def _workspace_payload_with_memory(self) -> dict[str, Any]:
@@ -1002,138 +1060,6 @@ class DesktopRuntime:
         return self._session
 
 
-_DEFAULT_CONTROL_TOKENS = (";", "||", "`", "$(", ">", "<", "\n", "\r")
-_DEFAULT_SHELL_SPLIT_RE = re.compile(r"\s*(?:\|\||&&|\|)\s*")
-_DEFAULT_SAFE_FD_REDIRECTION_RE = re.compile(r"(?<!\S)(?:2>&1|1>&2)(?=\s|$)")
-_DEFAULT_READ_COMMANDS = {
-    "pwd", "ls", "dir", "cat", "head", "tail", "wc", "sort", "uniq",
-    "cut", "grep", "rg", "fd", "find", "where", "which", "type",
-    "get-content", "select-string", "get-childitem", "git",
-}
-_DEFAULT_READ_ONLY_GIT = {
-    "status", "diff", "show", "log", "branch", "rev-parse", "ls-files",
-    "ls-tree", "cat-file", "grep", "blame", "remote", "tag", "describe",
-}
-_DEFAULT_VALIDATION_EXECUTABLES = {"pytest", "ruff", "pyright", "mypy"}
-_DEFAULT_SAFE_PACKAGE_SCRIPTS = {"test", "typecheck", "lint", "check", "build"}
-_DEFAULT_DANGEROUS_FIND_FLAGS = {"-delete", "-exec", "-execdir", "-ok", "-okdir"}
-
-
-def _is_default_approval_safe_shell_command(command: str, cwd: str) -> bool:
-    """Preserve the desktop's Default-mode approval shortcut.
-
-    Plan Mode no longer uses a shell allowlist: its runtime tool policy prevents
-    Bash from being registered and blocks denied tools again before execution.
-    This classifier is deliberately local to the desktop approval adapter so
-    tightening Plan Mode does not silently change established Default behavior.
-    """
-    command = _DEFAULT_SAFE_FD_REDIRECTION_RE.sub("", command.strip())
-    if not command or any(token in command for token in _DEFAULT_CONTROL_TOKENS):
-        return False
-    if re.search(r"(?:^|\s)\.\.(?:[\\/]|(?:\s|$))", command):
-        return False
-    segments = _DEFAULT_SHELL_SPLIT_RE.split(command)
-    if not segments or any(not segment.strip() for segment in segments):
-        return False
-    for segment in segments:
-        try:
-            tokens = shlex.split(segment, posix=True)
-        except ValueError:
-            return False
-        if not tokens or not _is_default_approval_safe_segment(tokens, cwd):
-            return False
-    return True
-
-
-def _is_default_approval_safe_segment(tokens: list[str], cwd: str) -> bool:
-    executable = tokens[0].replace("\\", "/").rsplit("/", 1)[-1].casefold()
-    if executable.endswith(".exe"):
-        executable = executable[:-4]
-    args = tokens[1:]
-    if executable == "cd":
-        return len(args) == 1 and _default_path_stays_in_workspace(args[0], cwd)
-    if executable == "git":
-        positional = [item for item in args if not item.startswith("-")]
-        if not positional or positional[0].casefold() not in _DEFAULT_READ_ONLY_GIT:
-            return False
-        if positional[0].casefold() == "branch" and len(positional) > 1:
-            return False
-        if any(
-            item in {"-c", "-o", "--paginate"}
-            or item.startswith(("--output", "--exec-path", "--open-files-in-pager"))
-            for item in args
-        ):
-            return False
-    elif executable in _DEFAULT_READ_COMMANDS:
-        if executable == "find" and any(
-            item.casefold() in _DEFAULT_DANGEROUS_FIND_FLAGS for item in args
-        ):
-            return False
-        if executable == "rg" and any(
-            item == "--pre" or item.startswith("--pre=") for item in args
-        ):
-            return False
-        if executable == "sort" and any(
-            item == "-o" or item.startswith("--output") for item in args
-        ):
-            return False
-        if executable == "uniq" and len(
-            [item for item in args if not item.startswith("-")]
-        ) > 1:
-            return False
-    elif executable in _DEFAULT_VALIDATION_EXECUTABLES:
-        pass
-    elif executable in {"pnpm", "npm", "yarn"}:
-        lowered = {item.casefold() for item in args if not item.startswith("-")}
-        if (
-            lowered.isdisjoint(_DEFAULT_SAFE_PACKAGE_SCRIPTS)
-            or lowered & {"add", "install", "exec", "publish"}
-        ):
-            return False
-    elif executable == "uv":
-        if not _is_default_approval_safe_uv(args):
-            return False
-    else:
-        return False
-    return all(
-        _default_path_stays_in_workspace(token, cwd)
-        for token in args
-        if _default_looks_like_path(token)
-    )
-
-
-def _is_default_approval_safe_uv(args: list[str]) -> bool:
-    lowered = [item.casefold() for item in args if not item.startswith("-")]
-    if not lowered:
-        return False
-    if lowered[0] == "build":
-        return True
-    if lowered[0] != "run" or len(lowered) < 2:
-        return False
-    if lowered[1] in _DEFAULT_VALIDATION_EXECUTABLES:
-        return True
-    return lowered[1:3] == ["python", "scripts/check_versions.py"]
-
-
-def _default_looks_like_path(token: str) -> bool:
-    if token.startswith("-"):
-        return False
-    return (
-        "/" in token or "\\" in token or token in {".", ".."}
-        or bool(re.match(r"^[A-Za-z]:", token))
-    )
-
-
-def _default_path_stays_in_workspace(token: str, cwd: str) -> bool:
-    if any(char in token for char in "*?[]{}"):
-        token = token.split("*", 1)[0].split("?", 1)[0] or "."
-    try:
-        root = Path(cwd).resolve()
-        candidate = Path(token)
-        resolved = candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
-        return os.path.commonpath((str(root), str(resolved))) == str(root)
-    except (OSError, ValueError):
-        return False
 
 
 def _is_read_only_bash_command(command: str) -> bool:

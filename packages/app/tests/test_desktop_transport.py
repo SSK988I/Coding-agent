@@ -113,6 +113,110 @@ def test_stdio_stop_and_ping_interrupt_real_compaction(monkeypatch, tmp_path):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("method", ["session.open", "session.new"])
+@pytest.mark.parametrize("cancelled_child", ["run", "memory"])
+def test_session_navigation_replies_when_a_background_task_is_cancelled(
+    monkeypatch, tmp_path, method, cancelled_child,
+):
+    """An observed child cancellation must not silently cancel an RPC reply."""
+    async def scenario():
+        from coding_agent.core.config import get_sessions_dir
+
+        wire = Wire()
+        runtime = DesktopRuntime(lambda _: None)
+        source = SessionManager.create(cwd=str(tmp_path), sessions_dir=get_sessions_dir())
+        source.append_message(UserMessage(content="Original transcript"))
+        source.flush()
+        target = SessionManager.create(cwd=str(tmp_path), sessions_dir=get_sessions_dir())
+        target.append_message(UserMessage(content="Target transcript"))
+        target.flush()
+        session = AgentSession(AgentSessionConfig(
+            cwd=str(tmp_path), session_manager=source, tools=[], memory_configured=True,
+            memory_enabled=True, memory_root=tmp_path / "memory",
+            model=Model(id="test", cost=ModelCost(input=0, output=0, cache_read=0, cache_write=0)),
+        ))
+        runtime._workspace = tmp_path
+        runtime._session = session
+        started = asyncio.Event()
+
+        async def background():
+            started.set()
+            await asyncio.Event().wait()
+
+        child = asyncio.create_task(background())
+        await started.wait()
+        if cancelled_child == "run":
+            runtime._run_task = child
+            runtime._run_id = "previous-run"
+
+            async def abort():
+                child.cancel()
+
+            monkeypatch.setattr(session, "abort", abort)
+        else:
+            service = session.memory_service
+            service._worker_task = child
+            close = service.close
+
+            async def close_while_worker_is_cancelled(**kwargs):
+                asyncio.get_running_loop().call_soon(child.cancel)
+                await close(**kwargs)
+
+            monkeypatch.setattr(service, "close", close_while_worker_is_cancelled)
+
+        serving = wire.start(monkeypatch, runtime)
+        try:
+            params = {"sessionId": target.header.id} if method == "session.open" else {}
+            wire.send("switch", method, **params)
+            reply = await wire.response("switch")
+            assert "result" in reply, reply
+            result = reply["result"]
+            assert result["sessionId"] != source.header.id
+            if method == "session.open":
+                assert result["sessionId"] == target.header.id
+                assert result["messages"][0]["content"] == "Target transcript"
+            else:
+                assert result["messages"] == []
+            assert child.cancelled()
+            assert [message.content for message in SessionManager.open(source.path).build_session_context().messages] == ["Original transcript"]
+            wire.send("ping", "runtime.ping")
+            assert "result" in await wire.response("ping")
+        finally:
+            child.cancel()
+            await asyncio.gather(child, return_exceptions=True)
+            await wire.close(serving)
+
+    asyncio.run(scenario())
+
+
+def test_stdio_returns_error_for_nested_cancellation_without_losing_request_id(monkeypatch):
+    async def scenario():
+        wire = Wire()
+        runtime = DesktopRuntime(lambda _: None)
+        original_dispatch = runtime.dispatch
+
+        async def dispatch(method, params):
+            if method == "test.cancelled_child":
+                child = asyncio.create_task(asyncio.sleep(60))
+                child.cancel()
+                await child
+            return await original_dispatch(method, params)
+
+        monkeypatch.setattr(runtime, "dispatch", dispatch)
+        serving = wire.start(monkeypatch, runtime)
+        try:
+            wire.send("interrupted", "test.cancelled_child")
+            reply = await wire.response("interrupted")
+            assert reply["id"] == "interrupted"
+            assert reply["error"]["code"] == "REQUEST_CANCELLED"
+            wire.send("ping", "runtime.ping")
+            assert "result" in await wire.response("ping")
+        finally:
+            await wire.close(serving)
+
+    asyncio.run(scenario())
+
+
 def test_sidecar_process_accepts_stop_over_real_pipes():
     # Only the slow operation is replaced. Requests pass through OS pipes, the
     # real process entrypoint, JSON parsing, dispatch and the real abort handler.
@@ -175,6 +279,109 @@ def test_sidecar_process_accepts_stop_over_real_pipes():
             process.stdin.close()
             assert await asyncio.wait_for(process.wait(), 5) == 0
             assert await process.stderr.read() == b""
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("method", ["session.open", "session.new"])
+@pytest.mark.parametrize("cancelled_child", ["run", "memory"])
+def test_sidecar_process_switches_once_after_child_cancellation(tmp_path, method, cancelled_child):
+    """Exercise real OS pipes, the runtime and session storage without a model call."""
+    from coding_agent.core.config import get_sessions_dir
+
+    target = SessionManager.create(cwd=str(tmp_path), sessions_dir=get_sessions_dir())
+    target.append_message(UserMessage(content="Target transcript"))
+    target.flush()
+    bootstrap = textwrap.dedent('''
+        import asyncio
+        import sys
+        from agent_llm import UserMessage
+        from coding_agent.desktop import __main__ as sidecar
+        from coding_agent.desktop.runtime import DesktopRuntime
+
+        class Runtime(DesktopRuntime):
+            async def dispatch(self, method, params):
+                result = await super().dispatch(method, params)
+                if method == "workspace.open":
+                    session = self._session
+                    session.session_manager.append_message(UserMessage(content="Original transcript"))
+                    session.session_manager.flush()
+                    started = asyncio.Event()
+
+                    async def background():
+                        started.set()
+                        await asyncio.Event().wait()
+
+                    child = asyncio.create_task(background())
+                    await started.wait()
+                    if sys.argv[1] == "run":
+                        self._run_task = child
+                        self._run_id = "previous-run"
+
+                        async def abort():
+                            child.cancel()
+
+                        session.abort = abort
+                    else:
+                        session.set_memory_enabled(True)
+                        service = session.memory_service
+                        service._worker_task = child
+                        close = service.close
+
+                        async def closing(**kwargs):
+                            asyncio.get_running_loop().call_soon(child.cancel)
+                            await close(**kwargs)
+
+                        service.close = closing
+                return result
+
+        sidecar.DesktopRuntime = Runtime
+        raise SystemExit(sidecar.main())
+    ''')
+
+    async def scenario():
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", bootstrap, cancelled_child,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+
+        async def request(request_id, method, **params):
+            process.stdin.write((json.dumps({"v": 1, "id": request_id, "method": method, "params": params}) + "\n").encode())
+            await process.stdin.drain()
+            async with asyncio.timeout(10):
+                while True:
+                    line = await process.stdout.readline()
+                    assert line, "Sidecar exited without replying"
+                    reply = json.loads(line)
+                    if reply.get("id") == request_id:
+                        assert "result" in reply, reply
+                        return reply["result"]
+
+        try:
+            source = await request("open", "workspace.open", path=str(tmp_path), resume=False)
+            params = {"sessionId": target.header.id} if method == "session.open" else {}
+            switched = await request("switch", method, **params)
+            assert switched["sessionId"] != source["sessionId"]
+            if method == "session.open":
+                assert switched["sessionId"] == target.header.id
+                assert switched["messages"][0]["content"] == "Target transcript"
+            else:
+                assert switched["messages"] == []
+            await request("ping", "runtime.ping")
+            snapshot = await request("snapshot", "session.snapshot")
+            assert snapshot["sessionId"] == switched["sessionId"]
+            process.stdin.close()
+            assert await asyncio.wait_for(process.wait(), 5) == 0
+            assert await process.stderr.read() == b""
+            original = next(info for info in SessionManager.list_sessions(
+                cwd=str(tmp_path), sessions_dir=get_sessions_dir(),
+            ) if info.id == source["sessionId"])
+            assert [message.content for message in SessionManager.open(original.path).build_session_context().messages] == ["Original transcript"]
         finally:
             if process.returncode is None:
                 process.kill()
@@ -258,6 +465,8 @@ def test_stdio_serializes_mutations_and_cleans_up_before_dispose(monkeypatch, sh
             await asyncio.wait_for(serving, 2)
             assert "session.new" not in calls
             assert calls.count("disposed") == 1
+            assert "open" not in wire.responses
+            assert "new" not in wire.responses
         finally:
             release.set()
             await wire.close(serving)

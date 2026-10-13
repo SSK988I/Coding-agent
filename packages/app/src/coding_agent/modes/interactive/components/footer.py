@@ -85,6 +85,12 @@ class FooterComponent(Component):
             lvl = thinking_level or "off"
             model_part = f"{model_id} • thinking {lvl}"
         mode_part = self._plan_label()
+        permission_mode = getattr(self._session, "permission_mode", None)
+        permission_part = (
+            "bypass permissions on" if permission_mode == "full_access"
+            else "permissions auto" if permission_mode == "auto"
+            else "permissions ask" if permission_mode == "ask" else ""
+        )
 
         # Token stats + context usage.
         token_part = ""
@@ -98,19 +104,26 @@ class FooterComponent(Component):
                 token_part += f" · ctx {ctx:.0f}%"
 
         cost_part = f"${stats.cost:.4f}" if stats.cost > 0 else ""
+        if len(" | ".join(p for p in (mode_part, permission_part) if p)) > width:
+            permission_part = "bypass on" if permission_mode == "full_access" else permission_part
+        extra_status = ""
+        if mode_part and permission_part and len(mode_part) + len(permission_part) + 3 > width:
+            extra_status = permission_part[:width]
+            permission_part = ""
 
         # Join with separators.  Wide terminals retain the existing inline
         # order.  On narrow terminals, keep the Plan recovery/lifecycle label
         # visible even when a long cwd would otherwise consume the whole row.
-        parts = [p for p in (left, mode_part, model_part, token_part, cost_part) if p]
+        parts = [p for p in (left, mode_part, permission_part, model_part, token_part, cost_part) if p]
         line = " | ".join(parts)
 
-        if len(line) > width and mode_part:
-            suffix = f" | {mode_part}"
+        status_part = " | ".join(p for p in (mode_part, permission_part) if p)
+        if len(line) > width and status_part:
+            suffix = f" | {status_part}"
             if len(suffix) < width:
                 line = left[: width - len(suffix)] + suffix
             else:
-                line = mode_part[:width]
+                line = status_part[:width]
 
         # Colorize the context marker if present.
         line = self._colorize_context(line, model, stats)
@@ -122,7 +135,12 @@ class FooterComponent(Component):
             line = line[:width]
         else:
             line = line.ljust(width)
-        return [self._theme.fg("dim", line)]
+        if permission_mode == "full_access" and permission_part:
+            line = line.replace(permission_part, self._theme.fg("warning", permission_part))
+        rows = [self._theme.fg("dim", line)]
+        if extra_status:
+            rows.append(self._theme.fg("warning", extra_status.ljust(width)))
+        return rows
 
     # ── helpers ─────────────────────────────────────────────────────────
 

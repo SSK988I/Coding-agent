@@ -640,10 +640,17 @@ class MemoryService:
                 try:
                     await task
                 except asyncio.CancelledError:
-                    pass
+                    current = asyncio.current_task()
+                    if current is not None and current.cancelling():
+                        raise
             except asyncio.CancelledError:
-                task.cancel()
-                raise
+                # An already-stopping worker can finish by cancellation while
+                # close() is awaiting it. Only propagate cancellation directed
+                # at this caller, not the worker's expected terminal outcome.
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    task.cancel()
+                    raise
         event_tasks = [item for item in self._event_tasks if not item.done()]
         if event_tasks:
             await asyncio.gather(*event_tasks, return_exceptions=True)

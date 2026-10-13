@@ -152,13 +152,16 @@ def test_full_plan_state_event_refreshes_footer_border_and_controls(
 
 
 def test_ready_body_is_visible_once_and_reappears_after_chat_rebuild() -> None:
-    from coding_agent.core.plan_mode import create_plan_revision
+    from coding_agent.core.plan_mode import PlanState, create_plan_revision
     from agent_tui import load_theme
     plan = create_plan_revision(plan_id="p", revision=1, title="Review title", markdown="exact body",
                                 source_message_id="m", submitted_by_tool_call_id="t")
     texts: list[str] = []
     mode = SimpleNamespace(
-        _session=SimpleNamespace(session_manager=SimpleNamespace(header=SimpleNamespace(id="child"))),
+        _session=SimpleNamespace(
+            session_manager=SimpleNamespace(header=SimpleNamespace(id="child")),
+            plan_state=PlanState(mode="plan", phase="ready", latest_revision=plan),
+        ),
         theme=load_theme("dark"),
         _add_assistant_text=texts.append,
         _swap_editor_for=lambda _component: None,
@@ -171,6 +174,36 @@ def test_ready_body_is_visible_once_and_reappears_after_chat_rebuild() -> None:
     mode._displayed_plan_key = None
     InteractiveMode._mount_plan_ready(mode, plan)  # type: ignore[arg-type]
     assert len(texts) == 2
+
+
+def test_ready_controls_follow_episode_capability_after_review_resubmission() -> None:
+    from agent_tui import load_theme
+    from coding_agent.core.plan_mode import PlanState, create_plan_revision
+
+    plan = create_plan_revision(
+        plan_id="p", revision=2, title="Revised review", markdown="Updated body",
+        source_message_id="m", submitted_by_tool_call_id="t",
+    )
+    controls = []
+    mode = SimpleNamespace(
+        _session=SimpleNamespace(
+            session_manager=SimpleNamespace(header=SimpleNamespace(id="review-child")),
+            plan_state=PlanState(
+                mode="plan", phase="ready", latest_revision=plan,
+                handoff_source_session_id="source-session",
+            ),
+        ),
+        theme=load_theme("dark"),
+        _add_assistant_text=lambda _text: None,
+        _swap_editor_for=controls.append,
+        _restore_editor=lambda: None,
+    )
+    InteractiveMode._mount_plan_ready(mode, plan)  # type: ignore[arg-type]
+
+    rendered = "\n".join(controls[0].render(100))
+    assert "新会话复核" not in rendered
+    assert "当前会话执行" in rendered
+    assert "取消规划" in rendered
 
 
 def test_legacy_candidate_has_visible_resubmission_requirement() -> None:

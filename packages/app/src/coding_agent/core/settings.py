@@ -22,6 +22,8 @@ class Settings:
     default_model: str | None = None
     thinking_level: str | None = None
     theme: str = "dark"
+    desktop_permission_mode: str = "ask"
+    tui_permission_mode: str = "ask"
     auto_retry: bool = True
     max_retries: int = 2
     retry_initial_delay: float = 1.0
@@ -109,6 +111,10 @@ class SettingsManager:
             raise ValueError("default_model must be a string or null")
         if settings.theme != "dark":
             raise ValueError("theme must currently be 'dark'")
+        if settings.desktop_permission_mode not in {"ask", "auto", "full_access"}:
+            raise ValueError("desktop_permission_mode must be ask, auto or full_access")
+        if settings.tui_permission_mode not in {"ask", "auto", "full_access"}:
+            raise ValueError("tui_permission_mode must be ask, auto or full_access")
         if not isinstance(settings.auto_retry, bool):
             raise ValueError("auto_retry must be a boolean")
         if isinstance(settings.max_retries, bool) or not 0 <= settings.max_retries <= 10:
