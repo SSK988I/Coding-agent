@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, AsyncIterator, Awaitable, Callable, Generic, TypeVar
+from typing import Any, AsyncIterable, AsyncIterator, Awaitable, Callable, Generic, TypeVar
 
 from agent_llm.types import (
     AssistantMessage,
@@ -180,7 +180,7 @@ def _error_message(model: Model, error: Any) -> AssistantMessage:
 
 def lazy_stream(
     model: Model,
-    setup: Callable[[], Awaitable[AsyncIterator[AssistantMessageEvent]]],
+    setup: Callable[[], Awaitable[AsyncIterable[AssistantMessageEvent]]],
 ) -> AssistantMessageEventStream:
     """把一个产出 event 迭代器的 async setup 包装成 stream。
 

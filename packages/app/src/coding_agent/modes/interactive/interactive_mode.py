@@ -14,12 +14,15 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import sys
 import time
 from pathlib import Path
 from typing import Any, Callable
 
 from agent_llm import ToolResultMessage
+from agent_core import BeforeToolCallContext, BeforeToolCallResult
+from agent_tui.components.select_list import SelectItem
 from agent_tui import (
     Component,
     Container,
@@ -44,7 +47,11 @@ from coding_agent.core.plan_mode import (
     PlanQuestion,
     PlanQuestionOption,
     PlanRevision,
+    call_hook,
 )
+from coding_agent.core.permissions import requires_approval, is_approval_safe_shell_command, normalize_permission_mode
+from coding_agent.core.settings import SettingsManager
+from coding_agent.modes.interactive.components.permission_menu import PermissionMenuComponent
 from coding_agent.core.slash_commands import (
     BUILTIN_SLASH_COMMANDS,
     BuiltinSlashCommand,
@@ -158,6 +165,96 @@ class InteractiveMode:
         self._is_submitting_plan = False
         self._subagent_cards: dict[str, Any] = {}
         self._subagent_unsubscribe = self._session.on_event(self._on_subagent_event)
+        self._permission_lock = asyncio.Lock()
+        self._permission_native_decision: tuple[asyncio.Event, bool] | None = None
+        self._prior_tool_hook = session._config.before_tool_call
+        self._prior_native_search_hook = session._config.before_native_web_search
+        mode = session.permission_mode or (session.settings_manager or SettingsManager()).load().tui_permission_mode
+        session.set_permission_mode(normalize_permission_mode(mode), persist=False)
+        session._config.before_tool_call = self._before_tool_call
+        session._config.before_native_web_search = self._before_native_web_search
+
+    async def _before_tool_call(
+        self, context: BeforeToolCallContext, signal: asyncio.Event,
+    ) -> BeforeToolCallResult | None:
+        previous = await call_hook(self._prior_tool_hook, context, signal)
+        if previous is not None and previous.block:
+            return previous
+        if not requires_approval(
+            self._session.permission_mode or "ask", context.tool_call.name, context.args,
+            Path(self._session.cwd), is_approval_safe_shell_command,
+        ):
+            return previous
+        detail = context.args.get("command", context.args.get("path", context.args.get("query", "")))
+        allowed = await self._ask_permission(f"工具审批 · {context.tool_call.name}", str(detail), signal)
+        return None if allowed else BeforeToolCallResult(
+            block=True, reason="运行已停止" if signal.is_set() else "用户未批准工具执行",
+            status="cancelled" if signal.is_set() else "blocked",
+        )
+
+    async def _before_native_web_search(self, signal: asyncio.Event) -> bool:
+        if self._prior_native_search_hook is not None and not await self._prior_native_search_hook(signal):
+            return False
+        if self._session.permission_mode != "ask":
+            return True
+        run_signal = self._session.agent.signal or signal
+        if self._permission_native_decision is not None and self._permission_native_decision[0] is run_signal:
+            return self._permission_native_decision[1]
+        allowed = await self._ask_permission("联网审批", "是否允许本次任务使用联网搜索？拒绝后继续处理已有内容。", signal)
+        self._permission_native_decision = (run_signal, allowed)
+        return allowed
+
+    async def _ask_permission(self, title: str, detail: str, signal: asyncio.Event) -> bool:
+        async with self._permission_lock:
+            if signal.is_set():
+                return False
+            future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+            def resolve(value: str) -> None:
+                if not future.done():
+                    future.set_result(value == "allow")
+            detail = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", detail)[:2000]
+            selector = PermissionMenuComponent(self.theme, title, detail, [
+                SelectItem(value="deny", label="拒绝本次", description="不执行该操作"),
+                SelectItem(value="allow", label="允许本次", description="仅批准这一次请求"),
+            ], resolve, lambda: resolve("deny"))
+            self._swap_editor_for(selector)
+            stopped = asyncio.create_task(signal.wait())
+            try:
+                done, _ = await asyncio.wait({future, stopped}, timeout=120, return_when=asyncio.FIRST_COMPLETED)
+                return future in done and future.result() and not signal.is_set()
+            finally:
+                stopped.cancel()
+                await asyncio.gather(stopped, return_exceptions=True)
+                if not future.done():
+                    future.cancel()
+                if self._current_selector is selector:
+                    self._restore_editor()
+
+    def _cmd_permissions(self, arg: str = "") -> None:
+        if self._is_responding or self._session.is_processing or self._session.subagents.has_active:
+            self._add_system_message("请先停止当前任务或子代理，再切换访问权限。")
+            return
+        if not arg.strip():
+            def select(value: str) -> None:
+                self._restore_editor()
+                self._cmd_permissions(value)
+            self._swap_editor_for(PermissionMenuComponent(
+                self.theme, "访问权限", "Alt+P 快速切换 bypass permissions", [
+                    SelectItem(value="ask", label="请求批准", description="外部编辑、联网和风险操作需要确认"),
+                    SelectItem(value="auto", label="帮我批准", description="仅对检测到的风险操作请求批准"),
+                    SelectItem(value="full_access", label="bypass permissions on", description="跳过工具审批"),
+                ], select, self._restore_editor, selected=self._session.permission_mode,
+            ))
+            return
+        try:
+            mode = normalize_permission_mode(arg)
+            self._session.set_permission_mode(mode)
+        except (OSError, ValueError, PlanModeError) as exc:
+            self._add_system_message(f"权限切换失败：{exc}")
+            return
+        self._add_system_message("bypass permissions on" if mode == "full_access"
+                                 else "bypass permissions off · " + ("帮我批准" if mode == "auto" else "请求批准"))
+        self._refresh_footer()
 
     def _on_subagent_event(self, event: dict) -> None:
         if event.get("type") == "subagent.stateChanged":
@@ -801,6 +898,8 @@ class InteractiveMode:
             self._cmd_new()
         elif cmd_name == "plan":
             self._cmd_plan()
+        elif cmd_name == "permissions":
+            self._cmd_permissions(" ".join(parts[1:]) if len(parts) > 1 else "")
         elif cmd_name == "cancel-plan":
             self._cancel_plan()
         elif cmd_name == "execute-plan":
@@ -1324,7 +1423,10 @@ class InteractiveMode:
                 ))
 
         self._swap_editor_for(
-            PlanActionsComponent(self.theme, plan, on_action, self._restore_editor)
+            PlanActionsComponent(
+                self.theme, plan, on_action, self._restore_editor,
+                can_handoff=self._session.plan_state.can_handoff,
+            )
         )
 
     def _render_plan_state_controls(self) -> None:
@@ -1837,6 +1939,9 @@ class InteractiveMode:
         if len(pieces) != 2:
             self._add_system_message("用法：/settings <key> <value>")
             return
+        if pieces[0] == "tui_permission_mode":
+            self._cmd_permissions(pieces[1])
+            return
         try:
             settings = manager.set_value(pieces[0], pieces[1])
             self._session.retry_policy = RetryPolicy(
@@ -2313,7 +2418,8 @@ class InteractiveMode:
           2. Ctrl+D (app.exit): on an empty editor, exits immediately; on a
              non-empty editor, falls through so the editor forward-deletes.
           3. Shift+Tab / Alt+M (app.mode.cycle): cycles collaboration mode.
-          4. Alt+T (app.thinking.cycle): cycles thinking level.
+          4. Alt+P (app.permissions.toggle): toggles bypass permissions.
+          5. Alt+T (app.thinking.cycle): cycles thinking level.
         """
         from coding_agent.core.keybindings import get_keybinding
 
@@ -2322,6 +2428,10 @@ class InteractiveMode:
 
         def on_input(data: str) -> dict | None:
             if matches_key(data, clear_keys):  # type: ignore[arg-type]
+                selector = getattr(self, "_current_selector", None)
+                if isinstance(selector, PermissionMenuComponent):
+                    selector.handle_input(data)
+                    return {"consume": True}
                 now = time.monotonic()
                 if now - self._last_sigint_time < 0.5:
                     # Double-tap within 500ms → quit.
@@ -2368,6 +2478,13 @@ class InteractiveMode:
             return None
 
         self.tui.add_input_listener(on_mode_cycle)
+        permission_keys = get_keybinding("app.permissions.toggle")
+        def on_permission_toggle(data: str) -> dict | None:
+            if getattr(self, "_current_selector", None) is None and matches_key(data, permission_keys):  # type: ignore[arg-type]
+                self._cmd_permissions("off" if self._session.permission_mode == "full_access" else "on")
+                return {"consume": True}
+            return None
+        self.tui.add_input_listener(on_permission_toggle)
 
         # ── 4. Alt+T: cycle thinking level ───────────────────────────────
         cycle_keys = get_keybinding("app.thinking.cycle")

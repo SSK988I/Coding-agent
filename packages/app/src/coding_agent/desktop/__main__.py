@@ -55,6 +55,17 @@ async def serve() -> int:
             writer.write({"v": PROTOCOL_VERSION, "id": request_id, "result": result})
         except RpcError as exc:
             write_error(request_id, exc)
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                # Disconnect/dispose must still cancel handlers and discard
+                # queued mutations, without sending replies to a gone client.
+                raise
+            # A cancelled nested task must never silently lose the request ID:
+            # Electron would otherwise wait until its 120-second RPC timeout.
+            write_error(request_id, RpcError(
+                "REQUEST_CANCELLED", "请求被后台任务中断，请重试",
+            ))
         except Exception as exc:  # noqa: BLE001 - process boundary
             print(f"desktop sidecar error: {exc}", file=sys.stderr)
             writer.write({

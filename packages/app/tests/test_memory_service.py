@@ -248,6 +248,65 @@ def test_disabling_auto_extract_releases_running_job(tmp_path: Path) -> None:
     _run(scenario())
 
 
+def test_close_accepts_worker_cancelled_while_waiting_and_releases_job(tmp_path: Path) -> None:
+    identity = MemoryIdentity("local-user", "project-a")
+    extractor = _SlowExtractor()
+    service = MemoryService(store=FileMemoryStore(tmp_path / "memory"), extractor=extractor)
+
+    async def scenario() -> None:
+        await service.after_task(_task(identity))
+        await extractor.started.wait()
+        worker = service._worker_task
+        assert worker is not None
+        asyncio.get_running_loop().call_soon(service.set_auto_extract, False)
+        await service.close(grace_seconds=1)
+
+        assert worker.cancelled()
+        assert not asyncio.current_task().cancelling()
+        counts = await service.queue.stats(identity)
+        assert counts.pending == 1
+        assert counts.processing == 0
+
+    _run(scenario())
+
+
+@pytest.mark.parametrize("grace_seconds", [0, 60])
+def test_close_preserves_caller_cancellation(tmp_path: Path, grace_seconds: float) -> None:
+    service = MemoryService(store=FileMemoryStore(tmp_path / "memory"), extractor=_Extractor())
+
+    async def scenario() -> None:
+        started, cleaning, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def background() -> None:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cleaning.set()
+                await release.wait()
+                raise
+
+        worker = asyncio.create_task(background())
+        service._worker_task = worker
+        await started.wait()
+        closing = asyncio.create_task(service.close(grace_seconds=grace_seconds))
+        try:
+            if grace_seconds == 0:
+                await asyncio.wait_for(cleaning.wait(), 1)
+            else:
+                await asyncio.sleep(0)
+            closing.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await closing
+        finally:
+            release.set()
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+            await service.close(grace_seconds=0)
+
+    _run(scenario())
+
+
 def test_queue_events_include_completed_receipt_count(tmp_path: Path) -> None:
     identity = MemoryIdentity("local-user", "project-a")
     events: list[dict] = []

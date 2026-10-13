@@ -26,6 +26,7 @@ export interface RpcErrorPayload {
 }
 
 export interface WorkspacePayload {
+  permissionMode?: PermissionMode;
   path: string;
   sessionId: string;
   model: { id: string; name: string; provider: string };
@@ -126,16 +127,26 @@ export interface PlanStatePayload {
   latestRun?: PlanRunPayload | null;
   recoveryError?: PlanRecoveryErrorPayload | null;
   handoffTargetSessionId?: string | null;
+  handoffSourceSessionId?: string | null;
+  canHandoff?: boolean;
   legacyCandidate?: boolean;
 }
 
 export interface SessionSnapshotPayload {
+  permissionMode?: PermissionMode;
   sessionId: string;
   messages: AgentMessage[];
   stats: Record<string, unknown>;
   collaborationMode: "default" | "plan";
   planState: PlanStatePayload;
   subagents?: SubagentTaskPayload[];
+}
+
+export type PermissionMode = "ask" | "auto" | "full_access";
+
+export interface PermissionModePayload {
+  sessionId: string;
+  permissionMode: PermissionMode;
 }
 
 export interface AgentMessage {

@@ -10,7 +10,10 @@ import type {
   SessionInfo,
   WorkspacePayload,
   SubagentTaskPayload,
+  PermissionMode,
+  PermissionModePayload,
 } from "../shared/types";
+import { PermissionPicker } from "./components/PermissionPicker";
 import { SubagentPanel } from "./components/SubagentPanel";
 import { ToolCard } from "./components/tool-card";
 import {
@@ -241,7 +244,13 @@ export function App() {
   const [input, setInput] = useState("");
   const [running, setRunning] = useState(false);
   const [compacting, setCompacting] = useState(false);
+  const [pendingSessionNavigation, setPendingSessionNavigation] = useState<string | null>(null);
+  const sessionNavigationRef = useRef(false);
+  const sessionNavigating = pendingSessionNavigation !== null;
   const [error, setError] = useState<string | null>(null);
+  const [pendingPermissionChange, setPendingPermissionChange] = useState(false);
+  const [networkApproval, setNetworkApproval] = useState<{ approvalId: string; message: string } | null>(null);
+  const [pendingNetworkDecision, setPendingNetworkDecision] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [isAtBottom, setIsAtBottom] = useState(true);
   const [customPlanAnswer, setCustomPlanAnswer] = useState("");
@@ -277,6 +286,18 @@ export function App() {
   };
 
   const applyWorkspace = (payload: WorkspacePayload, restoreTimeline = true) => {
+    if (restoreTimeline) {
+      // RPC results are already authoritative. A snapshot queued for the old
+      // session must not undo a successful switch in the next animation frame.
+      // Preserve trailing events belonging to the selected session.
+      rafQueue.current = rafQueue.current.filter((event) => (
+        !event.sessionId || event.sessionId === payload.sessionId
+      ) && (event.event.type !== "session.changed"
+        || event.event.payload.sessionId === payload.sessionId));
+    }
+    if (workspaceSessionIdRef.current !== payload.sessionId) {
+      setInput("");
+    }
     workspaceSessionIdRef.current = payload.sessionId;
     setWorkspace(payload);
     if (restoreTimeline) {
@@ -284,6 +305,7 @@ export function App() {
     }
     setCommandMenuOpen(false);
     setModelPickerOpen(false);
+    setNetworkApproval(null);
     setCustomPlanAnswer("");
     setSupplementingPlanDigest(null);
     setPlanCommandMenuOpen(false);
@@ -309,6 +331,7 @@ export function App() {
         collaborationMode: snapshot.collaborationMode,
         planState: snapshot.planState,
         messages: snapshot.messages,
+        permissionMode: snapshot.permissionMode ?? current.permissionMode,
       };
     });
     setTimelineState(createTimelineStateFromMessages(snapshot.messages, snapshot.sessionId));
@@ -318,6 +341,39 @@ export function App() {
     const snapshot = await window.agent.request<SessionSnapshotPayload>("session.snapshot");
     applySessionSnapshot(snapshot);
     return snapshot;
+  };
+
+  const changePermission = async (mode: PermissionMode) => {
+    if (!workspace) return;
+    const sessionId = workspace.sessionId;
+    setPendingPermissionChange(true);
+    try {
+      const payload = await window.agent.request<PermissionModePayload>("permission.setMode", { mode });
+      if (workspaceSessionIdRef.current === sessionId && payload.sessionId === sessionId) {
+        setWorkspace((current) => current ? { ...current, permissionMode: payload.permissionMode } : current);
+      }
+    } catch (reason) {
+      if (workspaceSessionIdRef.current === sessionId) {
+        setError(reason instanceof Error ? reason.message : String(reason));
+        await refreshSessionSnapshot().catch(() => undefined);
+      }
+    } finally {
+      setPendingPermissionChange(false);
+    }
+  };
+
+  const resolveNetworkApproval = async (approved: boolean) => {
+    if (!networkApproval) return;
+    const approvalId = networkApproval.approvalId;
+    setPendingNetworkDecision(true);
+    try {
+      await window.agent.request("approval.resolve", { approvalId, approved });
+      setNetworkApproval((current) => current?.approvalId === approvalId ? null : current);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setPendingNetworkDecision(false);
+    }
   };
 
   const beginCompaction = (reason: string): string => {
@@ -478,6 +534,18 @@ export function App() {
       const model = payload as unknown as WorkspacePayload["model"];
       setWorkspace((current) => current ? { ...current, model } : current);
     }
+    if (type === "permission.changed") {
+      const state = payload as unknown as PermissionModePayload;
+      if (state.sessionId === workspaceSessionIdRef.current) {
+        setWorkspace((current) => current ? { ...current, permissionMode: state.permissionMode } : current);
+      }
+    }
+    if (type === "permission.networkRequested" && typeof payload.approvalId === "string") {
+      setNetworkApproval({ approvalId: payload.approvalId, message: String(payload.message) });
+    }
+    if (type === "permission.networkResolved") {
+      setNetworkApproval((current) => current?.approvalId === payload.approvalId ? null : current);
+    }
     if (type === "memory.changed") {
       setWorkspace((current) => current ? {
         ...current,
@@ -577,6 +645,7 @@ export function App() {
   };
 
   const executeSlashCommand = async (name: string, args = "") => {
+    if (sessionNavigationRef.current) return;
     setInput("");
     setCommandMenuOpen(false);
     setError(null);
@@ -586,7 +655,7 @@ export function App() {
         return;
       }
       if (name === "new") {
-        applyWorkspace(await window.agent.request<WorkspacePayload>("session.new"));
+        await newSession();
         return;
       }
       if (name === "subagents") {
@@ -807,7 +876,7 @@ export function App() {
   const submit = async (event?: FormEvent) => {
     event?.preventDefault();
     const text = input.trim();
-    if (!text || !workspace || running || compacting || planSubmissionRef.current) return;
+    if (!text || !workspace || running || compacting || planSubmissionRef.current || sessionNavigationRef.current) return;
     if (text.startsWith("/")) {
       const [rawName, ...rest] = text.slice(1).split(/\s+/);
       const command = commandOptions.find((item) => item.name === rawName.toLocaleLowerCase());
@@ -951,7 +1020,7 @@ export function App() {
 
   const handoffPlan = async () => {
     const plan = workspace?.planState.latestRevision;
-    if (!plan || running || compacting || workspace?.planState.phase !== "ready") return;
+    if (!plan || running || compacting || !canHandoffPlan) return;
     setError(null);
     setRunning(true);
     setPendingPlanAction("handoff");
@@ -1170,17 +1239,28 @@ export function App() {
     }
   }, []);
 
-  const openSession = async (sessionId: string) => {
-    if (running || compacting || sessionId === workspace?.sessionId) return;
-    const result = await window.agent.request<WorkspacePayload>("session.open", { sessionId });
-    applyWorkspace(result);
+  const navigateSession = async (sessionId?: string) => {
+    if (running || compacting || !workspace || sessionNavigationRef.current
+      || (sessionId && sessionId === workspaceSessionIdRef.current)) return;
+    sessionNavigationRef.current = true;
+    setPendingSessionNavigation(sessionId ?? "new");
+    setError(null);
+    try {
+      const result = sessionId
+        ? await window.agent.request<WorkspacePayload>("session.open", { sessionId })
+        : await window.agent.request<WorkspacePayload>("session.new");
+      applyWorkspace(result);
+      requestAnimationFrame(() => composerRef.current?.focus());
+    } catch (reason) {
+      const detail = reason instanceof Error ? reason.message : String(reason);
+      setError(`${sessionId ? "切换" : "新建"}会话失败：${detail}`);
+    } finally {
+      sessionNavigationRef.current = false;
+      setPendingSessionNavigation(null);
+    }
   };
-
-  const newSession = async () => {
-    if (running || compacting || !workspace) return;
-    const result = await window.agent.request<WorkspacePayload>("session.new");
-    applyWorkspace(result);
-  };
+  const openSession = (sessionId: string) => navigateSession(sessionId);
+  const newSession = () => navigateSession();
 
   const statusLabel = useMemo(() => {
     if (sidecarStatus === "ready") return "运行时已连接";
@@ -1190,6 +1270,13 @@ export function App() {
   const readyPlan = workspace?.planState.phase === "ready"
     ? workspace.planState.latestRevision
     : null;
+  const canHandoffPlan = Boolean(readyPlan && (
+    workspace?.planState.canHandoff
+    ?? !(workspace?.planState.handoffSourceSessionId || readyPlan.originSessionId)
+  ));
+  const reviewingPlan = Boolean(
+    workspace?.planState.handoffSourceSessionId || readyPlan?.originSessionId,
+  );
   const visiblePlan = workspace?.planState.latestRevision ?? null;
   const awaitingPlanDecision = Boolean(
     readyPlan && supplementingPlanDigest !== readyPlan.digest,
@@ -1297,30 +1384,43 @@ export function App() {
         <div className="titlebar-spacer" />
         <div className={`runtime-dot ${sidecarStatus === "ready" ? "online" : ""}`} />
         <span className="runtime-label">{statusLabel}</span>
-        <button className="ghost-button" onClick={chooseWorkspace} disabled={running || compacting}>打开项目</button>
+        <button className="ghost-button" onClick={chooseWorkspace} disabled={running || compacting || sessionNavigating}>打开项目</button>
       </header>
 
       <div className={`workspace-grid ${sidebarOpen ? "" : "sidebar-closed"}`}>
         <aside className="sidebar">
           <div className="sidebar-heading">
             <span>会话</span>
-            <button className="icon-button" onClick={newSession} title="新建会话" disabled={running || compacting}>＋</button>
+            <button type="button" className="icon-button" onClick={() => void newSession()} title="新建会话"
+              aria-label="新建会话" disabled={!workspace || running || compacting || sessionNavigating}>
+              {pendingSessionNavigation === "new" ? <span className="session-navigation-spinner" aria-hidden="true" /> : "＋"}
+            </button>
           </div>
+          {sessionNavigating && (
+            <div className="session-navigation-status" role="status" aria-live="polite">
+              <span className="session-navigation-spinner" aria-hidden="true" />
+              {pendingSessionNavigation === "new" ? "正在新建会话…" : "正在切换会话…"}
+            </div>
+          )}
           <div className="session-list">
             {sessions.map((session) => (
               <button
                 key={session.id}
+                type="button"
                 className={`session-item ${session.id === workspace?.sessionId ? "active" : ""}`}
-                onClick={() => openSession(session.id)}
-                disabled={running || compacting}
+                onClick={() => void openSession(session.id)}
+                disabled={running || compacting || sessionNavigating}
+                aria-current={session.id === workspace?.sessionId ? "true" : undefined}
+                aria-busy={pendingSessionNavigation === session.id}
               >
                 <strong>{session.name || session.first_message || "新会话"}</strong>
-                <span>{session.message_count} 条消息</span>
+                <span>{pendingSessionNavigation === session.id ? "正在打开…" : `${session.message_count} 条消息`}</span>
               </button>
             ))}
             {!sessions.length && <div className="empty-sidebar">发送第一条消息后，会话会保存到 JSONL。</div>}
           </div>
           {workspace && <SubagentPanel key={workspace.sessionId} tasks={workspace.subagents ?? []}
+            disabled={sessionNavigating}
             onCancel={(taskId) => manageSubagents("cancel", taskId)}
             onReview={workspace.planState.phase === "ready" && workspace.planState.latestRevision && !running && !compacting
               ? () => manageSubagents("review", `只读复核下列计划：检查遗漏、风险和代码依据，不执行、不修改或提交计划。\n${workspace.planState.latestRevision?.markdown}`)
@@ -1336,7 +1436,7 @@ export function App() {
               <button
                 className={`memory-toggle ${workspace.memory.enabled ? "on" : "off"}`}
                 onClick={() => void executeSlashCommand("memory", workspace.memory.enabled ? "off" : "on")}
-                disabled={running || compacting}
+                disabled={running || compacting || sessionNavigating}
               >
                 {workspace.memory.enabled ? "已开启" : "已关闭"}
               </button>
@@ -1346,7 +1446,7 @@ export function App() {
                 onClick={() => void executeSlashCommand(
                   "memory", workspace.memory.autoExtractEnabled === false ? "auto on" : "auto off",
                 )}
-                disabled={running || compacting || !workspace.memory.enabled}
+                disabled={running || compacting || sessionNavigating || !workspace.memory.enabled}
               >
                 {workspace.memory.autoExtractEnabled === false ? "自动提取关闭" : "自动提取开启"}
               </button>
@@ -1359,7 +1459,7 @@ export function App() {
           )}
         </aside>
 
-        <main className="conversation">
+        <main className="conversation" aria-busy={sessionNavigating} inert={sessionNavigating}>
           <button className="sidebar-toggle" onClick={() => setSidebarOpen((value) => !value)}>
             {sidebarOpen ? "‹" : "›"}
           </button>
@@ -1416,7 +1516,11 @@ export function App() {
                     <button onClick={() => void answerPlanQuestion(customPlanAnswer)} disabled={!customPlanAnswer.trim()}>提交</button>
                   </div>
                 )}
-                <button onClick={() => void cancelPlan()} disabled={compacting}>取消规划</button>
+                <div className="plan-question-footer">
+                  <button type="button" className="plan-cancel-button" onClick={() => void cancelPlan()} disabled={compacting}>
+                    <span aria-hidden="true">×</span>取消规划
+                  </button>
+                </div>
               </section>
             )}
             {planCommandMenuOpen
@@ -1490,22 +1594,28 @@ export function App() {
                   <span className="plan-badge">PLAN READY</span>
                   <strong>下一步</strong>
                 </div>
-                <p>计划已提交，下一步怎么做？</p>
+                <p>{reviewingPlan ? "当前已在复核会话中，可确认执行或继续修改方案。" : "计划已提交，下一步怎么做？"}</p>
                 <div className="plan-options">
                   <button onClick={() => void executePlan()} disabled={running || compacting}>
                     <strong>{pendingPlanAction === "execute" ? "正在确认…" : "执行方案"}</strong>
                     <span>确认 revision {readyPlan.revision} 并立即切回 Default 执行</span>
                   </button>
-                  <button onClick={() => void handoffPlan()} disabled={running || compacting}>
-                    <strong>{pendingPlanAction === "handoff" ? "正在创建…" : "新会话复核"}</strong>
-                    <span>只把这个 revision 交给新会话，打开后再次确认再执行</span>
-                  </button>
+                  {canHandoffPlan && (
+                    <button onClick={() => void handoffPlan()} disabled={running || compacting}>
+                      <strong>{pendingPlanAction === "handoff" ? "正在创建…" : "新会话复核"}</strong>
+                      <span>只把这个 revision 交给新会话，打开后再次确认再执行</span>
+                    </button>
+                  )}
                   <button onClick={supplementPlan} disabled={running || compacting}>
                     <strong>继续修改</strong>
                     <span>保持 Plan Mode，在输入框中说明要补充或修改的内容</span>
                   </button>
                 </div>
-                <button className="plan-decision-cancel" onClick={() => void cancelPlan()} disabled={running || compacting}>取消规划</button>
+                <div className="plan-question-footer">
+                  <button type="button" className="plan-cancel-button" onClick={() => void cancelPlan()} disabled={running || compacting}>
+                    <span aria-hidden="true">×</span>取消规划
+                  </button>
+                </div>
               </section>
             )}
             {workspace?.planState.legacyCandidate && (
@@ -1580,7 +1690,17 @@ export function App() {
                 </div>
               </section>
             )}
-            {error && <div className="error-banner">{error}<button onClick={() => setError(null)}>×</button></div>}
+            {error && <div className="error-banner" role="alert">{error}<button onClick={() => setError(null)}>×</button></div>}
+            {networkApproval && (
+              <section className="permission-network" role="region" aria-label="联网批准">
+                <strong>{networkApproval.message}</strong>
+                <p>授权仅在本次任务内有效。拒绝后会继续处理已有内容。</p>
+                <div>
+                  <button type="button" disabled={pendingNetworkDecision} onClick={() => void resolveNetworkApproval(false)}>继续离线</button>
+                  <button type="button" disabled={pendingNetworkDecision} onClick={() => void resolveNetworkApproval(true)}>允许本次联网</button>
+                </div>
+              </section>
+            )}
             <form className={`composer ${workspace?.collaborationMode === "plan" ? "plan-mode" : ""}`} onSubmit={submit}>
               <textarea
                 ref={composerRef}
@@ -1596,12 +1716,13 @@ export function App() {
                     : planCommandMenuOpen
                       ? "请先选择 Plan 操作"
                     : awaitingPlanDecision
-                      ? "请先选择执行、新会话复核或继续修改"
+                      ? canHandoffPlan ? "请先选择执行、新会话复核或继续修改" : "请先选择执行或继续修改"
                       : "描述你想完成的任务…"}
-                disabled={!workspace || awaitingPlanDecision || planCommandMenuOpen || compacting || Boolean(planStatusMessage)}
+                disabled={!workspace || awaitingPlanDecision || planCommandMenuOpen || compacting || sessionNavigating || Boolean(planStatusMessage)}
                 rows={3}
               />
               <div className="composer-footer">
+                <div className="composer-controls">
                 <div className="mode-switch" aria-label="协作模式">
                   <button
                     type="button"
@@ -1619,7 +1740,11 @@ export function App() {
                     <span className="plan-badge">{planBadgeLabel}</span>
                   )}
                 </div>
-                <span>Enter 发送 · Shift+Enter 换行</span>
+                <PermissionPicker key={workspace?.sessionId} mode={workspace?.permissionMode ?? "ask"}
+                  disabled={!workspace || running || compacting || (workspace.subagents ?? []).some((task) => task.status === "queued" || task.status === "running")}
+                  pending={pendingPermissionChange} onChange={changePermission} />
+                </div>
+                <span className="composer-hint">Enter 发送 · Shift+Enter 换行</span>
                 {running ? (
                   <button type="button" className="stop-button" onClick={() => void abortPlanExecution()}>■ 停止</button>
                 ) : compacting ? (

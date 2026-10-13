@@ -158,6 +158,12 @@ uv run coding-agent --no-session
 
 Enter Plan Mode interactively with `/plan`, `Shift+Tab`, or `Alt+M`. `Shift+Tab`/`Alt+M` leaves Plan Mode by cancelling; it never executes a plan. Thinking-level cycling is `Alt+T`, while `Ctrl+T` only toggles thinking-block visibility.
 
+TUI tool approval uses `/permissions` to select a mode. `/permissions on` or
+`Alt+P` enables full access and displays `bypass permissions on` in the footer;
+`/permissions off` restores normal approval. `--dangerously-skip-permissions` or
+`--permission-mode bypassPermissions` enables it for one launch. The setting does
+not override Plan tool restrictions. See [access permissions](docs/specs/desktop-permissions.md).
+
 For resumable non-interactive workflows:
 
 ```powershell

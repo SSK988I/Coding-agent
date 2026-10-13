@@ -41,7 +41,9 @@ entry becomes `uncertain`, never inferred success or an automatic retry.
 
 Clean-session execution is a linked handoff: only the confirmed revision and
 origin metadata cross into a child session, which remains ready until a second
-explicit confirmation.
+explicit confirmation. A review episode cannot hand off again; Core derives
+this capability from the episode's persisted origin, including after revision
+changes and recovery. A new independent episode has normal handoff controls.
 
 ## Consequences
 

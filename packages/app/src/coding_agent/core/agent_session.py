@@ -21,7 +21,7 @@ import contextlib
 import sys
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Literal, cast
 
@@ -53,6 +53,7 @@ from agent_core import (
 )
 from agent_core.prompts import build_system_prompt
 from coding_agent.core.retry import RetryPolicy, retrying_stream
+from coding_agent.core.permissions import PERMISSION_MODES, PermissionMode, requires_approval, is_approval_safe_shell_command
 from coding_agent.core.subagents import SubagentError, SubagentManager, SubagentTool
 from coding_agent.memory.types import MemoryScope
 from coding_agent.core.plan_mode import (
@@ -123,6 +124,9 @@ class AgentSessionConfig:
     # to implement approval gates and audit logging without changing tools.
     before_tool_call: Any = None
     after_tool_call: Any = None
+    #: Hosts can authorize server-side search before it is exposed to a Provider.
+    before_native_web_search: Any = None
+    permission_mode: PermissionMode | None = None
     retry_policy: RetryPolicy = field(default_factory=RetryPolicy)
     settings_manager: Any = None
     theme_name: str = "dark"
@@ -461,6 +465,25 @@ class AgentSession:
         return self._is_processing
 
     @property
+    def permission_mode(self) -> PermissionMode | None:
+        return self._config.permission_mode
+
+    def set_permission_mode(self, mode: PermissionMode, *, persist: bool = True) -> None:
+        if mode not in PERMISSION_MODES:
+            raise ValueError("权限模式必须是 ask、auto 或 full_access")
+        if self._is_processing or self._active_plan_run_id is not None:
+            raise PlanModeError("RUN_IN_PROGRESS", "请先停止当前任务，再切换访问权限")
+        if self.subagents.has_active:
+            raise PlanModeError("SUBAGENT_RUNNING", "请先停止子代理，再切换访问权限")
+        if persist:
+            from coding_agent.core.settings import SettingsManager
+            manager = self._config.settings_manager or SettingsManager()
+            settings = replace(manager.load(), tui_permission_mode=mode)
+            manager.save(settings)
+        self._config.permission_mode = mode
+        self._emit_event({"type": "permission_mode_changed", "mode": mode})
+
+    @property
     def turn_index(self) -> int:
         return self._turn_index
 
@@ -672,6 +695,16 @@ class AgentSession:
                     "reason": policy_result.reason,
                 })
                 return policy_result
+        if (
+            self.permission_mode is not None
+            and self._config.before_tool_call is None
+            and requires_approval(self.permission_mode, context.tool_call.name, context.args,
+                                  Path(self.cwd), is_approval_safe_shell_command)
+        ):
+            return BeforeToolCallResult(
+                block=True, code="PERMISSION_APPROVAL_REQUIRED",
+                reason="此操作需要审批；当前非交互运行无法请求批准", status="blocked",
+            )
         return await call_hook(self._config.before_tool_call, context, signal)
 
     def _sync_plan_state(self, *, emit: bool = True) -> PlanState:
@@ -1032,6 +1065,12 @@ class AgentSession:
             raise PlanModeError(
                 "STALE_PLAN_REVISION",
                 "只能交接最新的 Plan revision",
+            )
+
+        if not self._plan_state.can_handoff:
+            raise PlanModeError(
+                "PLAN_ALREADY_IN_REVIEW",
+                "当前已在复核会话中，请执行、继续修改或取消当前计划",
             )
 
         source = self.session_manager
@@ -1768,6 +1807,7 @@ class AgentSession:
         Models instance.
         """
         from agent_llm.compat import stream_simple
+        from agent_llm.event_stream import lazy_stream
 
         def _stream(model: Model, context, options=None):
             effective_options: dict[str, Any] = dict(options or {})
@@ -1777,49 +1817,66 @@ class AgentSession:
                 and self._plan_state.phase not in {"uncertain", "recovery_error"}
                 and any(tool.name == "web_search" for tool in (context.tools or []))
             )
-            if not search_allowed:
+            native_search = self.web_search_enabled and model.provider == "deepseek" and search_allowed
+
+            def start(native_allowed: bool = True):
+                nonlocal effective_context
+                # A caller-supplied flag must not bypass host authorization.
                 effective_options.pop("web_search", None)
-            if self.web_search_enabled and model.provider == "deepseek" and search_allowed:
-                # DeepSeek's Responses API owns web_search server-side. Keep
-                # the application tool registered for UI/provider switching,
-                # but do not expose a duplicate function tool to DeepSeek.
-                effective_options["web_search"] = True
-                native_search_prompt = (
-                    "<native_web_search>\n"
-                    "You have a native web_search tool. Use it for current or unstable "
-                    "information and whenever the user asks you to search the web. "
-                    "Do not claim that web access is unavailable while this tool is enabled. "
-                    "Never put API keys, cookies, private code, internal URLs, or personal "
-                    "data in a search query. Preserve source URLs in the answer.\n"
-                    "</native_web_search>"
-                )
-                effective_context = Context(
-                    system_prompt=(
-                        f"{context.system_prompt}\n\n{native_search_prompt}"
-                        if context.system_prompt else native_search_prompt
+                if native_search:
+                    effective_context = Context(
+                        system_prompt=context.system_prompt,
+                        messages=context.messages,
+                        tools=[tool for tool in (context.tools or []) if tool.name != "web_search"] or None,
+                    )
+                if native_search and native_allowed:
+                    # DeepSeek owns search server-side. Do not expose a duplicate
+                    # function tool alongside its authorized native capability.
+                    effective_options["web_search"] = True
+                    native_search_prompt = (
+                        "<native_web_search>\n"
+                        "You have a native web_search tool. Use it for current or unstable "
+                        "information and whenever the user asks you to search the web. "
+                        "Do not claim that web access is unavailable while this tool is enabled. "
+                        "Never put API keys, cookies, private code, internal URLs, or personal "
+                        "data in a search query. Preserve source URLs in the answer.\n"
+                        "</native_web_search>"
+                    )
+                    effective_context = Context(
+                        system_prompt=(
+                            f"{context.system_prompt}\n\n{native_search_prompt}"
+                            if context.system_prompt else native_search_prompt
+                        ),
+                        messages=context.messages,
+                        tools=effective_context.tools,
+                    )
+                return retrying_stream(
+                    lambda: stream_simple(
+                        model,
+                        effective_context,
+                        cast(Any, effective_options or None),
                     ),
-                    messages=context.messages,
-                    tools=[
-                        tool for tool in (context.tools or [])
-                        if tool.name != "web_search"
-                    ] or None,
+                    self.retry_policy,
+                    on_retry=None if isolated else lambda attempt, delay, error: self._emit_event({
+                        "type": "retry",
+                        "attempt": attempt,
+                        "max_retries": self.retry_policy.max_retries,
+                        "delay": delay,
+                        "error": error,
+                    }),
+                    abort_event=None if isolated else self._retry_abort_event,
                 )
-            return retrying_stream(
-                lambda: stream_simple(
-                    model,
-                    effective_context,
-                    cast(Any, effective_options or None),
-                ),
-                self.retry_policy,
-                on_retry=None if isolated else lambda attempt, delay, error: self._emit_event({
-                    "type": "retry",
-                    "attempt": attempt,
-                    "max_retries": self.retry_policy.max_retries,
-                    "delay": delay,
-                    "error": error,
-                }),
-                abort_event=None if isolated else self._retry_abort_event,
-            )
+
+            if native_search and self._config.before_native_web_search is not None:
+                async def authorize_search():
+                    allowed = await self._config.before_native_web_search(self._retry_abort_event)
+                    if self._retry_abort_event.is_set():
+                        raise asyncio.CancelledError
+                    return start(bool(allowed))
+                return lazy_stream(model, authorize_search)
+            if native_search and self.permission_mode == "ask":
+                return start(False)
+            return start()
 
         setattr(_stream, "for_subagent", lambda: self._create_stream_fn(isolated=True))
         return _stream

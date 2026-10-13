@@ -11,6 +11,7 @@ import sys
 from dataclasses import dataclass, field
 
 from coding_agent.core.config import APP_NAME, VERSION
+from coding_agent.core.permissions import normalize_permission_mode
 
 # ─── Argument definitions ────────────────────────────────────────────────
 
@@ -43,6 +44,7 @@ class Args:
     exclude_tools: list[str] | None = None
     no_tools: bool = False
     no_builtin_tools: bool = False
+    permission_mode: str | None = None
     web_search: bool | None = None
 
     no_context_files: bool = False
@@ -117,6 +119,13 @@ def _validate_thinking(value: str) -> str:
 def _parse_comma_list(value: str) -> list[str]:
     """解析逗号分隔的列表参数，并过滤空字符串。"""
     return [s.strip() for s in value.split(",") if s.strip()]
+
+
+def _parse_permission_mode(value: str) -> str:
+    try:
+        return normalize_permission_mode(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _parse_positive_revision(value: str | int) -> int:
@@ -261,6 +270,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="为本次运行禁用联网检索",
     )
     parser.set_defaults(web_search=None)
+    permission_group = tool_group.add_mutually_exclusive_group()
+    permission_group.add_argument(
+        "--permission-mode", type=_parse_permission_mode,
+        metavar="ask|auto|full_access", help="本次运行的工具审批模式；支持 default、bypassPermissions 别名",
+    )
+    permission_group.add_argument(
+        "--dangerously-skip-permissions", dest="permission_mode",
+        action="store_const", const="full_access", help="本次运行跳过工具审批（仍遵守 Plan 工具限制）",
+    )
 
     # ── Project context ──────────────────────────────────────────────────
     context_group = parser.add_argument_group("项目上下文")
@@ -451,6 +469,7 @@ def _apply_namespace(args: Args, ns: argparse.Namespace) -> None:
     args.model = ns.model
     args.api_key = ns.api_key
     args.thinking = ns.thinking
+    args.permission_mode = ns.permission_mode
 
     # 系统提示词
     args.system_prompt = ns.system_prompt

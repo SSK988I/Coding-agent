@@ -68,6 +68,245 @@ describe("desktop Plan Mode", () => {
     vi.clearAllMocks();
   });
 
+  it.each([
+    ["open", false], ["open", true], ["new", false], ["new", true],
+  ] as const)("responds to the first sidebar %s click (snapshot first: %s)", async (action, eventFirst) => {
+    const initial = workspace({
+      collaborationMode: "default",
+      planState: { phase: "idle", activePlanId: null, latestRevision: null, pendingQuestion: null },
+      messages: [{ role: "user", content: "Original conversation", timestamp: 1 }],
+    });
+    const next = { ...initial, sessionId: "session-2", messages: action === "open"
+      ? [{ role: "user", content: "Selected conversation", timestamp: 2 }]
+      : [] };
+    let resolveNavigation: ((value: WorkspacePayload) => void) | undefined;
+    requests.mockImplementation(async (method: string) => {
+      if (method === "workspace.open") return initial;
+      if (method === "session.list") return [
+        { id: "session-1", name: "Original session", message_count: 1 },
+        { id: "session-2", name: "Selected session", message_count: 1 },
+      ];
+      if (method === "command.list") return [];
+      if (method === `session.${action}`) return new Promise<WorkspacePayload>((resolve) => { resolveNavigation = resolve; });
+      return {};
+    });
+    renderApp();
+    const target = action === "open"
+      ? await screen.findByRole("button", { name: /Selected session/ })
+      : await screen.findByTitle("新建会话");
+    await screen.findByText("Original conversation");
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Old session draft" } });
+
+    fireEvent.click(target);
+    expect(screen.getByRole("status")).toHaveTextContent(action === "open" ? "正在切换会话" : "正在新建会话");
+    expect(target).toBeDisabled();
+    fireEvent.click(target);
+    expect(requests.mock.calls.filter(([method]) => method === `session.${action}`)).toHaveLength(1);
+    expect(screen.getByText("Original conversation")).toBeInTheDocument();
+    if (eventFirst) {
+      await act(async () => {
+        eventListener?.({
+          v: 1, type: "event", seq: 1, timestamp: 1, sessionId: next.sessionId, runId: null,
+          event: { type: "session.changed", payload: next as unknown as Record<string, unknown> },
+        });
+        await new Promise(requestAnimationFrame);
+      });
+    }
+    await act(async () => { resolveNavigation?.(next); });
+
+    await waitFor(() => expect(screen.queryByText("Original conversation")).not.toBeInTheDocument());
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.getByTitle("新建会话")).toBeEnabled();
+    expect(screen.getByRole("textbox")).toHaveValue("");
+    if (action === "open") expect(screen.getByText("Selected conversation")).toBeInTheDocument();
+  });
+
+  it.each([
+    ["open", false], ["open", true], ["new", false], ["new", true],
+  ] as const)("does not undo a single %s click with an old queued snapshot (snapshot first: %s)", async (action, eventFirst) => {
+    const initial = workspace({ messages: [{ role: "user", content: "Original conversation", timestamp: 1 }] });
+    const next = workspace({ sessionId: "session-2", messages: [{ role: "user", content: "Selected conversation", timestamp: 2 }] });
+    let resolveNavigation: ((value: WorkspacePayload) => void) | undefined;
+    requests.mockImplementation(async (method: string) => {
+      if (method === "workspace.open") return initial;
+      if (method === "session.list") return [{ id: "session-2", name: "Selected session", message_count: 1 }];
+      if (method === "command.list") return [];
+      if (method === `session.${action}`) return new Promise<WorkspacePayload>((resolve) => { resolveNavigation = resolve; });
+      return {};
+    });
+    renderApp();
+    await screen.findByText("Original conversation");
+    fireEvent.click(action === "open"
+      ? await screen.findByRole("button", { name: /Selected session/ })
+      : screen.getByTitle("新建会话"));
+    if (eventFirst) {
+      await act(async () => {
+        eventListener?.({
+          v: 1, type: "event", seq: 1, timestamp: 1, sessionId: next.sessionId, runId: null,
+          event: { type: "session.changed", payload: next as unknown as Record<string, unknown> },
+        });
+        await new Promise(requestAnimationFrame);
+      });
+    }
+    await act(async () => {
+      eventListener?.({
+        v: 1, type: "event", seq: 2, timestamp: 2, sessionId: initial.sessionId, runId: null,
+        event: { type: "session.changed", payload: initial as unknown as Record<string, unknown> },
+      });
+      resolveNavigation?.(next);
+      await new Promise(requestAnimationFrame);
+    });
+
+    expect(screen.getByText("Selected conversation")).toBeInTheDocument();
+    expect(screen.queryByText("Original conversation")).not.toBeInTheDocument();
+    expect(requests.mock.calls.filter(([method]) => method === `session.${action}`)).toHaveLength(1);
+  });
+
+  it.each([
+    ["open", "sidecar unavailable"], ["new", "sidecar unavailable"],
+    ["open", "REQUEST_CANCELLED: 请求被后台任务中断，请重试"],
+    ["new", "REQUEST_CANCELLED: 请求被后台任务中断，请重试"],
+  ])("shows a failed %s request (%s) and allows retry without losing the draft", async (action, reason) => {
+    const initial = workspace({
+      collaborationMode: "default",
+      planState: { phase: "idle", activePlanId: null, latestRevision: null, pendingQuestion: null },
+      messages: [{ role: "user", content: "Original conversation", timestamp: 1 }],
+    });
+    let attempts = 0;
+    requests.mockImplementation(async (method: string) => {
+      if (method === "workspace.open") return initial;
+      if (method === "session.list") return [{ id: "session-2", name: "Selected session", message_count: 1 }];
+      if (method === "command.list") return [];
+      if (method === `session.${action}`) {
+        attempts++;
+        if (attempts === 1) throw new Error(reason);
+        return { ...initial, sessionId: "session-2", messages: [] };
+      }
+      return {};
+    });
+    renderApp();
+    await screen.findByText("Original conversation");
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Unsent draft" } });
+    const target = action === "open"
+      ? await screen.findByRole("button", { name: /Selected session/ })
+      : screen.getByTitle("新建会话");
+    fireEvent.click(target);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(reason);
+    expect(screen.getByText("Original conversation")).toBeInTheDocument();
+    expect(screen.getByRole("textbox")).toHaveValue("Unsent draft");
+    expect(screen.getByRole("textbox")).toBeEnabled();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(target).toBeEnabled();
+    expect(attempts).toBe(1);
+    fireEvent.click(target);
+
+    await waitFor(() => expect(screen.queryByText("Original conversation")).not.toBeInTheDocument());
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox")).toHaveValue("");
+    expect(attempts).toBe(2);
+  });
+
+  it("preserves new-session stream events while dropping an old queued snapshot", async () => {
+    const initial = workspace({ messages: [{ role: "user", content: "Original conversation", timestamp: 1 }] });
+    const next = workspace({ sessionId: "session-2", messages: [{ role: "user", content: "Selected conversation", timestamp: 2 }] });
+    requests.mockImplementation(async (method: string) => {
+      if (method === "workspace.open") return initial;
+      if (method === "session.list") return [{ id: "session-2", name: "Selected session", message_count: 1 }];
+      if (method === "command.list") return [];
+      if (method === "session.open") {
+        eventListener?.({
+          v: 1, type: "event", seq: 1, timestamp: 1, sessionId: initial.sessionId, runId: null,
+          event: { type: "session.changed", payload: initial as unknown as Record<string, unknown> },
+        });
+        eventListener?.({
+          v: 1, type: "event", seq: 2, timestamp: 2, sessionId: next.sessionId, runId: "next-run",
+          event: { type: "message_start", payload: { message: { role: "assistant", content: "" } } },
+        });
+        eventListener?.({
+          v: 1, type: "event", seq: 3, timestamp: 3, sessionId: next.sessionId, runId: "next-run",
+          event: { type: "message_update", payload: { kind: "text_delta", delta: "Live selected response" } },
+        });
+        return next;
+      }
+      return {};
+    });
+    renderApp();
+    fireEvent.click(await screen.findByRole("button", { name: /Selected session/ }));
+
+    expect(await screen.findByText("Live selected response")).toBeInTheDocument();
+    expect(screen.getByText("Selected conversation")).toBeInTheDocument();
+    expect(screen.queryByText("Original conversation")).not.toBeInTheDocument();
+  });
+
+  it("shows all permission modes and applies only the saved server choice", async () => {
+    let resolveMode: ((value: unknown) => void) | undefined;
+    requests.mockImplementation(async (method: string) => {
+      if (method === "workspace.open") return workspace({ permissionMode: "auto" });
+      if (method === "permission.setMode") return new Promise((resolve) => { resolveMode = resolve; });
+      if (method === "session.list" || method === "command.list") return [];
+      return {};
+    });
+    renderApp();
+    fireEvent.click(await screen.findByRole("button", { name: "访问权限：帮我批准" }));
+    expect(screen.getAllByRole("menuitemradio")).toHaveLength(3);
+    expect(screen.getByRole("menuitemradio", { name: /帮我批准/ })).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(screen.getByRole("menuitemradio", { name: /完全访问权限/ }));
+    expect(requests).toHaveBeenCalledWith("permission.setMode", { mode: "full_access" });
+    expect(screen.getByRole("button", { name: "访问权限：帮我批准" })).toBeDisabled();
+    act(() => resolveMode?.({ sessionId: "session-1", permissionMode: "full_access" }));
+    expect(await screen.findByRole("button", { name: "访问权限：完全访问权限" })).toBeEnabled();
+  });
+
+  it("restores authoritative permission state after a rejected change", async () => {
+    requests.mockImplementation(async (method: string) => {
+      if (method === "workspace.open") return workspace({ permissionMode: "auto" });
+      if (method === "permission.setMode") throw new Error("权限保存失败");
+      if (method === "session.snapshot") return workspace({ permissionMode: "ask" });
+      if (method === "session.list" || method === "command.list") return [];
+      return {};
+    });
+    renderApp();
+    fireEvent.click(await screen.findByRole("button", { name: "访问权限：帮我批准" }));
+    fireEvent.click(screen.getByRole("menuitemradio", { name: /完全访问权限/ }));
+    expect(await screen.findByText("权限保存失败")).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "访问权限：请求批准" })).toBeEnabled();
+    expect(requests).toHaveBeenCalledWith("session.snapshot");
+  });
+
+  it("supports keyboard dismissal and clears the permission menu on session changes", async () => {
+    renderApp();
+    await waitFor(() => expect(screen.getByRole("button", { name: "访问权限：请求批准" })).toBeEnabled());
+    const trigger = screen.getByRole("button", { name: "访问权限：请求批准" });
+    fireEvent.click(trigger);
+    expect(screen.getByRole("menuitemradio", { name: /请求批准/ })).toHaveFocus();
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "ArrowDown" });
+    expect(screen.getByRole("menuitemradio", { name: /帮我批准/ })).toHaveFocus();
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+    fireEvent.click(trigger);
+    act(() => eventListener?.({
+      v: 1, type: "event", seq: 1, timestamp: Date.now(), sessionId: "session-2", runId: null,
+      event: { type: "session.changed", payload: workspace({ sessionId: "session-2", permissionMode: "full_access" }) as unknown as Record<string, unknown> },
+    }));
+    await screen.findByRole("button", { name: "访问权限：完全访问权限" });
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+
+  it.each([true, false])("resolves native network permission with approved=%s", async (approved) => {
+    renderApp();
+    await screen.findByRole("button", { name: "访问权限：请求批准" });
+    act(() => eventListener?.({
+      v: 1, type: "event", seq: 1, timestamp: Date.now(), sessionId: "session-1", runId: "run-1",
+      event: { type: "permission.networkRequested", payload: { approvalId: "network-1", message: "允许本次任务联网？" } },
+    }));
+    await screen.findByRole("region", { name: "联网批准" });
+    fireEvent.click(screen.getByRole("button", { name: approved ? "允许本次联网" : "继续离线" }));
+    await waitFor(() => expect(requests).toHaveBeenCalledWith("approval.resolve", { approvalId: "network-1", approved }));
+    await waitFor(() => expect(screen.queryByRole("region", { name: "联网批准" })).not.toBeInTheDocument());
+  });
+
   it("reviews the current plan read-only without executing it or clearing the composer", async () => {
     const task: SubagentTaskPayload = {
       taskId: "child-1", sessionId: "session-1", purpose: "review", prompt: "review plan",
@@ -590,7 +829,7 @@ describe("desktop Plan Mode", () => {
   });
 
   it("hands the exact ready revision to a fresh review session", async () => {
-    const childPlan = { ...latestPlan, title: "Fresh review" };
+    const childPlan = { ...latestPlan, title: "Fresh review", originSessionId: "session-1" };
     requests.mockImplementation(async (method: string) => {
       if (method === "workspace.open") return workspace();
       if (method === "session.list" || method === "command.list") return [];
@@ -602,6 +841,8 @@ describe("desktop Plan Mode", () => {
           activePlanId: "plan-1",
           latestRevision: childPlan,
           pendingQuestion: null,
+          handoffSourceSessionId: "session-1",
+          canHandoff: false,
         },
       });
       return {};
@@ -614,7 +855,41 @@ describe("desktop Plan Mode", () => {
       planId: "plan-1", revision: 2, digest: "abcdef0123456789",
     }));
     expect(await screen.findByTestId("plan-card")).toHaveTextContent("Fresh review");
-    expect(screen.getByTestId("plan-decision")).toHaveTextContent("新会话复核");
+    expect(screen.queryByRole("button", { name: /新会话复核/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /执行方案/ })).toBeEnabled();
+    expect(screen.getByRole("button", { name: /继续修改/ })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "取消规划" })).toBeEnabled();
+    expect(requests.mock.calls.filter(([method]) => method === "plan.handoff")).toHaveLength(1);
+    expect(requests).not.toHaveBeenCalledWith("plan.execute", expect.anything());
+  });
+
+  it.each(["origin", "episode"])("restores a %s review without offering another handoff", async (metadata) => {
+    const reviewWorkspace = workspace({
+      sessionId: "review-session",
+      planState: {
+        ...workspace().planState,
+        latestRevision: { ...latestPlan, originSessionId: metadata === "origin" ? "session-1" : null },
+        ...(metadata === "episode" ? { handoffSourceSessionId: "session-1", canHandoff: false } : {}),
+      },
+    });
+    requests.mockImplementation(async (method: string) => {
+      if (method === "workspace.open" || method === "session.snapshot") return reviewWorkspace;
+      if (method === "command.list") return [{ name: "plan", label: "计划模式" }];
+      if (method === "session.list") return [];
+      return {};
+    });
+
+    renderApp();
+    expect(await screen.findByRole("button", { name: /执行方案/ })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: /新会话复核/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox")).toHaveAttribute("placeholder", "请先选择执行或继续修改");
+    fireEvent.click(screen.getByRole("button", { name: /继续修改/ }));
+    expect(screen.getByRole("textbox")).toBeEnabled();
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "/plan" } });
+    fireEvent.click(await screen.findByRole("button", { name: /计划模式/ }));
+    expect(await screen.findByTestId("plan-decision")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /新会话复核/ })).not.toBeInTheDocument();
+    expect(requests).not.toHaveBeenCalledWith("plan.handoff", expect.anything());
   });
 
   it.each([

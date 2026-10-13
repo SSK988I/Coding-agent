@@ -6,15 +6,16 @@ const LABELS: Record<SubagentTaskPayload["status"], string> = {
   cancelled: "已停止", timed_out: "已超时", uncertain: "结果未知",
 };
 
-export function SubagentPanel({ tasks, onCancel, onReview }: {
+export function SubagentPanel({ tasks, onCancel, onReview, disabled = false }: {
   tasks: SubagentTaskPayload[];
   onCancel: (id: string) => Promise<void>;
   onReview?: () => Promise<void>;
+  disabled?: boolean;
 }) {
   const [pending, setPending] = useState(false);
   const busy = useRef(false);
   const request = async (action: () => Promise<void>) => {
-    if (busy.current) return;
+    if (busy.current || disabled) return;
     busy.current = true;
     setPending(true);
     try { await action(); }
@@ -23,7 +24,7 @@ export function SubagentPanel({ tasks, onCancel, onReview }: {
   return (
     <section className="subagent-panel" aria-label="只读子代理">
       <h3>只读子代理</h3>
-      {onReview && <button className="ghost-button" type="button" disabled={pending} onClick={() => void request(onReview)}>只读复核当前计划</button>}
+      {onReview && <button className="ghost-button" type="button" disabled={pending || disabled} onClick={() => void request(onReview)}>只读复核当前计划</button>}
       {pending && <p role="status">正在请求…</p>}
       {!tasks.length && <p>可用 /subagents spawn 任务说明 启动独立调查。</p>}
       {tasks.map((task) => (
@@ -34,7 +35,7 @@ export function SubagentPanel({ tasks, onCancel, onReview }: {
           <details className="subagent-brief"><summary>任务说明</summary><p>{task.prompt}</p></details>
           <small>{task.taskId} · {task.turns}/{task.maxTurns} 轮{task.lastTool ? ` · ${task.lastTool}` : ""}</small>
           {(task.status === "queued" || task.status === "running") && (
-            <button className="ghost-button" type="button" disabled={pending} onClick={() => void request(() => onCancel(task.taskId))}>停止子代理</button>
+            <button className="ghost-button" type="button" disabled={pending || disabled} onClick={() => void request(() => onCancel(task.taskId))}>停止子代理</button>
           )}
           {task.error && <p role="status">{task.error}</p>}
           {task.output && <pre>{task.output}</pre>}

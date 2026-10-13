@@ -158,6 +158,14 @@ uv run coding-agent --no-session
 
 交互模式可通过 `/plan`、`Shift+Tab` 或 `Alt+M` 进入 Plan Mode。再次按 `Shift+Tab`/`Alt+M` 只会取消规划，不会执行计划。思考级别循环迁移到 `Alt+T`；`Ctrl+T` 仍只展开或折叠 thinking block。
 
+### 访问权限
+
+桌面输入框提供“请求批准 / 帮我批准 / 完全访问权限”菜单；TUI 使用 `/permissions` 选择相同策略。`/permissions on` 或 `Alt+P` 开启完全访问，底栏显示 `bypass permissions on`；`/permissions off` 恢复审批，`/permissions auto` 使用自动审批。双端设置分别保存。
+
+启动参数 `--dangerously-skip-permissions` 或 `--permission-mode bypassPermissions` 只对本次启动生效。完全访问仅跳过工具审批，不绕过 Plan 工具限制或操作系统权限。详见[访问权限规范](docs/specs/desktop-permissions.md)。
+
+### Plan 会话控制
+
 非交互模式使用可恢复控制参数：
 
 ```powershell

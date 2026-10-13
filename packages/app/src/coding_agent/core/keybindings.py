@@ -43,6 +43,10 @@ DEFAULT_APP_KEYBINDINGS: dict[str, dict] = {
         "keys": ["shift+tab", "alt+m"],
         "description": "Cycle Default and Plan modes",
     },
+    "app.permissions.toggle": {
+        "keys": "alt+p",
+        "description": "Toggle bypass permissions",
+    },
     "app.thinking.cycle": {
         "keys": "alt+t",
         "description": "Cycle thinking level",
