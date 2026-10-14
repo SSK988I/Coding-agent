@@ -420,7 +420,7 @@ def _build_epilog() -> str:
   {APP_NAME} --continue "我们刚才讨论了什么？"
 
   # 使用其他模型
-  {APP_NAME} --model deepseek-v4-pro "帮我重构这段代码"
+  {APP_NAME} --model deepseek-flash "帮我重构这段代码"
 
   # 使用智谱 GLM Coding Plan（GLM-5.2 等）
   {APP_NAME} --provider zhipu --model glm-5.2 "重构这个函数"

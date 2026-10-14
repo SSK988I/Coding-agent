@@ -164,7 +164,11 @@ def build_params(
     # Responses defaults DeepSeek reasoning on. Sending ``none`` is required
     # for the UI's THINKING off state to actually mean off.
     level = opts.get("reasoning")
-    effort = "max" if level == "xhigh" else (level or "none")
+    effort = "none"
+    if level:
+        effort = (model.thinking_level_map or {}).get(
+            level, "max" if level == "xhigh" else level,
+        ) or "high"
     params["reasoning"] = {"effort": effort}
     return params
 

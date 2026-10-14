@@ -1183,7 +1183,8 @@ class InteractiveMode:
         # Exact-match shortcut: don't open the selector at all.
         term = search.strip()
         if term:
-            exact = next((m for m in models if m.id == term), None)
+            from coding_agent.core.providers import normalize_model_id
+            exact = next((m for m in models if m.id == normalize_model_id(m.provider, term)), None)
             if exact is not None:
                 self._session.set_model(exact)
                 self._refresh_footer()
@@ -1218,7 +1219,8 @@ class InteractiveMode:
                 models = self._available_models()
             except Exception:
                 models = []
-            chosen = next((m for m in models if m.id == model_id), None)
+            from coding_agent.core.providers import normalize_model_id
+            chosen = next((m for m in models if m.id == normalize_model_id(m.provider, model_id)), None)
             if chosen is not None:
                 self._session.set_model(chosen)
                 self._refresh_footer()

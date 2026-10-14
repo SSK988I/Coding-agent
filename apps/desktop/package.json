@@ -11,9 +11,13 @@
     "build": "pnpm run build:electron && pnpm run build:renderer",
     "typecheck": "tsc -p tsconfig.electron.json --noEmit && tsc -p tsconfig.renderer.json --noEmit",
     "test": "vitest run",
-    "test:smoke": "pnpm build && electron tests/electron.smoke.cjs"
+    "test:smoke": "pnpm build && electron tests/electron.smoke.cjs",
+    "test:workbench": "pnpm build && electron tests/workbench.smoke.cjs"
   },
   "dependencies": {
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "node-pty": "^1.1.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "react-markdown": "^10.1.0",

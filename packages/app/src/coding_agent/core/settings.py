@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from coding_agent.core.config import get_settings_path
+from coding_agent.core.providers import normalize_model_id
 
 
 @dataclass
@@ -109,6 +110,9 @@ class SettingsManager:
             raise ValueError("default_provider must be a string or null")
         if settings.default_model is not None and not isinstance(settings.default_model, str):
             raise ValueError("default_model must be a string or null")
+        settings.default_model = normalize_model_id(
+            settings.default_provider or "deepseek", settings.default_model,
+        )
         if settings.theme != "dark":
             raise ValueError("theme must currently be 'dark'")
         if settings.desktop_permission_mode not in {"ask", "auto", "full_access"}:

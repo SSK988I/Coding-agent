@@ -23,6 +23,7 @@ from __future__ import annotations
 from typing import Callable
 
 from agent_llm import Provider
+from agent_llm.providers.deepseek_models import DEEPSEEK_MODEL_ALIASES
 from agent_llm.types import Model
 
 
@@ -30,7 +31,7 @@ from agent_llm.types import Model
 #: Only the providers we ship are listed; adding a new provider means
 #: adding one line here.
 DEFAULT_MODEL_PER_PROVIDER: dict[str, str] = {
-    "deepseek": "deepseek-v4-pro",
+    "deepseek": "deepseek-flash",
     "zai-coding-cn": "glm-5.1",
 }
 
@@ -43,6 +44,13 @@ def _all_factories() -> list[Callable[[], Provider]]:
 
 
 ALL_PROVIDER_FACTORIES = _all_factories()
+
+
+def normalize_model_id(provider_id: str, model_id: str | None) -> str | None:
+    """Migrate retired built-in ids without changing other providers' models."""
+    if provider_id == "deepseek" and model_id is not None:
+        return DEEPSEEK_MODEL_ALIASES.get(model_id, model_id)
+    return model_id
 
 
 def _all_providers() -> list[Provider]:

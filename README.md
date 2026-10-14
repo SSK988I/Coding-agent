@@ -38,6 +38,7 @@ The desktop MVP currently supports:
 - Tool execution cards and result updates
 - Approval prompts for `bash`, `write`, and `edit`
 - A command palette that opens when `/` is entered
+- A right-hand workbench with independent side conversations, line diffs, interactive terminals, an embedded browser, and file previews; see the [workbench guide](docs/specs/workbench.md) for lifecycle and permission boundaries
 - `/help`, `/new`, `/model`, `/compact`, `/clear`, `/session`, `/plan`, `/cancel-plan`, `/execute-plan`, and `/memory`
 
 ## Requirements
@@ -179,10 +180,12 @@ Plan State is reduced from the active JSONL v4 branch and can be resumed by eith
 ### Provider and model selection
 
 ```powershell
-uv run coding-agent --model deepseek-v4-pro
+uv run coding-agent --model deepseek-flash
 uv run coding-agent --provider zhipu --model glm-5.2
 uv run coding-agent --model zhipu/glm-5.2:high
 ```
+
+DeepSeek defaults to V4.1 Flash (`deepseek-flash`), with text and image input. Retired V4 Flash and V4 Pro ids in CLI arguments, settings, and saved sessions resolve to this model. Cost estimates use peak rates; actual off-peak rates are half as much. See [DeepSeek's release notice](https://api-docs.deepseek.com/news/news260910/) and [pricing](https://api-docs.deepseek.com/quick_start/pricing/).
 
 ### Tool restrictions
 

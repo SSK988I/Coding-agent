@@ -29,6 +29,7 @@ from coding_agent.core.config import (
     get_sessions_dir,
 )
 from coding_agent.core.credentials import CredentialStore
+from coding_agent.core.providers import normalize_model_id
 from coding_agent.core.retry import RetryPolicy
 from coding_agent.core.plan_mode import PlanModeError
 from coding_agent.core.settings import SettingsManager
@@ -248,18 +249,20 @@ def _resolve_model(args: Args, provider: Any) -> Any:
         print("错误：没有可用模型。", file=sys.stderr)
         sys.exit(1)
 
-    if args.model:
+    requested_id = normalize_model_id(provider.id, args.model)
+    if requested_id:
         # Match by id (exact or prefix).
         for m in available:
-            if m.id == args.model:
+            if m.id == requested_id:
                 return m
         for m in available:
-            if m.id.startswith(args.model):
+            if m.id.startswith(requested_id):
                 return m
         # Also try provider/model format.
-        if "/" in args.model:
-            prov, mid = args.model.split("/", 1)
+        if "/" in requested_id:
+            prov, mid = requested_id.split("/", 1)
             if prov == provider.id:
+                mid = normalize_model_id(provider.id, mid) or mid
                 for m in available:
                     if m.id == mid or m.id.startswith(mid):
                         return m

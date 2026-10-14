@@ -1,0 +1,71 @@
+# 桌面工作栏
+
+右上角的“工具栏”打开右侧工作栏。它属于现有 Electron + React 桌面界面，不是独立 Web 应用。
+
+## 使用
+
+工作栏有五个工具：
+
+| 工具 | 用途 |
+| --- | --- |
+| 侧边对话 | 创建独立对话，追问具体问题，不中断主任务，也不把回复自动注入主对话 |
+| 变更 | 查看未暂存、已暂存、分支、本会话或上一轮的文件差异 |
+| 终端 | 在当前工作区打开真实交互终端，支持输入、清屏和重新启动 |
+| 浏览器 | 打开 HTTP / HTTPS 网页，包括本地开发服务器；支持后退、前进、刷新和外部打开 |
+| 文件 | 展开文件树，预览文本、Markdown 和常见图片；可在系统文件管理器中定位文件 |
+
+顶部的“＋”回到工具列表。文件、变更、浏览器和侧边对话各复用一个标签；终端可打开多个标签。关闭当前标签后回到最近使用的标签。宽窗口可拖动左边界调整宽度，窄窗口使用覆盖式面板，也可手动展开工作栏。
+
+关闭整个工作栏只隐藏面板，终端和侧边对话仍可运行。关闭终端标签会终止该终端进程；切换主会话、切换工作区或退出应用会关闭旧作用域的终端、浏览器和侧边 Agent。已经发生的文件、Git、网络等副作用不会被回滚。
+
+## 侧边对话
+
+Python Runtime 为每个侧边对话创建独立 `AgentSession`，沿用创建时的模型、凭据和项目上下文，不复制主会话消息。它只继承主会话当时可用的开发工具，不提供 Plan 控制工具或嵌套子代理。
+
+每次调用工具时还会检查主会话当前的工具集合和权限模式。主会话进入 Plan 后，已有侧边对话也不能继续使用写入或 Shell 工具。侧边审批有独立的批准、拒绝和停止入口；并行工具请求依次展示，不共用主任务的审批。
+
+这与已有的只读调查子代理不同：侧边对话是用户主动操作的独立聊天，在 Default 下可能修改文件。两边共享工作区，勿让它们同时修改同一文件。
+
+对话 JSONL 单独保存，并关联来源主会话。在侧边工具的下拉框中可重新打开记录。进程异常退出后，未能确认结果的运行显示为 `uncertain`，不会自动重试。每个主会话最多打开 16 个侧边对话、同时运行 3 个；单次运行限时 5 分钟。
+
+## 变更来源
+
+- 未暂存：工作目录相对暂存区的差异，另列未跟踪文件。
+- 已暂存：暂存区相对 HEAD 的差异。
+- 分支：选定分支与 HEAD 的共同祖先，相对当前工作目录的差异；不执行 checkout、fetch 或 reset。
+- 本会话：首次开始主任务时的文件快照，相对当前文件的差异。
+- 上一轮：最近一次开始主任务时的文件快照，相对当前文件的差异。
+
+会话快照保存在 Agent 的工作栏缓存目录，不修改 Git index，也不创建 Git commit。尚未运行任务的会话没有快照；缺失时明确提示，不把工作目录差异冒充会话差异。快照只代表文件比较基准，不代表任务验证成功。
+
+Git 使用参数数组调用，不通过 Shell，关闭 pager、终端提示、optional locks 和 fsmonitor。差异读取固定带 `--no-ext-diff --no-textconv --no-color`，不会启动 `diff.external` 或 textconv helper；其他 Git 配置仍属于受信任项目边界。
+
+每个快照最多 2000 个文件、32 MiB 内容，单文件文本限 1 MiB。大文件只记录大小和修改时间标识，不能据此保证内容未变。Git 列表最多 500 个文件，单文件 diff 预览限 1 MiB；界面提示截断。缓存保留在本地，不自动删除旧会话基线。
+
+## 文件、终端和浏览器边界
+
+文件路径由 Core 解析后限制在当前工作区内，包括符号链接。目录按需加载，每级最多 500 个条目；筛选只作用于已加载的文件树。文本和图片预览限 1 MiB，源码最多展示 5000 行。文件预览不提供编辑操作。
+
+终端通过 Electron 主进程的 `node-pty` 创建，Windows 默认 PowerShell，其他平台使用用户 Shell。它是用户手动输入的终端，不是模型的 `bash` 工具，也不经过 Agent 工具审批。最多同时打开 6 个，输出缓冲保留最近 256 KiB；切换会话不会自动重启终端。
+
+浏览器使用隔离的 `WebContentsView`，启用 sandbox 和 context isolation，关闭 Node integration，不加载桌面 preload。网页不能访问 Agent RPC、文件工具或凭据；摄像头等网站权限默认拒绝。仅允许 HTTP / HTTPS 和内部空白页，拒绝 `file:`、`javascript:` 等地址。Cookie 保存在独立浏览器分区，关闭标签不会清除 Cookie。
+
+工作栏 RPC 和原生请求都携带工作区路径与主会话 ID。服务端拒绝旧作用域请求，客户端忽略旧会话事件，避免切换后把结果送到另一会话。
+
+## 验证
+
+```powershell
+uv run pytest -q packages/app/tests/test_workbench.py
+cd apps/desktop
+pnpm test
+pnpm typecheck
+pnpm test:workbench
+```
+
+原生冒烟测试使用临时 Git 仓库、独立配置、真实 Python Runtime、PTY 和本地 HTTP 页面。它验证终端输入、浏览器点击与隔离、差异和文件预览、标签切换、窄窗口及资源关闭，不调用收费模型 API。侧边 Agent 的独立运行、恢复和并行审批由 Python 回归测试覆盖。
+
+## 参考
+
+工具列表与标签行为参考 `G:\openpi` 的 `web/ui/src/features/workbar`；终端及 Git 读取边界参考其 `web/host/interactive-terminal.ts` 和 `git-review.ts`。Codex 的 `codex-rs/app-server/src/request_processors/git_processor.rs` 用作后端负责差异读取的参考。本项目仍使用自己的 Python Core 与 Electron IPC，不复制上游运行时。
+
+原生视图的隔离和资源生命周期遵循 [Electron WebContentsView 文档](https://www.electronjs.org/docs/latest/api/web-contents-view)和 [BaseWindow 资源管理说明](https://www.electronjs.org/docs/latest/api/base-window#resource-management)。

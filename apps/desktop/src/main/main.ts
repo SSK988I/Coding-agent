@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
+import { NativeWorkbench } from "./workbench";
 
 interface PendingRequest {
   resolve: (value: unknown) => void;
@@ -14,6 +15,7 @@ interface PendingRequest {
 let mainWindow: BrowserWindow | null = null;
 let sidecar: ChildProcessWithoutNullStreams | null = null;
 let quitting = false;
+let workbench: NativeWorkbench | null = null;
 const pending = new Map<string, PendingRequest>();
 
 const desktopRoot = path.resolve(__dirname, "..", "..");
@@ -67,6 +69,10 @@ function startSidecar(): void {
     try {
       const message = JSON.parse(line) as Record<string, unknown>;
       if (message.type === "event") {
+        const event = message.event as { type?: string; payload?: Record<string, unknown> } | undefined;
+        if (event?.payload && typeof event.payload.path === "string" && typeof event.payload.sessionId === "string") {
+          workbench?.retainScope(event.payload.path, event.payload.sessionId);
+        }
         broadcast("agent:event", message);
         return;
       }
@@ -105,6 +111,7 @@ function startSidecar(): void {
 
   sidecar.once("exit", (code, signal) => {
     sidecar = null;
+    void workbench?.dispose();
     const reason = new Error(`Agent sidecar exited (${code ?? signal ?? "unknown"})`);
     for (const request of pending.values()) {
       clearTimeout(request.timeout);
@@ -161,6 +168,7 @@ function createWindow(): void {
   });
 
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  workbench = new NativeWorkbench(mainWindow, requestSidecar);
   mainWindow.webContents.on("will-navigate", (event, url) => {
     const devUrl = process.env.VITE_DEV_SERVER_URL;
     if (!devUrl || !url.startsWith(devUrl)) event.preventDefault();
@@ -171,7 +179,14 @@ function createWindow(): void {
   } else {
     void mainWindow.loadFile(path.join(desktopRoot, "dist-renderer", "index.html"));
   }
-  mainWindow.on("closed", () => { mainWindow = null; });
+  let drained = false;
+  const window = mainWindow;
+  mainWindow.on("close", (event) => {
+    if (drained || !workbench) return;
+    event.preventDefault();
+    void workbench.dispose().finally(() => { drained = true; if (!window.isDestroyed()) window.close(); });
+  });
+  mainWindow.on("closed", () => { workbench = null; mainWindow = null; });
 }
 
 app.whenReady().then(() => {
@@ -188,6 +203,11 @@ app.whenReady().then(() => {
     assertTrustedSender(event);
     const result = await dialog.showOpenDialog(mainWindow!, { properties: ["openDirectory"] });
     return result.canceled ? null : result.filePaths[0] ?? null;
+  });
+  ipcMain.handle("desktop:workbench-request", (event, method: unknown, params: unknown) => {
+    assertTrustedSender(event);
+    if (typeof method !== "string" || !params || typeof params !== "object" || Array.isArray(params)) throw new Error("工具栏请求无效");
+    return workbench!.dispatch(method, params as Record<string, unknown>);
   });
   ipcMain.handle("desktop:get-bootstrap", (event) => {
     assertTrustedSender(event);

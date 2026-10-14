@@ -75,7 +75,7 @@ async def serve() -> int:
             })
 
     async def dispatch(request: dict[str, Any]) -> None:
-        if request["method"] in _OUT_OF_BAND_METHODS:
+        if request["method"] in _OUT_OF_BAND_METHODS or request["method"].startswith("workbench."):
             await respond(request)
         else:
             async with serial:

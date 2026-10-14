@@ -17,13 +17,15 @@ from coding_agent.core.agent_session import AgentSession, AgentSessionConfig
 from coding_agent.core.config import get_agent_dir, get_auth_path, get_sessions_dir
 from coding_agent.core.context_files import load_project_context_files
 from coding_agent.core.credentials import CredentialStore
-from coding_agent.core.providers import _all_providers, get_configured_models
+from coding_agent.core.providers import _all_providers, get_configured_models, normalize_model_id
 from coding_agent.core.retry import RetryPolicy
 from coding_agent.core.plan_mode import PlanModeError
 from coding_agent.core.settings import SettingsManager
 from coding_agent.core.slash_commands import get_active_commands
 from coding_agent.core.subagents import SubagentError
 from coding_agent.desktop.protocol import PROTOCOL_VERSION, RpcError, to_jsonable
+from coding_agent.desktop.workbench import WorkspaceWorkbench
+from coding_agent.desktop.side_conversations import SideConversations
 from coding_agent.core.permissions import (
     PERMISSION_MODES, PermissionMode, requires_approval,
     is_approval_safe_shell_command as _is_default_approval_safe_shell_command,
@@ -60,8 +62,12 @@ class DesktopRuntime:
         self._approval_timeout_seconds = approval_timeout_seconds
         self._permission_mode: PermissionMode = cast(PermissionMode, SettingsManager().load().desktop_permission_mode)
         self._native_search_decision: tuple[str, bool] | None = None
+        self._workbench: WorkspaceWorkbench | None = None
+        self._side_conversations: SideConversations | None = None
 
     async def dispatch(self, method: str, params: dict[str, Any]) -> Any:
+        if method.startswith("workbench."):
+            return await self._workbench_request(method, params)
         handlers: dict[str, Callable[[dict[str, Any]], Awaitable[Any]]] = {
             "runtime.ping": self._ping,
             "workspace.open": self._workspace_open,
@@ -155,7 +161,8 @@ class DesktopRuntime:
             raise RpcError("NO_PROVIDER", "没有可用的模型 Provider")
 
         available_models = provider.get_models()
-        model = next((item for item in available_models if item.id == settings.default_model), None)
+        default_model_id = normalize_model_id(provider.id, settings.default_model)
+        model = next((item for item in available_models if item.id == default_model_id), None)
         if model is None and available_models:
             model = available_models[0]
         if model is None:
@@ -170,6 +177,7 @@ class DesktopRuntime:
             persisted_model_id = persisted.model.get("model_id")
             persisted_provider_obj = next((item for item in providers if item.id == persisted_provider), None)
             if persisted_provider_obj is not None:
+                persisted_model_id = normalize_model_id(persisted_provider_obj.id, persisted_model_id)
                 persisted_model = next(
                     (item for item in persisted_provider_obj.get_models() if item.id == persisted_model_id),
                     None,
@@ -225,6 +233,48 @@ class DesktopRuntime:
         self._workspace = workspace
         self._session = AgentSession(config)
         self._unsubscribe = self._session.on_event(self._on_session_event)
+        self._workbench = WorkspaceWorkbench(workspace, self._session.session_manager.header.id, get_agent_dir() / "workbench")
+        self._side_conversations = SideConversations(
+            self._session, self._workbench.storage, self._publish, lambda: self._permission_mode,
+        )
+
+    async def _workbench_request(self, method: str, params: dict[str, Any]) -> Any:
+        session = self._require_session()
+        workbench = self._workbench
+        if workbench is None or workbench.session_id != session.session_manager.header.id:
+            raise RpcError("WORKBENCH_UNAVAILABLE", "请重新打开当前工作区")
+        scope = {"workspacePath": str(workbench.workspace), "sessionId": workbench.session_id}
+        if method == "workbench.scope":
+            return scope
+        if params.get("sessionId") != workbench.session_id or params.get("workspacePath") != str(workbench.workspace):
+            raise RpcError("STALE_WORKSPACE", "工作区或会话已经切换，请重新打开工具")
+        readers = {"workbench.files.list": workbench.list_files, "workbench.files.read": workbench.read_file, "workbench.changes": workbench.changes}
+        if method in readers:
+            result = await asyncio.to_thread(readers[method], params)
+            return {**scope, **result}
+        if method == "workbench.files.resolve":
+            return {**scope, "absolutePath": str(workbench.path(params.get("path")))}
+        side = self._side_conversations
+        if side is None:
+            raise RpcError("WORKBENCH_UNAVAILABLE", "侧边对话不可用")
+        if method == "workbench.chat.list":
+            return {**scope, "conversations": side.list()}
+        if method == "workbench.chat.open":
+            return {**scope, **side.open(params.get("conversationId"))}
+        if method == "workbench.chat.send":
+            return {**scope, **side.send(params.get("conversationId"), params.get("text"))}
+        if method == "workbench.chat.stop":
+            return {**scope, **await side.stop(params.get("conversationId"))}
+        if method == "workbench.chat.approve":
+            return side.resolve(params.get("conversationId"), params.get("approvalId"), params.get("allowed"))
+        raise RpcError("METHOD_NOT_FOUND", f"未知工具栏方法：{method}")
+
+    async def _capture_workbench(self) -> None:
+        if self._workbench is not None:
+            try:
+                await self._workbench.capture()
+            except Exception as exc:  # noqa: BLE001 - unavailable evidence must not stop the Agent
+                self._publish("workbench.baselineFailed", {"message": str(exc)})
 
     def _select_session_manager(
         self,
@@ -336,6 +386,7 @@ class DesktopRuntime:
         provider_id = params.get("provider")
         if not isinstance(model_id, str) or not isinstance(provider_id, str):
             raise RpcError("INVALID_PARAMS", "model.select 需要 modelId 和 provider")
+        model_id = normalize_model_id(provider_id, model_id)
         chosen = next(
             (
                 model for model in self._available_models()
@@ -471,12 +522,18 @@ class DesktopRuntime:
 
         session = self._require_session()
         try:
+            if self._side_conversations is not None:
+                await self._side_conversations.close()
             session.handoff_plan_to_new_session(
                 plan_id, revision, digest, attach=True,
             )
         except PlanModeError as exc:
             raise RpcError(exc.code, str(exc)) from exc
-
+        finally:
+            # Handoff can reject the revision after closing children. Rebind the
+            # still-authoritative session on both success and failure.
+            self._workbench = WorkspaceWorkbench(self._require_workspace(), session.session_manager.header.id, get_agent_dir() / "workbench")
+            self._side_conversations = SideConversations(session, self._workbench.storage, self._publish, lambda: self._permission_mode)
         payload = self._workspace_payload()
         self._publish("session.changed", payload)
         return payload
@@ -487,6 +544,7 @@ class DesktopRuntime:
     ) -> None:
         self._publish("run.started", {"planExecution": True}, run_id=run_id)
         try:
+            await self._capture_workbench()
             await session.execute_plan(plan_id, revision, digest, run_id=run_id)
         except PlanModeError as exc:
             self._publish("run.failed", {"code": exc.code, "message": str(exc)}, run_id=run_id)
@@ -509,6 +567,7 @@ class DesktopRuntime:
     async def _drive_run(self, session: AgentSession, text: str, run_id: str) -> None:
         self._publish("run.started", {"text": text}, run_id=run_id)
         try:
+            await self._capture_workbench()
             await session.prompt(text)
         except asyncio.CancelledError:
             self._publish("run.cancelled", {}, run_id=run_id)
@@ -592,6 +651,8 @@ class DesktopRuntime:
     async def _permission_set_mode(self, params: dict[str, Any]) -> dict[str, Any]:
         session = self._require_session()
         self._ensure_no_active_run("请先停止当前任务，再切换访问权限")
+        if self._side_conversations is not None and any(live.status == "running" for live in self._side_conversations.records.values()):
+            raise RpcError("SIDE_CHAT_RUNNING", "请先停止侧边对话，再切换访问权限")
         if session.subagents.has_active:
             raise RpcError("SUBAGENT_RUNNING", "请先停止子代理，再切换访问权限")
         mode = params.get("mode")
@@ -937,6 +998,10 @@ class DesktopRuntime:
                 raise
 
     async def _dispose_session(self) -> None:
+        if self._side_conversations is not None:
+            await self._side_conversations.close()
+            self._side_conversations = None
+        self._workbench = None
         if self._unsubscribe is not None:
             self._unsubscribe()
             self._unsubscribe = None

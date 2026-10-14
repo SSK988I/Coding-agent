@@ -38,6 +38,7 @@ Coding Agent 是一个面向本地开发工作的编程 Agent。项目以 Python
 - 展示工具调用状态和执行结果
 - 对 `bash`、`write`、`edit` 请求执行确认
 - 输入 `/` 打开命令面板
+- 右上角“工具栏”：独立侧边对话、逐行变更、交互终端、内嵌浏览器和文件树预览；使用与权限边界见[桌面工作栏](docs/specs/workbench.md)
 - `/help`、`/new`、`/model`、`/compact`、`/clear`、`/session`、`/plan`、`/cancel-plan`、`/execute-plan`、`/memory`
 
 ## 环境要求
@@ -181,10 +182,12 @@ Plan State 从活动 JSONL v4 分支归约，可由 CLI 或桌面端交叉恢复
 ### 选择 Provider 和模型
 
 ```powershell
-uv run coding-agent --model deepseek-v4-pro
+uv run coding-agent --model deepseek-flash
 uv run coding-agent --provider zhipu --model glm-5.2
 uv run coding-agent --model zhipu/glm-5.2:high
 ```
+
+DeepSeek 默认使用 V4.1 Flash（`deepseek-flash`），支持文本和图片输入。CLI 参数、设置和保存会话中的旧 V4 Flash / V4 Pro 名称会自动迁移到该模型。费用按高峰价估算，闲时实际单价为一半。详见 [DeepSeek 发布公告](https://api-docs.deepseek.com/news/news260910/)和[定价](https://api-docs.deepseek.com/quick_start/pricing/)。
 
 ### 限制工具
 

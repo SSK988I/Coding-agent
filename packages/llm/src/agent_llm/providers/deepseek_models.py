@@ -1,7 +1,8 @@
 """DeepSeek model 目录。
 
-使用 DeepSeek 真实 API 的 model id(``deepseek-v4-flash`` /
-``deepseek-v4-pro``)、定价、上下文窗口和 compat 配置。
+使用官方 API 名称 ``deepseek-flash``，对应 DeepSeek V4.1 Flash。
+旧 Flash / Pro 入口按官方 2026-09-10 公告迁移，不在选择器中重复展示。
+价格使用美元高峰价估算；闲时及中国法定节假日的实际单价为一半。
 """
 from __future__ import annotations
 
@@ -16,42 +17,35 @@ _DEEPSEEK_COMPAT = {
     "thinking_format": "deepseek",
 }
 
-#: 仅支持 high / xhigh;minimal / low / medium 显式为 null。
+#: 官方支持 low / high / max；统一级别映射到对应的 API 参数。
 _DEEPSEEK_THINKING_LEVEL_MAP = {
-    "minimal": None,
-    "low": None,
-    "medium": None,
+    "minimal": "low",
+    "low": "low",
+    "medium": "high",
     "high": "high",
     "xhigh": "max",
 }
 
+#: 兼容旧 CLI 参数、设置和保存的会话，不向用户暴露已退役的选项。
+DEEPSEEK_MODEL_ALIASES: dict[str, str] = {
+    "deepseek-v4-flash": "deepseek-flash",
+    "deepseek-v4-flash-vision-exp": "deepseek-flash",
+    "deepseek-v4-pro": "deepseek-flash",
+}
+
 DEEPSEEK_MODELS: dict[str, Model] = {
-    "deepseek-v4-flash": Model(
-        id="deepseek-v4-flash",
-        name="DeepSeek V4 Flash",
+    "deepseek-flash": Model(
+        id="deepseek-flash",
+        name="DeepSeek V4.1 Flash",
         api="openai-responses",
         provider="deepseek",
         base_url="https://api.deepseek.com",
         compat=dict(_DEEPSEEK_COMPAT),
         reasoning=True,
         thinking_level_map=dict(_DEEPSEEK_THINKING_LEVEL_MAP),  # type: ignore[arg-type]
-        input=["text"],
-        cost=ModelCost(input=0.14, output=0.28, cache_read=0.0028, cache_write=0),
-        context_window=1_000_000,
-        max_tokens=384_000,
-    ),
-    "deepseek-v4-pro": Model(
-        id="deepseek-v4-pro",
-        name="DeepSeek V4 Pro",
-        api="openai-responses",
-        provider="deepseek",
-        base_url="https://api.deepseek.com",
-        compat=dict(_DEEPSEEK_COMPAT),
-        reasoning=True,
-        thinking_level_map=dict(_DEEPSEEK_THINKING_LEVEL_MAP),  # type: ignore[arg-type]
-        input=["text"],
-        cost=ModelCost(input=0.435, output=0.87, cache_read=0.003625, cache_write=0),
-        context_window=1_000_000,
-        max_tokens=384_000,
+        input=["text", "image"],
+        cost=ModelCost(input=0.3, output=1.2, cache_read=0.006, cache_write=0),
+        context_window=1_048_576,
+        max_tokens=393_216,
     ),
 }

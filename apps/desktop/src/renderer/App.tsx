@@ -16,6 +16,7 @@ import type {
 import { PermissionPicker } from "./components/PermissionPicker";
 import { SubagentPanel } from "./components/SubagentPanel";
 import { ToolCard } from "./components/tool-card";
+import { Workbench } from "./workbench/Workbench";
 import {
   createTimelineState,
   createTimelineStateFromMessages,
@@ -231,6 +232,8 @@ function updateTimelineItem(
 }
 
 export function App() {
+  const [workbenchOpen, setWorkbenchOpen] = useState(false);
+  const [workbenchWidth, setWorkbenchWidth] = useState(480);
   const [sidecarStatus, setSidecarStatus] = useState("starting");
   const [workspace, setWorkspace] = useState<WorkspacePayload | null>(null);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
@@ -436,6 +439,7 @@ export function App() {
   useEffect(() => {
     const unsubscribeStatus = window.agent.onStatus(setSidecarStatus);
     const unsubscribeEvents = window.agent.onEvent((event) => {
+      if (event.event.type.startsWith("workbench.")) return;
       rafQueue.current.push(event);
       if (rafId.current !== null) return;
       rafId.current = requestAnimationFrame(() => {
@@ -1384,10 +1388,11 @@ export function App() {
         <div className="titlebar-spacer" />
         <div className={`runtime-dot ${sidecarStatus === "ready" ? "online" : ""}`} />
         <span className="runtime-label">{statusLabel}</span>
+        <button type="button" className="ghost-button" aria-label="打开工具栏" aria-expanded={workbenchOpen} onClick={() => setWorkbenchOpen((value) => !value)} disabled={!workspace}>工具栏 ▥</button>
         <button className="ghost-button" onClick={chooseWorkspace} disabled={running || compacting || sessionNavigating}>打开项目</button>
       </header>
 
-      <div className={`workspace-grid ${sidebarOpen ? "" : "sidebar-closed"}`}>
+      <div className={`workspace-grid ${sidebarOpen ? "" : "sidebar-closed"} ${workbenchOpen ? "with-workbench" : ""}`} style={{ "--workbench-width": `${workbenchWidth}px` } as React.CSSProperties}>
         <aside className="sidebar">
           <div className="sidebar-heading">
             <span>会话</span>
@@ -1758,6 +1763,7 @@ export function App() {
             </form>
           </div>
         </main>
+        {workspace && <Workbench key={workspace.sessionId} workspace={workspace} open={workbenchOpen} onClose={() => setWorkbenchOpen(false)} width={workbenchWidth} onWidth={setWorkbenchWidth} />}
       </div>
     </div>
   );
