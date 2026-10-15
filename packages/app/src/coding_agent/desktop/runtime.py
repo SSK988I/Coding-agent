@@ -2,10 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import os
 from pathlib import Path
-import re
-import shlex
 import time
 from typing import Any, Awaitable, Callable, cast
 import uuid
@@ -18,23 +17,30 @@ from coding_agent.core.agent_session import AgentSession, AgentSessionConfig
 from coding_agent.core.config import get_agent_dir, get_auth_path, get_sessions_dir
 from coding_agent.core.context_files import load_project_context_files
 from coding_agent.core.credentials import CredentialStore
-from coding_agent.core.providers import _all_providers, get_configured_models
+from coding_agent.core.providers import _all_providers, get_configured_models, normalize_model_id
 from coding_agent.core.retry import RetryPolicy
 from coding_agent.core.plan_mode import PlanModeError
 from coding_agent.core.settings import SettingsManager
 from coding_agent.core.slash_commands import get_active_commands
+from coding_agent.core.subagents import SubagentError
 from coding_agent.desktop.protocol import PROTOCOL_VERSION, RpcError, to_jsonable
+from coding_agent.desktop.workbench import WorkspaceWorkbench
+from coding_agent.desktop.side_conversations import SideConversations
+from coding_agent.core.permissions import (
+    PERMISSION_MODES, PermissionMode, requires_approval,
+    is_approval_safe_shell_command as _is_default_approval_safe_shell_command,
+)
 
 EventEmitter = Callable[[dict[str, Any]], None]
-_APPROVAL_TOOLS = {"bash", "write", "edit"}
 _DESKTOP_COMMANDS = {
     "help": ("帮助", "查看桌面端可用命令"),
     "new": ("新会话", "创建一个新的会话"),
     "model": ("模型", "选择或切换当前模型"),
-    "compact": ("压缩上下文", "立即压缩较早的会话内容"),
+    "compact": ("压缩上下文", "压缩会话；/compact <下一阶段目标> 可定向整理"),
+    "subagents": ("只读子代理", "查看、启动、审查或停止独立调查任务"),
     "clear": ("清空对话", "清空当前窗口和 Agent 上下文"),
     "session": ("会话状态", "查看当前会话统计信息"),
-    "plan": ("计划模式", "进入 Plan Mode"),
+    "plan": ("计划模式", "进入 Plan Mode 或显示当前 Plan 操作"),
     "cancel-plan": ("取消规划", "退出 Plan Mode，不执行计划"),
     "execute-plan": ("执行计划", "执行最新的 Plan revision"),
     "memory": ("长期记忆", "查看和管理长期偏好、事实与项目经验"),
@@ -54,8 +60,14 @@ class DesktopRuntime:
         self._seq = 0
         self._approvals: dict[str, asyncio.Future[bool]] = {}
         self._approval_timeout_seconds = approval_timeout_seconds
+        self._permission_mode: PermissionMode = cast(PermissionMode, SettingsManager().load().desktop_permission_mode)
+        self._native_search_decision: tuple[str, bool] | None = None
+        self._workbench: WorkspaceWorkbench | None = None
+        self._side_conversations: SideConversations | None = None
 
     async def dispatch(self, method: str, params: dict[str, Any]) -> Any:
+        if method.startswith("workbench."):
+            return await self._workbench_request(method, params)
         handlers: dict[str, Callable[[dict[str, Any]], Awaitable[Any]]] = {
             "runtime.ping": self._ping,
             "workspace.open": self._workspace_open,
@@ -72,6 +84,7 @@ class DesktopRuntime:
             "run.steer": self._run_steer,
             "run.followUp": self._run_follow_up,
             "approval.resolve": self._approval_resolve,
+            "permission.setMode": self._permission_set_mode,
             "mode.enterPlan": self._mode_enter_plan,
             "plan.answer": self._plan_answer,
             "plan.cancel": self._plan_cancel,
@@ -88,18 +101,26 @@ class DesktopRuntime:
             "webSearch.status": self._web_search_status,
             "webSearch.setEnabled": self._web_search_set_enabled,
             "session.compact": self._session_compact,
+            "subagent.spawn": self._subagent_spawn,
+            "subagent.list": self._subagent_list,
+            "subagent.status": self._subagent_status,
+            "subagent.wait": self._subagent_wait,
+            "subagent.cancel": self._subagent_cancel,
             "runtime.dispose": self._dispose_command,
         }
         handler = handlers.get(method)
         if handler is None:
             raise RpcError("METHOD_NOT_FOUND", f"未知方法：{method}")
-        return await handler(params)
+        try:
+            return await handler(params)
+        except SubagentError as exc:
+            raise RpcError(exc.code, str(exc)) from exc
 
     async def _ping(self, params: dict[str, Any]) -> dict[str, Any]:
         del params
         return {
             "protocolVersion": PROTOCOL_VERSION, "status": "ready",
-            "capabilities": ["plan_mode_v1", "memory_v1", "memory_v2", "web_search_v1"],
+            "capabilities": ["plan_mode_v1", "memory_v1", "memory_v2", "web_search_v1", "context_pivot_v1", "readonly_subagents_v1", "desktop_permissions_v1"],
         }
 
     async def _workspace_open(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -121,11 +142,14 @@ class DesktopRuntime:
         session_id: str | None = None,
         resume: bool = False,
     ) -> None:
+        if self._session is not None and getattr(self._session, "is_compacting", False):
+            raise RpcError("COMPACTION_IN_PROGRESS", "请先停止压缩，再切换会话")
         await self._stop_active_run()
         await self._dispose_session()
 
         settings_manager = SettingsManager()
         settings = settings_manager.load()
+        self._permission_mode = cast(PermissionMode, settings.desktop_permission_mode)
         provider_id = settings.default_provider or "deepseek"
         providers = _all_providers()
         provider = next((item for item in providers if item.id == provider_id), None)
@@ -137,7 +161,8 @@ class DesktopRuntime:
             raise RpcError("NO_PROVIDER", "没有可用的模型 Provider")
 
         available_models = provider.get_models()
-        model = next((item for item in available_models if item.id == settings.default_model), None)
+        default_model_id = normalize_model_id(provider.id, settings.default_model)
+        model = next((item for item in available_models if item.id == default_model_id), None)
         if model is None and available_models:
             model = available_models[0]
         if model is None:
@@ -152,6 +177,7 @@ class DesktopRuntime:
             persisted_model_id = persisted.model.get("model_id")
             persisted_provider_obj = next((item for item in providers if item.id == persisted_provider), None)
             if persisted_provider_obj is not None:
+                persisted_model_id = normalize_model_id(persisted_provider_obj.id, persisted_model_id)
                 persisted_model = next(
                     (item for item in persisted_provider_obj.get_models() if item.id == persisted_model_id),
                     None,
@@ -180,6 +206,7 @@ class DesktopRuntime:
             reasoning=reasoning,
             context_files=context_files,
             before_tool_call=self._before_tool_call,
+            before_native_web_search=self._before_native_web_search,
             retry_policy=RetryPolicy(
                 enabled=settings.auto_retry,
                 max_retries=settings.max_retries,
@@ -206,6 +233,48 @@ class DesktopRuntime:
         self._workspace = workspace
         self._session = AgentSession(config)
         self._unsubscribe = self._session.on_event(self._on_session_event)
+        self._workbench = WorkspaceWorkbench(workspace, self._session.session_manager.header.id, get_agent_dir() / "workbench")
+        self._side_conversations = SideConversations(
+            self._session, self._workbench.storage, self._publish, lambda: self._permission_mode,
+        )
+
+    async def _workbench_request(self, method: str, params: dict[str, Any]) -> Any:
+        session = self._require_session()
+        workbench = self._workbench
+        if workbench is None or workbench.session_id != session.session_manager.header.id:
+            raise RpcError("WORKBENCH_UNAVAILABLE", "请重新打开当前工作区")
+        scope = {"workspacePath": str(workbench.workspace), "sessionId": workbench.session_id}
+        if method == "workbench.scope":
+            return scope
+        if params.get("sessionId") != workbench.session_id or params.get("workspacePath") != str(workbench.workspace):
+            raise RpcError("STALE_WORKSPACE", "工作区或会话已经切换，请重新打开工具")
+        readers = {"workbench.files.list": workbench.list_files, "workbench.files.read": workbench.read_file, "workbench.changes": workbench.changes}
+        if method in readers:
+            result = await asyncio.to_thread(readers[method], params)
+            return {**scope, **result}
+        if method == "workbench.files.resolve":
+            return {**scope, "absolutePath": str(workbench.path(params.get("path")))}
+        side = self._side_conversations
+        if side is None:
+            raise RpcError("WORKBENCH_UNAVAILABLE", "侧边对话不可用")
+        if method == "workbench.chat.list":
+            return {**scope, "conversations": side.list()}
+        if method == "workbench.chat.open":
+            return {**scope, **side.open(params.get("conversationId"))}
+        if method == "workbench.chat.send":
+            return {**scope, **side.send(params.get("conversationId"), params.get("text"))}
+        if method == "workbench.chat.stop":
+            return {**scope, **await side.stop(params.get("conversationId"))}
+        if method == "workbench.chat.approve":
+            return side.resolve(params.get("conversationId"), params.get("approvalId"), params.get("allowed"))
+        raise RpcError("METHOD_NOT_FOUND", f"未知工具栏方法：{method}")
+
+    async def _capture_workbench(self) -> None:
+        if self._workbench is not None:
+            try:
+                await self._workbench.capture()
+            except Exception as exc:  # noqa: BLE001 - unavailable evidence must not stop the Agent
+                self._publish("workbench.baselineFailed", {"message": str(exc)})
 
     def _select_session_manager(
         self,
@@ -260,12 +329,13 @@ class DesktopRuntime:
             "stats": to_jsonable(session.get_stats()),
             "collaborationMode": session.collaboration_mode,
             "planState": session.plan_state.to_payload(),
+            "subagents": self._subagent_payload(session),
+            "permissionMode": self._permission_mode,
         }
 
     async def _session_clear(self, params: dict[str, Any]) -> dict[str, Any]:
         del params
-        if self._run_task is not None and not self._run_task.done():
-            raise RpcError("RUN_IN_PROGRESS", "任务运行时不能清空会话")
+        self._ensure_no_active_run("任务运行时不能清空会话")
         self._require_session().agent.reset()
         payload = await self._workspace_payload_with_memory()
         self._publish("session.changed", payload)
@@ -311,12 +381,12 @@ class DesktopRuntime:
         ]
 
     async def _model_select(self, params: dict[str, Any]) -> dict[str, Any]:
-        if self._run_task is not None and not self._run_task.done():
-            raise RpcError("RUN_IN_PROGRESS", "任务运行时不能切换模型")
+        self._ensure_no_active_run("任务运行时不能切换模型")
         model_id = params.get("modelId")
         provider_id = params.get("provider")
         if not isinstance(model_id, str) or not isinstance(provider_id, str):
             raise RpcError("INVALID_PARAMS", "model.select 需要 modelId 和 provider")
+        model_id = normalize_model_id(provider_id, model_id)
         chosen = next(
             (
                 model for model in self._available_models()
@@ -342,8 +412,7 @@ class DesktopRuntime:
             raise RpcError("INVALID_PARAMS", "run.start 需要非空 text")
         if text.lstrip().startswith("/"):
             raise RpcError("SLASH_COMMAND", "斜杠命令需要由桌面端处理，不能作为提示词发送给模型")
-        if self._run_task is not None and not self._run_task.done():
-            raise RpcError("RUN_IN_PROGRESS", "当前已有任务正在运行")
+        self._ensure_no_active_run("当前已有任务正在运行")
         run_id = uuid.uuid4().hex
         self._run_id = run_id
         self._run_task = asyncio.create_task(self._drive_run(session, text, run_id))
@@ -383,12 +452,14 @@ class DesktopRuntime:
         self._publish("run.started", {"planAnswer": True}, run_id=run_id)
         try:
             await session.answer_plan_question(question_id, answer)
+        except asyncio.CancelledError:
+            self._publish("run.cancelled", {}, run_id=run_id)
         except PlanModeError as exc:
             self._publish("run.failed", {"code": exc.code, "message": str(exc)}, run_id=run_id)
         except Exception as exc:  # noqa: BLE001 - runtime boundary
             self._publish("run.failed", {"message": str(exc)}, run_id=run_id)
         else:
-            self._publish("run.completed", {"stats": to_jsonable(session.get_stats())}, run_id=run_id)
+            self._publish_prompt_outcome(session, run_id)
         finally:
             if self._run_id == run_id:
                 self._run_id = None
@@ -451,12 +522,18 @@ class DesktopRuntime:
 
         session = self._require_session()
         try:
+            if self._side_conversations is not None:
+                await self._side_conversations.close()
             session.handoff_plan_to_new_session(
                 plan_id, revision, digest, attach=True,
             )
         except PlanModeError as exc:
             raise RpcError(exc.code, str(exc)) from exc
-
+        finally:
+            # Handoff can reject the revision after closing children. Rebind the
+            # still-authoritative session on both success and failure.
+            self._workbench = WorkspaceWorkbench(self._require_workspace(), session.session_manager.header.id, get_agent_dir() / "workbench")
+            self._side_conversations = SideConversations(session, self._workbench.storage, self._publish, lambda: self._permission_mode)
         payload = self._workspace_payload()
         self._publish("session.changed", payload)
         return payload
@@ -467,6 +544,7 @@ class DesktopRuntime:
     ) -> None:
         self._publish("run.started", {"planExecution": True}, run_id=run_id)
         try:
+            await self._capture_workbench()
             await session.execute_plan(plan_id, revision, digest, run_id=run_id)
         except PlanModeError as exc:
             self._publish("run.failed", {"code": exc.code, "message": str(exc)}, run_id=run_id)
@@ -489,25 +567,39 @@ class DesktopRuntime:
     async def _drive_run(self, session: AgentSession, text: str, run_id: str) -> None:
         self._publish("run.started", {"text": text}, run_id=run_id)
         try:
+            await self._capture_workbench()
             await session.prompt(text)
         except asyncio.CancelledError:
             self._publish("run.cancelled", {}, run_id=run_id)
         except Exception as exc:  # noqa: BLE001 - runtime boundary
             self._publish("run.failed", {"message": str(exc)}, run_id=run_id)
         else:
-            self._publish(
-                "run.completed",
-                {"stats": to_jsonable(session.get_stats())},
-                run_id=run_id,
-            )
+            self._publish_prompt_outcome(session, run_id)
         finally:
             if self._run_id == run_id:
                 self._run_id = None
                 self._run_task = None
 
+    def _publish_prompt_outcome(self, session: AgentSession, run_id: str) -> None:
+        status = session.agent.last_run_status
+        if status == "cancelled":
+            self._publish("run.cancelled", {}, run_id=run_id)
+        elif status == "failed":
+            self._publish("run.failed", {
+                "message": session.agent.state.error_message or "模型回合失败",
+            }, run_id=run_id)
+        else:
+            self._publish("run.completed", {"stats": to_jsonable(session.get_stats())}, run_id=run_id)
+
     async def _run_abort(self, params: dict[str, Any]) -> dict[str, Any]:
         del params
+        if self._session is not None and getattr(self._session, "is_compacting", False):
+            self._session.abort_compaction()
+            return {"aborted": True}
         if self._session is None or self._run_task is None or self._run_task.done():
+            if self._session is not None and getattr(self._session, "subagents", None) is not None and self._session.subagents.has_active:
+                await self._session.subagents.aclose()
+                return {"aborted": True}
             return {"aborted": False}
         await self._abort_active_run()
         return {"aborted": True}
@@ -516,7 +608,7 @@ class DesktopRuntime:
         text = params.get("text")
         if not isinstance(text, str) or not text.strip():
             raise RpcError("INVALID_PARAMS", "run.steer 需要非空 text")
-        session = self._require_session()
+        session = self._require_queueable_run(params)
         session.agent.steer(text)
         return {"queued": True}
 
@@ -524,32 +616,88 @@ class DesktopRuntime:
         text = params.get("text")
         if not isinstance(text, str) or not text.strip():
             raise RpcError("INVALID_PARAMS", "run.followUp 需要非空 text")
-        session = self._require_session()
+        session = self._require_queueable_run(params)
         session.agent.follow_up(text)
         return {"queued": True}
+
+    def _require_queueable_run(self, params: dict[str, Any]) -> AgentSession:
+        session = self._require_session()
+        for key in ("runId", "sessionId"):
+            if key in params and (not isinstance(params[key], str) or not params[key]):
+                raise RpcError("INVALID_PARAMS", f"{key} 必须是非空字符串")
+        if self._run_task is None or self._run_task.done() or self._run_id is None:
+            raise RpcError("NO_ACTIVE_RUN", "没有可接收补充指令的运行")
+        if (
+            ("runId" in params and params["runId"] != self._run_id)
+            or ("sessionId" in params and params["sessionId"] != session.session_manager.header.id)
+        ):
+            raise RpcError("STALE_RUN", "运行或会话已变化，请刷新后重试")
+        if not session.agent.is_accepting_messages:
+            raise RpcError("RUN_NOT_ACCEPTING_MESSAGES", "当前运行正在准备、收尾或停止，不能接收补充指令")
+        return session
 
     async def _before_tool_call(
         self,
         context: BeforeToolCallContext,
         signal: asyncio.Event,
     ) -> BeforeToolCallResult | None:
-        if context.tool_call.name not in _APPROVAL_TOOLS:
-            return None
-        if context.tool_call.name == "bash" and _is_default_approval_safe_shell_command(
-            str(context.args.get("command", "")),
-            str(self._workspace or Path.cwd()),
+        if not requires_approval(
+            self._permission_mode, context.tool_call.name, context.args,
+            self._workspace, _is_default_approval_safe_shell_command,
         ):
             return None
+        return await self._request_approval(context, signal)
+
+    async def _permission_set_mode(self, params: dict[str, Any]) -> dict[str, Any]:
+        session = self._require_session()
+        self._ensure_no_active_run("请先停止当前任务，再切换访问权限")
+        if self._side_conversations is not None and any(live.status == "running" for live in self._side_conversations.records.values()):
+            raise RpcError("SIDE_CHAT_RUNNING", "请先停止侧边对话，再切换访问权限")
+        if session.subagents.has_active:
+            raise RpcError("SUBAGENT_RUNNING", "请先停止子代理，再切换访问权限")
+        mode = params.get("mode")
+        if not isinstance(mode, str) or mode not in PERMISSION_MODES:
+            raise RpcError("INVALID_PARAMS", "mode 必须是 ask、auto 或 full_access")
+        configured_manager = getattr(getattr(session, "_config", None), "settings_manager", None)
+        settings_manager = configured_manager or SettingsManager()
+        settings = replace(settings_manager.load(), desktop_permission_mode=mode)
+        settings_manager.save(settings)
+        self._permission_mode = cast(PermissionMode, mode)
+        payload = {"sessionId": session.session_manager.header.id, "permissionMode": mode}
+        self._publish("permission.changed", payload)
+        return payload
+
+    async def _before_native_web_search(self, signal: asyncio.Event) -> bool:
+        if self._permission_mode != "ask":
+            return True
+        run_id = self._run_id
+        if run_id is None:
+            return False
+        if self._native_search_decision is not None and self._native_search_decision[0] == run_id:
+            return self._native_search_decision[1]
+        decision = await self._request_approval(None, signal)
+        allowed = decision is None
+        if signal.is_set():
+            raise asyncio.CancelledError
+        self._native_search_decision = (run_id, allowed)
+        return allowed
+
+    async def _request_approval(
+        self, context: BeforeToolCallContext | None, signal: asyncio.Event,
+    ) -> BeforeToolCallResult | None:
         approval_id = uuid.uuid4().hex
         future = asyncio.get_running_loop().create_future()
         self._approvals[approval_id] = future
         self._publish(
-            "approval.requested",
+            "approval.requested" if context is not None else "permission.networkRequested",
             {
                 "approvalId": approval_id,
                 "toolCallId": context.tool_call.id,
                 "toolName": context.tool_call.name,
                 "args": context.args,
+            } if context is not None else {
+                "approvalId": approval_id,
+                "message": "是否允许本次任务使用联网搜索？",
             },
         )
         signal_task = asyncio.create_task(signal.wait())
@@ -562,17 +710,22 @@ class DesktopRuntime:
             if not done:
                 self._publish(
                     "approval.expired",
-                    {"approvalId": approval_id, "toolCallId": context.tool_call.id},
+                    {"approvalId": approval_id, "toolCallId": context.tool_call.id if context else None},
                 )
-                return BeforeToolCallResult(block=True, reason="工具审批已超时")
-            approved = future in done and future.result()
+                return BeforeToolCallResult(block=True, reason="工具审批已超时", status="timed_out")
+            approved = future in done and future.result() and not signal.is_set()
             if approved:
                 return None
             reason = "运行已停止" if signal.is_set() else "用户拒绝了工具执行"
-            return BeforeToolCallResult(block=True, reason=reason)
+            return BeforeToolCallResult(
+                block=True, reason=reason, status="cancelled" if signal.is_set() else "blocked",
+            )
         finally:
             signal_task.cancel()
+            await asyncio.gather(signal_task, return_exceptions=True)
             self._approvals.pop(approval_id, None)
+            if context is None:
+                self._publish("permission.networkResolved", {"approvalId": approval_id})
 
     async def _approval_resolve(self, params: dict[str, Any]) -> dict[str, Any]:
         approval_id = params.get("approvalId")
@@ -586,9 +739,17 @@ class DesktopRuntime:
         return {"resolved": True}
 
     async def _session_compact(self, params: dict[str, Any]) -> dict[str, Any]:
-        del params
         self._ensure_no_active_run("任务运行时不能手动压缩上下文")
-        result = await self._require_session().compact("manual")
+        direction = params.get("direction")
+        if direction is not None and (
+            not isinstance(direction, str) or not direction.strip() or len(direction) > 2000
+        ):
+            raise RpcError("INVALID_PARAMS", "下一阶段目标需要 1–2000 个字符")
+        session = self._require_session()
+        result = (
+            await session.compact("pivot", direction=direction)
+            if direction is not None else await session.compact("manual")
+        )
         if result.get("performed"):
             # Rehydrate the renderer from the same persisted context it will see
             # after a session switch. This replaces the transient progress card
@@ -596,6 +757,45 @@ class DesktopRuntime:
             payload = await self._workspace_payload_with_memory()
             self._publish("session.changed", payload)
         return result
+
+    @staticmethod
+    def _subagent_payload(session: AgentSession) -> list[dict[str, Any]]:
+        manager = getattr(session, "subagents", None)
+        return manager.snapshot() if manager is not None else []
+
+    async def _subagent_list(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+        del params
+        return self._require_session().subagents.snapshot()
+
+    async def _subagent_status(self, params: dict[str, Any]) -> dict[str, Any] | list[dict[str, Any]]:
+        task_id = params.get("taskId")
+        if task_id is None:
+            return self._require_session().subagents.snapshot()
+        if not isinstance(task_id, str) or not task_id:
+            raise RpcError("INVALID_PARAMS", "subagent.status 的 taskId 无效")
+        return self._require_session().subagents.get(task_id)
+
+    async def _subagent_wait(self, params: dict[str, Any]) -> dict[str, Any]:
+        task_id = params.get("taskId")
+        timeout = params.get("timeoutSeconds", 20)
+        if not isinstance(task_id, str) or not task_id:
+            raise RpcError("INVALID_PARAMS", "subagent.wait 需要 taskId")
+        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
+            raise RpcError("INVALID_PARAMS", "subagent.wait 的 timeoutSeconds 无效")
+        return await self._require_session().subagents.wait(task_id, timeout)
+
+    async def _subagent_spawn(self, params: dict[str, Any]) -> dict[str, Any]:
+        task = params.get("task")
+        purpose = params.get("purpose", "investigate")
+        if not isinstance(task, str) or not isinstance(purpose, str):
+            raise RpcError("INVALID_PARAMS", "subagent.spawn 需要 task 和可选 purpose")
+        return self._require_session().subagents.spawn(task, purpose)
+
+    async def _subagent_cancel(self, params: dict[str, Any]) -> dict[str, Any]:
+        task_id = params.get("taskId")
+        if not isinstance(task_id, str) or not task_id:
+            raise RpcError("INVALID_PARAMS", "subagent.cancel 需要 taskId")
+        return await self._require_session().subagents.cancel(task_id)
 
     async def _memory_status(self, params: dict[str, Any]) -> dict[str, Any]:
         del params
@@ -787,9 +987,21 @@ class DesktopRuntime:
             try:
                 await task
             except asyncio.CancelledError:
-                pass
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+        except asyncio.CancelledError:
+            # The run may cancel itself while we await its shutdown. That is
+            # not cancellation of the navigation/abort request awaiting it.
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
 
     async def _dispose_session(self) -> None:
+        if self._side_conversations is not None:
+            await self._side_conversations.close()
+            self._side_conversations = None
+        self._workbench = None
         if self._unsubscribe is not None:
             self._unsubscribe()
             self._unsubscribe = None
@@ -876,7 +1088,9 @@ class DesktopRuntime:
             "collaborationMode": session.collaboration_mode,
             "planState": session.plan_state.to_payload(),
             "memory": memory,
+            "subagents": self._subagent_payload(session),
             "webSearch": web_search,
+            "permissionMode": self._permission_mode,
         }
 
     async def _workspace_payload_with_memory(self) -> dict[str, Any]:
@@ -895,6 +1109,8 @@ class DesktopRuntime:
         return payload
 
     def _ensure_no_active_run(self, message: str) -> None:
+        if self._session is not None and getattr(self._session, "is_compacting", False):
+            raise RpcError("COMPACTION_IN_PROGRESS", "上下文压缩中，请先停止压缩")
         if self._run_task is not None and not self._run_task.done():
             raise RpcError("RUN_IN_PROGRESS", message)
 
@@ -909,138 +1125,6 @@ class DesktopRuntime:
         return self._session
 
 
-_DEFAULT_CONTROL_TOKENS = (";", "||", "`", "$(", ">", "<", "\n", "\r")
-_DEFAULT_SHELL_SPLIT_RE = re.compile(r"\s*(?:\|\||&&|\|)\s*")
-_DEFAULT_SAFE_FD_REDIRECTION_RE = re.compile(r"(?<!\S)(?:2>&1|1>&2)(?=\s|$)")
-_DEFAULT_READ_COMMANDS = {
-    "pwd", "ls", "dir", "cat", "head", "tail", "wc", "sort", "uniq",
-    "cut", "grep", "rg", "fd", "find", "where", "which", "type",
-    "get-content", "select-string", "get-childitem", "git",
-}
-_DEFAULT_READ_ONLY_GIT = {
-    "status", "diff", "show", "log", "branch", "rev-parse", "ls-files",
-    "ls-tree", "cat-file", "grep", "blame", "remote", "tag", "describe",
-}
-_DEFAULT_VALIDATION_EXECUTABLES = {"pytest", "ruff", "pyright", "mypy"}
-_DEFAULT_SAFE_PACKAGE_SCRIPTS = {"test", "typecheck", "lint", "check", "build"}
-_DEFAULT_DANGEROUS_FIND_FLAGS = {"-delete", "-exec", "-execdir", "-ok", "-okdir"}
-
-
-def _is_default_approval_safe_shell_command(command: str, cwd: str) -> bool:
-    """Preserve the desktop's Default-mode approval shortcut.
-
-    Plan Mode no longer uses a shell allowlist: its runtime tool policy prevents
-    Bash from being registered and blocks denied tools again before execution.
-    This classifier is deliberately local to the desktop approval adapter so
-    tightening Plan Mode does not silently change established Default behavior.
-    """
-    command = _DEFAULT_SAFE_FD_REDIRECTION_RE.sub("", command.strip())
-    if not command or any(token in command for token in _DEFAULT_CONTROL_TOKENS):
-        return False
-    if re.search(r"(?:^|\s)\.\.(?:[\\/]|(?:\s|$))", command):
-        return False
-    segments = _DEFAULT_SHELL_SPLIT_RE.split(command)
-    if not segments or any(not segment.strip() for segment in segments):
-        return False
-    for segment in segments:
-        try:
-            tokens = shlex.split(segment, posix=True)
-        except ValueError:
-            return False
-        if not tokens or not _is_default_approval_safe_segment(tokens, cwd):
-            return False
-    return True
-
-
-def _is_default_approval_safe_segment(tokens: list[str], cwd: str) -> bool:
-    executable = tokens[0].replace("\\", "/").rsplit("/", 1)[-1].casefold()
-    if executable.endswith(".exe"):
-        executable = executable[:-4]
-    args = tokens[1:]
-    if executable == "cd":
-        return len(args) == 1 and _default_path_stays_in_workspace(args[0], cwd)
-    if executable == "git":
-        positional = [item for item in args if not item.startswith("-")]
-        if not positional or positional[0].casefold() not in _DEFAULT_READ_ONLY_GIT:
-            return False
-        if positional[0].casefold() == "branch" and len(positional) > 1:
-            return False
-        if any(
-            item in {"-c", "-o", "--paginate"}
-            or item.startswith(("--output", "--exec-path", "--open-files-in-pager"))
-            for item in args
-        ):
-            return False
-    elif executable in _DEFAULT_READ_COMMANDS:
-        if executable == "find" and any(
-            item.casefold() in _DEFAULT_DANGEROUS_FIND_FLAGS for item in args
-        ):
-            return False
-        if executable == "rg" and any(
-            item == "--pre" or item.startswith("--pre=") for item in args
-        ):
-            return False
-        if executable == "sort" and any(
-            item == "-o" or item.startswith("--output") for item in args
-        ):
-            return False
-        if executable == "uniq" and len(
-            [item for item in args if not item.startswith("-")]
-        ) > 1:
-            return False
-    elif executable in _DEFAULT_VALIDATION_EXECUTABLES:
-        pass
-    elif executable in {"pnpm", "npm", "yarn"}:
-        lowered = {item.casefold() for item in args if not item.startswith("-")}
-        if (
-            lowered.isdisjoint(_DEFAULT_SAFE_PACKAGE_SCRIPTS)
-            or lowered & {"add", "install", "exec", "publish"}
-        ):
-            return False
-    elif executable == "uv":
-        if not _is_default_approval_safe_uv(args):
-            return False
-    else:
-        return False
-    return all(
-        _default_path_stays_in_workspace(token, cwd)
-        for token in args
-        if _default_looks_like_path(token)
-    )
-
-
-def _is_default_approval_safe_uv(args: list[str]) -> bool:
-    lowered = [item.casefold() for item in args if not item.startswith("-")]
-    if not lowered:
-        return False
-    if lowered[0] == "build":
-        return True
-    if lowered[0] != "run" or len(lowered) < 2:
-        return False
-    if lowered[1] in _DEFAULT_VALIDATION_EXECUTABLES:
-        return True
-    return lowered[1:3] == ["python", "scripts/check_versions.py"]
-
-
-def _default_looks_like_path(token: str) -> bool:
-    if token.startswith("-"):
-        return False
-    return (
-        "/" in token or "\\" in token or token in {".", ".."}
-        or bool(re.match(r"^[A-Za-z]:", token))
-    )
-
-
-def _default_path_stays_in_workspace(token: str, cwd: str) -> bool:
-    if any(char in token for char in "*?[]{}"):
-        token = token.split("*", 1)[0].split("?", 1)[0] or "."
-    try:
-        root = Path(cwd).resolve()
-        candidate = Path(token)
-        resolved = candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
-        return os.path.commonpath((str(root), str(resolved))) == str(root)
-    except (OSError, ValueError):
-        return False
 
 
 def _is_read_only_bash_command(command: str) -> bool:

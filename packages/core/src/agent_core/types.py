@@ -11,7 +11,7 @@ drive the outer/inner dual-loop.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Literal, Protocol, TypedDict, Union, runtime_checkable
+from typing import Any, Awaitable, Callable, Literal, NotRequired, Protocol, TypedDict, Union, runtime_checkable
 
 from agent_llm import (
     AssistantMessage,
@@ -23,6 +23,7 @@ from agent_llm import (
     SimpleStreamOptions,
     ThinkingLevel,
     ToolCall,
+    ToolResultStatus,
 )
 
 
@@ -39,6 +40,18 @@ class AgentToolResult:
     content: list  # list[TextContent | ImageContent]
     details: Any = None
     terminate: bool = False
+    status: ToolResultStatus = "completed"
+
+
+class ToolExecutionError(RuntimeError):
+    """A failed tool operation with a machine-readable terminal outcome."""
+
+    def __init__(
+        self, message: str, *, status: ToolResultStatus = "failed", details: Any = None,
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.details = details
 
 
 #: Tool batch execution strategy. Batch-level default lives on
@@ -149,6 +162,7 @@ class BeforeToolCallResult:
     reason: str | None = None
     code: str | None = None
     alternatives: list[dict[str, Any]] | None = None
+    status: ToolResultStatus = "blocked"
 
 
 @dataclass
@@ -239,6 +253,14 @@ class ToolExecutionStartEvent(TypedDict):
     tool_call_id: str
     tool_name: str
     args: Any
+    status: NotRequired[Literal["pending"]]
+
+
+class ToolExecutionRunningEvent(TypedDict):
+    type: Literal["tool_execution_running"]
+    tool_call_id: str
+    tool_name: str
+    args: Any
 
 
 class ToolExecutionUpdateEvent(TypedDict):
@@ -255,6 +277,7 @@ class ToolExecutionEndEvent(TypedDict):
     tool_name: str
     result: AgentToolResult
     is_error: bool
+    status: NotRequired[ToolResultStatus]
 
 
 class TurnEndEvent(TypedDict):
@@ -275,6 +298,7 @@ AgentEvent = Union[
     MessageUpdateEvent,
     MessageEndEvent,
     ToolExecutionStartEvent,
+    ToolExecutionRunningEvent,
     ToolExecutionUpdateEvent,
     ToolExecutionEndEvent,
     TurnEndEvent,

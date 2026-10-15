@@ -164,7 +164,11 @@ def build_params(
     # Responses defaults DeepSeek reasoning on. Sending ``none`` is required
     # for the UI's THINKING off state to actually mean off.
     level = opts.get("reasoning")
-    effort = "max" if level == "xhigh" else (level or "none")
+    effort = "none"
+    if level:
+        effort = (model.thinking_level_map or {}).get(
+            level, "max" if level == "xhigh" else level,
+        ) or "high"
     params["reasoning"] = {"effort": effort}
     return params
 
@@ -432,6 +436,9 @@ def stream(
             client = AsyncOpenAI(
                 api_key=api_key,
                 base_url=opts.get("base_url", model.base_url),
+                # Each retry must return to the host's current capability gate.
+                # Never let SDK retries resend previously authorized search.
+                max_retries=0,
             )
             created = await client.responses.create(**build_params(model, context, opts))
             terminal = False
@@ -528,7 +535,9 @@ def _wire_coroutine(stream: AssistantMessageEventStream, coroutine: Any) -> None
             stream.push({"type": "error", "reason": "error", "error": message})
             stream.end(message)
 
-    asyncio.ensure_future(_run())
+    producer = asyncio.ensure_future(_run())
+    producer.add_done_callback(lambda _: coroutine.close())
+    stream.set_producer(producer)
 
 
 def stream_simple(

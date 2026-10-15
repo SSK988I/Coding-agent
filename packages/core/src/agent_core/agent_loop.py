@@ -232,6 +232,10 @@ async def _run_loop(
 
             await _emit(emit, {"type": "turn_end", "message": message, "tool_results": tool_results})
 
+            if _is_aborted(signal):
+                await _emit(emit, {"type": "agent_end", "messages": new_messages})
+                return
+
             if tool_calls and batch_terminate:
                 await _emit(emit, {"type": "agent_end", "messages": new_messages})
                 return
@@ -270,6 +274,50 @@ async def _refresh_runtime_context(
 # ─── stream + consume ──────────────────────────
 
 async def _stream_assistant_response(
+    context: AgentContext, config: AgentLoopConfig, emit: Any,
+    signal: Any, stream_fn: StreamFn,
+) -> AssistantMessage:
+    """Own the stream lifetime, including an abort while no deltas arrive."""
+    if _is_aborted(signal):
+        final = AssistantMessage(stop_reason="aborted", error_message="Operation aborted")
+        await _emit(emit, {"type": "message_start", "message": final})
+        await _emit(emit, {"type": "message_end", "message": final})
+        return final
+    partial: AssistantMessage | None = None
+
+    async def forward(event):
+        nonlocal partial
+        if event["type"] in {"message_start", "message_update"}:
+            partial = event["message"]
+        await _emit(emit, event)
+
+    task = asyncio.create_task(_stream_assistant_response_impl(context, config, forward, signal, stream_fn))
+    abort_task = asyncio.create_task(signal.wait()) if signal is not None else None
+    try:
+        if abort_task is None:
+            return await task
+        done, _ = await asyncio.wait({task, abort_task}, return_when=asyncio.FIRST_COMPLETED)
+        if task in done:
+            return await task
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        final = AssistantMessage(
+            content=list(partial.content) if partial else [],
+            model=config.model.id, provider=config.model.provider,
+            stop_reason="aborted", error_message="Operation aborted",
+        )
+        if partial is None:
+            await _emit(emit, {"type": "message_start", "message": final})
+        await _emit(emit, {"type": "message_end", "message": final})
+        return final
+    finally:
+        task.cancel()
+        if abort_task is not None:
+            abort_task.cancel()
+        await asyncio.gather(task, *([abort_task] if abort_task is not None else []), return_exceptions=True)
+
+
+async def _stream_assistant_response_impl(
     context: AgentContext,
     config: AgentLoopConfig,
     emit: AgentEventSink,
@@ -361,39 +409,34 @@ async def _stream_assistant_response(
         with open(_DBG_LOG, "a", encoding="utf-8") as f:
             f.write(f"{time.perf_counter():.6f} LOOP#{_dbg_n} {tag} {kw}\n")
     # ────────────────────────────────────────────────────────────────────
-    async for event in event_stream:
-        etype = event.get("type")
-        _dbg("recv", t=etype)
-        if etype == "start" and not started:
-            started = True
-            await _emit(emit, {"type": "message_start", "message": event["partial"]})
-        elif etype in (
-            "text_start", "text_delta", "text_end",
-            "thinking_start", "thinking_delta", "thinking_end",
-            "toolcall_start", "toolcall_delta", "toolcall_end",
-        ):
-            if not started:
+    try:
+        async for event in event_stream:
+            etype = event.get("type")
+            _dbg("recv", t=etype)
+            if etype == "start" and not started:
                 started = True
                 await _emit(emit, {"type": "message_start", "message": event["partial"]})
-            await _emit(emit, {
-                "type": "message_update",
-                "message": event["partial"],
-                "event": event,
-            })
-        # Yield to the event loop. sleep(0) handles the common case (sparse
-        # deltas, stdin/queue pumps). Within a dense burst, force a real yield
-        # at most once per _BURST_YIELD_INTERVAL_S so the throttled render
-        # timer can fire between deltas instead of collapsing the burst.
-        await asyncio.sleep(0)
-        now = time.monotonic()
-        if now - last_real_yield >= _BURST_YIELD_INTERVAL_S:
-            # sleep(0) didn't actually give timers a chance (queue still has
-            # ready events). A minimal real sleep lets call_later timers fire.
-            await asyncio.sleep(0.001)
-            last_real_yield = time.monotonic()
-        # done/error handled by .result() below.
-
-    final = await event_stream.result()
+            elif etype in (
+                "text_start", "text_delta", "text_end",
+                "thinking_start", "thinking_delta", "thinking_end",
+                "toolcall_start", "toolcall_delta", "toolcall_end",
+            ):
+                if not started:
+                    started = True
+                    await _emit(emit, {"type": "message_start", "message": event["partial"]})
+                await _emit(emit, {
+                    "type": "message_update", "message": event["partial"], "event": event,
+                })
+            await asyncio.sleep(0)
+            now = time.monotonic()
+            if now - last_real_yield >= _BURST_YIELD_INTERVAL_S:
+                await asyncio.sleep(0.001)
+                last_real_yield = time.monotonic()
+        final = await event_stream.result()
+    finally:
+        close = getattr(event_stream, "aclose", None)
+        if close is not None:
+            await close()
     if not started:
         # Stream produced no content events (e.g. immediate error); still emit start.
         await _emit(emit, {"type": "message_start", "message": final})
@@ -413,9 +456,9 @@ class _Finalized:
     is_error: bool
 
 
-def _error_result(message: str, details: Any = None) -> AgentToolResult:
+def _error_result(message: str, details: Any = None, *, status="failed") -> AgentToolResult:
     """Build a non-terminating error result for a failed tool call."""
-    return AgentToolResult(content=[TextContent(text=message)], details=details)
+    return AgentToolResult(content=[TextContent(text=message)], details=details, status=status)
 
 
 async def _execute_tool_calls(
@@ -516,15 +559,11 @@ async def _execute_tool_calls_parallel(
             finalized = preparation["finalized"]
             await _emit_end(emit, finalized)  # immediate: emit end right away
             pending.append(finalized)
-            if _is_aborted(signal):
-                break
             continue
 
         pending.append(
             _run_one_parallel(tc, preparation, context, assistant_message, config, signal, emit)
         )
-        if _is_aborted(signal):
-            break
 
     # Concurrent execution: wrap already-finalized items so gather sees a
     # uniform list of awaitables yielding _Finalized.
@@ -575,6 +614,11 @@ async def _prepare_tool_call(
     ``{"kind": "prepared", "tool": ..., "args": validated}``.
     """
     tool_map = {t.name: t for t in (context.tools or [])}
+    if _is_aborted(signal):
+        return {
+            "kind": "immediate",
+            "finalized": _Finalized(tc, _error_result("Operation aborted", status="cancelled"), True),
+        }
     tool = tool_map.get(tc.name)
     if tool is None:
         if config.before_tool_call is not None:
@@ -615,7 +659,7 @@ async def _prepare_tool_call(
             if _is_aborted(signal):
                 return {
                     "kind": "immediate",
-                    "finalized": _Finalized(tc, _error_result("Operation aborted"), True),
+                    "finalized": _Finalized(tc, _error_result("Operation aborted", status="cancelled"), True),
                 }
             if before is not None and before.block:
                 return {
@@ -630,7 +674,7 @@ async def _prepare_tool_call(
         if _is_aborted(signal):
             return {
                 "kind": "immediate",
-                "finalized": _Finalized(tc, _error_result("Operation aborted"), True),
+                "finalized": _Finalized(tc, _error_result("Operation aborted", status="cancelled"), True),
             }
         return {"kind": "prepared", "tool": tool, "args": validated}
     except Exception as e:  # noqa: BLE001 — validation / prepare failure
@@ -648,7 +692,7 @@ def _blocked_result(before: Any) -> AgentToolResult:
             "reason": before.reason,
             "alternatives": before.alternatives or [],
         }
-    return _error_result(before.reason or "Tool execution was blocked", details)
+    return _error_result(before.reason or "Tool execution was blocked", details, status=before.status)
 
 
 async def _execute_prepared_tool_call(
@@ -689,18 +733,34 @@ async def _execute_prepared_tool_call(
             update_futures.append(asyncio.create_task(fut))
 
     try:
+        if _is_aborted(signal):
+            return _Finalized(tc, _error_result("Operation aborted", status="cancelled"), True)
+        await _emit(emit, {
+            "type": "tool_execution_running", "tool_call_id": tc.id,
+            "tool_name": tc.name, "args": args,
+        })
         if _accepts_on_update(tool):
             result = await tool.execute(tc.id, args, signal, on_update)
         else:
             result = await tool.execute(tc.id, args, signal)
+    except asyncio.CancelledError:
+        accepting_updates = False
+        if signal is not None and hasattr(signal, "set"):
+            signal.set()
+        await _drain(update_futures)
+        return _Finalized(tc, _error_result("Operation aborted", status="cancelled"), True)
     except Exception as e:  # noqa: BLE001 — tool failures are error results
+        from agent_core.types import ToolExecutionError
+
         accepting_updates = False
         await _drain(update_futures)
-        return _Finalized(tc, _error_result(f"Error: {e}"), True)
+        status = e.status if isinstance(e, ToolExecutionError) else "failed"
+        details = e.details if isinstance(e, ToolExecutionError) else None
+        return _Finalized(tc, _error_result(f"Error: {e}", details, status=status), True)
 
     accepting_updates = False
     await _drain(update_futures)
-    return _Finalized(tc, result, False)
+    return _Finalized(tc, result, result.status != "completed")
 
 
 async def _finalize_executed_tool_call(
@@ -741,6 +801,9 @@ async def _finalize_executed_tool_call(
                 content=after.content if after.content is not None else result.content,
                 details=after.details if after.details is not None else result.details,
                 terminate=after.terminate if after.terminate is not None else result.terminate,
+                status=result.status if after.is_error is None else (
+                    "failed" if after.is_error else "completed"
+                ),
             )
             if after.is_error is not None:
                 is_error = after.is_error
@@ -811,6 +874,7 @@ def _create_tool_result_message(finalized: _Finalized) -> ToolResultMessage:
         content=finalized.result.content,
         details=finalized.result.details,
         is_error=finalized.is_error,
+        status=finalized.result.status,
     )
 
 
@@ -831,6 +895,7 @@ async def _emit_start(emit: AgentEventSink, tc: ToolCall) -> None:
         "tool_call_id": tc.id,
         "tool_name": tc.name,
         "args": tc.arguments,
+        "status": "pending",
     })
 
 
@@ -841,6 +906,7 @@ async def _emit_end(emit: AgentEventSink, finalized: _Finalized) -> None:
         "tool_name": finalized.tool_call.name,
         "result": finalized.result,
         "is_error": finalized.is_error,
+        "status": finalized.result.status,
     })
 
 

@@ -14,11 +14,15 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import sys
 import time
 from pathlib import Path
 from typing import Any, Callable
 
+from agent_llm import ToolResultMessage
+from agent_core import BeforeToolCallContext, BeforeToolCallResult
+from agent_tui.components.select_list import SelectItem
 from agent_tui import (
     Component,
     Container,
@@ -43,7 +47,11 @@ from coding_agent.core.plan_mode import (
     PlanQuestion,
     PlanQuestionOption,
     PlanRevision,
+    call_hook,
 )
+from coding_agent.core.permissions import requires_approval, is_approval_safe_shell_command, normalize_permission_mode
+from coding_agent.core.settings import SettingsManager
+from coding_agent.modes.interactive.components.permission_menu import PermissionMenuComponent
 from coding_agent.core.slash_commands import (
     BUILTIN_SLASH_COMMANDS,
     BuiltinSlashCommand,
@@ -154,6 +162,121 @@ class InteractiveMode:
         #: via handle_input + render + focused).
         self._current_selector: Any = None
         self._displayed_plan_key: tuple[Any, ...] | None = None
+        self._is_submitting_plan = False
+        self._subagent_cards: dict[str, Any] = {}
+        self._subagent_unsubscribe = self._session.on_event(self._on_subagent_event)
+        self._permission_lock = asyncio.Lock()
+        self._permission_native_decision: tuple[asyncio.Event, bool] | None = None
+        self._prior_tool_hook = session._config.before_tool_call
+        self._prior_native_search_hook = session._config.before_native_web_search
+        mode = session.permission_mode or (session.settings_manager or SettingsManager()).load().tui_permission_mode
+        session.set_permission_mode(normalize_permission_mode(mode), persist=False)
+        session._config.before_tool_call = self._before_tool_call
+        session._config.before_native_web_search = self._before_native_web_search
+
+    async def _before_tool_call(
+        self, context: BeforeToolCallContext, signal: asyncio.Event,
+    ) -> BeforeToolCallResult | None:
+        previous = await call_hook(self._prior_tool_hook, context, signal)
+        if previous is not None and previous.block:
+            return previous
+        if not requires_approval(
+            self._session.permission_mode or "ask", context.tool_call.name, context.args,
+            Path(self._session.cwd), is_approval_safe_shell_command,
+        ):
+            return previous
+        detail = context.args.get("command", context.args.get("path", context.args.get("query", "")))
+        allowed = await self._ask_permission(f"工具审批 · {context.tool_call.name}", str(detail), signal)
+        return None if allowed else BeforeToolCallResult(
+            block=True, reason="运行已停止" if signal.is_set() else "用户未批准工具执行",
+            status="cancelled" if signal.is_set() else "blocked",
+        )
+
+    async def _before_native_web_search(self, signal: asyncio.Event) -> bool:
+        if self._prior_native_search_hook is not None and not await self._prior_native_search_hook(signal):
+            return False
+        if self._session.permission_mode != "ask":
+            return True
+        run_signal = self._session.agent.signal or signal
+        if self._permission_native_decision is not None and self._permission_native_decision[0] is run_signal:
+            return self._permission_native_decision[1]
+        allowed = await self._ask_permission("联网审批", "是否允许本次任务使用联网搜索？拒绝后继续处理已有内容。", signal)
+        self._permission_native_decision = (run_signal, allowed)
+        return allowed
+
+    async def _ask_permission(self, title: str, detail: str, signal: asyncio.Event) -> bool:
+        async with self._permission_lock:
+            if signal.is_set():
+                return False
+            future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+            def resolve(value: str) -> None:
+                if not future.done():
+                    future.set_result(value == "allow")
+            detail = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", detail)[:2000]
+            selector = PermissionMenuComponent(self.theme, title, detail, [
+                SelectItem(value="deny", label="拒绝本次", description="不执行该操作"),
+                SelectItem(value="allow", label="允许本次", description="仅批准这一次请求"),
+            ], resolve, lambda: resolve("deny"))
+            self._swap_editor_for(selector)
+            stopped = asyncio.create_task(signal.wait())
+            try:
+                done, _ = await asyncio.wait({future, stopped}, timeout=120, return_when=asyncio.FIRST_COMPLETED)
+                return future in done and future.result() and not signal.is_set()
+            finally:
+                stopped.cancel()
+                await asyncio.gather(stopped, return_exceptions=True)
+                if not future.done():
+                    future.cancel()
+                if self._current_selector is selector:
+                    self._restore_editor()
+
+    def _cmd_permissions(self, arg: str = "") -> None:
+        if self._is_responding or self._session.is_processing or self._session.subagents.has_active:
+            self._add_system_message("请先停止当前任务或子代理，再切换访问权限。")
+            return
+        if not arg.strip():
+            def select(value: str) -> None:
+                self._restore_editor()
+                self._cmd_permissions(value)
+            self._swap_editor_for(PermissionMenuComponent(
+                self.theme, "访问权限", "Alt+P 快速切换 bypass permissions", [
+                    SelectItem(value="ask", label="请求批准", description="外部编辑、联网和风险操作需要确认"),
+                    SelectItem(value="auto", label="帮我批准", description="仅对检测到的风险操作请求批准"),
+                    SelectItem(value="full_access", label="bypass permissions on", description="跳过工具审批"),
+                ], select, self._restore_editor, selected=self._session.permission_mode,
+            ))
+            return
+        try:
+            mode = normalize_permission_mode(arg)
+            self._session.set_permission_mode(mode)
+        except (OSError, ValueError, PlanModeError) as exc:
+            self._add_system_message(f"权限切换失败：{exc}")
+            return
+        self._add_system_message("bypass permissions on" if mode == "full_access"
+                                 else "bypass permissions off · " + ("帮我批准" if mode == "auto" else "请求批准"))
+        self._refresh_footer()
+
+    def _on_subagent_event(self, event: dict) -> None:
+        if event.get("type") == "subagent.stateChanged":
+            self._render_subagents(event.get("tasks", []))
+
+    def _render_subagents(self, tasks: list[dict] | None = None) -> None:
+        from coding_agent.modes.interactive.components.subagent import SubagentComponent
+        if tasks is None:
+            tasks = self._session.subagents.snapshot()
+        cards = self._subagent_cards
+        active_ids = {task["taskId"] for task in tasks}
+        for task_id in list(cards):
+            if task_id not in active_ids:
+                self.chat_container.remove_child(cards.pop(task_id))
+        for task in tasks:
+            task_id = task["taskId"]
+            if task_id in cards:
+                cards[task_id].update(task)
+            else:
+                cards[task_id] = SubagentComponent(task)
+                self._add_to_chat(cards[task_id])
+        self.tui.request_render()
 
     def _spawn(self, coro):
         """Schedule a fire-and-forget coroutine, keeping a strong reference.
@@ -204,6 +327,9 @@ class InteractiveMode:
         active = self._active_status_indicator
         if active is not None and getattr(active, "kind", None) == "compaction":
             self._session.abort_compaction()
+            return True
+        if getattr(self._session, "subagents", None) is not None and self._session.subagents.has_active:
+            self._spawn(self._session.subagents.aclose())
             return True
         return None
 
@@ -412,7 +538,11 @@ class InteractiveMode:
 
         if etype == "agent_start":
             self._pending_tools.clear()
-            self._show_status_indicator(WorkingStatusIndicator(self.tui, "Working...", self.theme))
+            label = (
+                "正在整理并提交计划…（Esc 停止）"
+                if getattr(self, "_is_submitting_plan", False) else "Working..."
+            )
+            self._show_status_indicator(WorkingStatusIndicator(self.tui, label, self.theme))
         elif etype == "message_start":
             self._clear_status_indicator("retry")
             self._handle_message_start(event)
@@ -422,6 +552,11 @@ class InteractiveMode:
             self._handle_message_end(event)
         elif etype == "tool_execution_start":
             self._handle_tool_start(event)
+        elif etype == "tool_execution_running":
+            card = self._pending_tools.get(event.get("tool_call_id", ""))
+            if card is not None:
+                card.set_status("running")
+                self.tui.request_render()
         elif etype == "tool_execution_end":
             self._handle_tool_end(event)
         elif etype == "agent_end":
@@ -571,7 +706,7 @@ class InteractiveMode:
                 "Aborted after retries" if stop_reason == "aborted" else "Request failed"
             )
             for card in self._pending_tools.values():
-                card.set_result(err_text, is_error=True)
+                card.set_result(err_text, is_error=True, status="uncertain")
             self._pending_tools.clear()
             self.tui.request_render()
 
@@ -593,6 +728,7 @@ class InteractiveMode:
             )
             self._pending_tools[tc_id] = card
             self._add_to_chat(card)
+        card.set_status(event.get("status", "running"))
         self.tui.request_render()
 
     def _handle_tool_end(self, event: dict) -> None:
@@ -602,7 +738,7 @@ class InteractiveMode:
         tc_id = event.get("tool_call_id", "")
         card = self._pending_tools.get(tc_id)
         if card is not None:
-            card.set_result(event.get("result"), event.get("is_error", False))
+            card.set_result(event.get("result"), event.get("is_error", False), event.get("status"))
             self._pending_tools.pop(tc_id, None)
             self.tui.request_render()
 
@@ -614,6 +750,12 @@ class InteractiveMode:
     def _handle_compaction_end(self, event: dict) -> None:
         """Clear the compaction spinner and rebuild chat from the session."""
         self._clear_status_indicator("compaction")
+        if event.get("aborted"):
+            self._add_system_message("上下文压缩已取消，原上下文保留。")
+            return
+        if event.get("error"):
+            self._add_system_message(f"上下文压缩失败：{event['error']}")
+            return
         preview = event.get("summary_preview", "")
         reason = event.get("reason", "unknown")
         # Rebuild the chat from the compacted session history.
@@ -669,6 +811,7 @@ class InteractiveMode:
         except Exception:
             entries = []
         from agent_core.session.types import SessionMessageEntry
+        restored_tools: dict[str, ToolExecutionComponent] = {}
         for entry in entries:
             if not isinstance(entry, SessionMessageEntry) or entry.message is None:
                 continue
@@ -687,6 +830,22 @@ class InteractiveMode:
                     message=msg, markdown_theme=self.md_theme, theme=self.theme, output_pad=1,
                 )
                 self._add_to_chat(comp)
+                for block in getattr(msg, "content", []):
+                    if getattr(block, "type", None) != "toolCall" or block.name == "request_user_input":
+                        continue
+                    card = ToolExecutionComponent(block.name, block.id, block.arguments, theme=self.theme)
+                    card.set_result("未找到执行结果；不能据此判断是否产生了副作用。", status="uncertain")
+                    restored_tools[block.id] = card
+                    self._add_to_chat(card)
+            elif isinstance(msg, ToolResultMessage) and msg.tool_name != "request_user_input":
+                card = restored_tools.get(msg.tool_call_id)
+                if card is None:
+                    card = ToolExecutionComponent(msg.tool_name, msg.tool_call_id, {}, theme=self.theme)
+                    self._add_to_chat(card)
+                card.set_result(msg, msg.is_error)
+        if hasattr(self, "_subagent_cards"):
+            self._subagent_cards.clear()
+            self._render_subagents()
         self.tui.request_render()
 
     # ── Slash commands ────────────────────────────────────────────────────
@@ -726,7 +885,9 @@ class InteractiveMode:
         elif cmd_name == "logout":
             self._cmd_logout()
         elif cmd_name == "compact":
-            await self._cmd_compact()
+            await self._cmd_compact(" ".join(parts[1:]) if len(parts) > 1 else None)
+        elif cmd_name == "subagents":
+            await self._cmd_subagents(" ".join(parts[1:]) if len(parts) > 1 else "")
         elif cmd_name == "quit":
             self._cmd_quit()
         elif cmd_name == "session":
@@ -737,6 +898,8 @@ class InteractiveMode:
             self._cmd_new()
         elif cmd_name == "plan":
             self._cmd_plan()
+        elif cmd_name == "permissions":
+            self._cmd_permissions(" ".join(parts[1:]) if len(parts) > 1 else "")
         elif cmd_name == "cancel-plan":
             self._cancel_plan()
         elif cmd_name == "execute-plan":
@@ -826,19 +989,34 @@ class InteractiveMode:
 
     def _cmd_plan(self) -> None:
         state = self._session.plan_state
-        # Reopening a pending question through bare /plan first shows the
-        # state menu, so users can either redisplay the question or leave the
-        # episode.  Startup/event rehydration still restores the question card
-        # directly through _render_plan_state_controls().
-        if state.phase == "awaiting_answer":
-            self._mount_plan_phase_menu("awaiting_answer")
-            return
-        if state.phase in {
-            "drafting", "ready", "executing",
-            "uncertain", "recovery_error",
-        }:
+        phase = str(getattr(state, "phase", "idle"))
+        mode = getattr(state, "mode", None)
+        if mode is None:
+            mode = getattr(
+                self._session, "collaboration_mode",
+                "plan" if phase in {"drafting", "awaiting_answer", "ready"} else "default",
+            )
+
+        # Recovery and live execution states own the command even though the
+        # reducer may project them with Default collaboration mode.
+        if phase in {"executing", "uncertain", "recovery_error"}:
             self._render_plan_state_controls()
             return
+
+        # A second /plan while already planning is an explicit request to open
+        # the state-specific actions. The first /plan from Default only enters
+        # Plan Mode and leaves the editor available for the user's objective.
+        if mode == "plan":
+            if phase == "drafting":
+                self._mount_plan_phase_menu(phase)
+            elif phase == "awaiting_answer":
+                self._mount_plan_phase_menu(phase)
+            elif phase == "ready":
+                self._render_plan_state_controls()
+            else:
+                self._close_plan_controls()
+            return
+
         try:
             self._session.enter_plan_mode()
         except PlanModeError as exc:
@@ -847,17 +1025,57 @@ class InteractiveMode:
         self._refresh_footer()
         self._update_editor_border_color()
         self._add_system_message("已进入计划模式。")
-        self._render_plan_state_controls()
+        self._restore_editor()
 
-    async def _cmd_compact(self) -> None:
-        self._add_system_message("正在压缩上下文…")
-        self.tui.request_render()
-        result = await self._session.compact("manual")
-        if result["performed"]:
-            preview = result.get("summary_preview", "")
-            self._add_system_message(f"上下文已压缩。{preview}")
-        else:
-            self._add_system_message(result.get("error", "无需压缩。"))
+    async def _cmd_compact(self, direction: str | None = None) -> None:
+        if self._is_responding:
+            return
+        self._is_responding = True
+        self.editor.disable_submit = True
+        unsub = self._session.on_event(self._on_agent_event)
+        self._add_system_message(
+            f"正在面向下一阶段整理上下文：{direction}（Esc 取消）"
+            if direction else "正在压缩上下文…（Esc 取消）"
+        )
+        try:
+            result = (
+                await self._session.compact("pivot", direction=direction)
+                if direction is not None else await self._session.compact("manual")
+            )
+            if not result["performed"]:
+                self._add_system_message(result.get("error") or "无需压缩。")
+        except Exception as exc:
+            self._add_system_message(f"上下文压缩失败：{exc}")
+        finally:
+            unsub()
+            self._is_responding = False
+            self.editor.disable_submit = False
+            self._clear_status_indicator("compaction")
+            self._refresh_footer()
+            self._render_plan_state_controls()
+
+    async def _cmd_subagents(self, args: str) -> None:
+        parts = args.split(maxsplit=1)
+        action = parts[0] if parts else "list"
+        value = parts[1] if len(parts) > 1 else ""
+        try:
+            if action in {"spawn", "review"}:
+                self._session.subagents.spawn(value, "review" if action == "review" else "investigate")
+            elif action == "cancel":
+                await self._session.subagents.cancel(value)
+            elif action in {"show", "status"}:
+                task = self._session.subagents.get(value)
+                self._add_assistant_text(task.get("output") or task.get("error") or task["status"])
+            elif action == "wait":
+                await self._session.subagents.wait(value)
+            elif action != "list":
+                self._add_system_message("用法：/subagents list | spawn <任务> | review <任务> | status <id> | wait <id> | show <id> | cancel <id>")
+                return
+            self._render_subagents()
+            if not self._session.subagents.snapshot():
+                self._add_system_message("暂无只读子代理。用 /subagents spawn <任务说明> 启动调查。")
+        except Exception as exc:
+            self._add_system_message(f"子代理操作失败：{exc}")
 
     def _cmd_quit(self) -> None:
         self._add_system_message("再见！")
@@ -965,7 +1183,8 @@ class InteractiveMode:
         # Exact-match shortcut: don't open the selector at all.
         term = search.strip()
         if term:
-            exact = next((m for m in models if m.id == term), None)
+            from coding_agent.core.providers import normalize_model_id
+            exact = next((m for m in models if m.id == normalize_model_id(m.provider, term)), None)
             if exact is not None:
                 self._session.set_model(exact)
                 self._refresh_footer()
@@ -1000,7 +1219,8 @@ class InteractiveMode:
                 models = self._available_models()
             except Exception:
                 models = []
-            chosen = next((m for m in models if m.id == model_id), None)
+            from coding_agent.core.providers import normalize_model_id
+            chosen = next((m for m in models if m.id == normalize_model_id(m.provider, model_id)), None)
             if chosen is not None:
                 self._session.set_model(chosen)
                 self._refresh_footer()
@@ -1199,9 +1419,16 @@ class InteractiveMode:
                 self._spawn(self._execute_latest_plan())
             elif action == "handoff":
                 self._handoff_latest_plan()
+            elif action == "review":
+                self._spawn(self._cmd_subagents(
+                    "review 只读复核下列计划：检查遗漏、风险和代码依据，不执行、不修改或提交计划。\n" + plan.markdown
+                ))
 
         self._swap_editor_for(
-            PlanActionsComponent(self.theme, plan, on_action, self._restore_editor)
+            PlanActionsComponent(
+                self.theme, plan, on_action, self._restore_editor,
+                can_handoff=self._session.plan_state.can_handoff,
+            )
         )
 
     def _render_plan_state_controls(self) -> None:
@@ -1232,7 +1459,12 @@ class InteractiveMode:
         if phase == "ready" and latest is not None:
             self._mount_plan_ready(latest)
             return
-        if phase in {"drafting", "executing", "uncertain", "recovery_error"}:
+        if phase == "drafting":
+            # Drafting is the normal Plan editor state. The action menu is
+            # opened only by an explicit /plan command, not on resume/events.
+            self._close_plan_controls()
+            return
+        if phase in {"executing", "uncertain", "recovery_error"}:
             self._mount_plan_phase_menu(phase)
             return
         self._close_plan_controls()
@@ -1274,20 +1506,35 @@ class InteractiveMode:
         if self._is_responding:
             self._add_system_message("任务运行中，请先按 Esc 停止。")
             return
+        if self._session.plan_state.phase != "drafting":
+            self._render_plan_state_controls()
+            return
         prompt = (
             "请基于当前讨论整理一份决策完备的实施计划，并仅通过 submit_plan "
             "控制工具提交；不要执行计划。"
         )
         self._add_user_message(prompt)
         self._is_responding = True
+        self._is_submitting_plan = True
         self.editor.disable_submit = True
         try:
+            # Show progress at the click boundary, before authentication,
+            # context preparation or the first agent event can delay feedback.
+            self._show_status_indicator(WorkingStatusIndicator(
+                self.tui, "正在整理并提交计划…（Esc 停止）", self.theme,
+            ))
             await self._respond(prompt)
         finally:
             self._is_responding = False
+            self._is_submitting_plan = False
             self.editor.disable_submit = False
+            self._clear_status_indicator()
             self._refresh_footer()
             self._render_plan_state_controls()
+            if self._session.plan_state.phase == "drafting":
+                self._add_system_message(
+                    "本轮尚未提交计划。请继续补充需求，或通过 /plan 再次整理并提交。"
+                )
 
     def _show_plan_recovery_details(self) -> None:
         state = self._session.plan_state
@@ -1693,6 +1940,9 @@ class InteractiveMode:
         pieces = value.split(maxsplit=1)
         if len(pieces) != 2:
             self._add_system_message("用法：/settings <key> <value>")
+            return
+        if pieces[0] == "tui_permission_mode":
+            self._cmd_permissions(pieces[1])
             return
         try:
             settings = manager.set_value(pieces[0], pieces[1])
@@ -2153,9 +2403,11 @@ class InteractiveMode:
         self._render_plan_state_controls()
 
         # Event loop.
+        self._render_subagents()
         while self._running:
             await asyncio.sleep(0.05)
 
+        self._subagent_unsubscribe()
         self.tui.stop()
 
     def _register_input_listeners(self) -> None:
@@ -2168,7 +2420,8 @@ class InteractiveMode:
           2. Ctrl+D (app.exit): on an empty editor, exits immediately; on a
              non-empty editor, falls through so the editor forward-deletes.
           3. Shift+Tab / Alt+M (app.mode.cycle): cycles collaboration mode.
-          4. Alt+T (app.thinking.cycle): cycles thinking level.
+          4. Alt+P (app.permissions.toggle): toggles bypass permissions.
+          5. Alt+T (app.thinking.cycle): cycles thinking level.
         """
         from coding_agent.core.keybindings import get_keybinding
 
@@ -2177,6 +2430,10 @@ class InteractiveMode:
 
         def on_input(data: str) -> dict | None:
             if matches_key(data, clear_keys):  # type: ignore[arg-type]
+                selector = getattr(self, "_current_selector", None)
+                if isinstance(selector, PermissionMenuComponent):
+                    selector.handle_input(data)
+                    return {"consume": True}
                 now = time.monotonic()
                 if now - self._last_sigint_time < 0.5:
                     # Double-tap within 500ms → quit.
@@ -2223,6 +2480,13 @@ class InteractiveMode:
             return None
 
         self.tui.add_input_listener(on_mode_cycle)
+        permission_keys = get_keybinding("app.permissions.toggle")
+        def on_permission_toggle(data: str) -> dict | None:
+            if getattr(self, "_current_selector", None) is None and matches_key(data, permission_keys):  # type: ignore[arg-type]
+                self._cmd_permissions("off" if self._session.permission_mode == "full_access" else "on")
+                return {"consume": True}
+            return None
+        self.tui.add_input_listener(on_permission_toggle)
 
         # ── 4. Alt+T: cycle thinking level ───────────────────────────────
         cycle_keys = get_keybinding("app.thinking.cycle")

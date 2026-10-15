@@ -113,7 +113,7 @@ def test_deepseek_never_emits_tool_stream():
 
 def test_deepseek_thinking_format_uses_simpler_shape():
     """DeepSeek: thinking={type:'enabled'} without clear_thinking (NOT zai shape)."""
-    m = DEEPSEEK_MODELS["deepseek-v4-pro"]
+    m = DEEPSEEK_MODELS["deepseek-flash"]
     params: dict = {}
     _inject_thinking_params(params, m, {"reasoning": "high"}, _resolve_compat(m))
     assert params["extra_body"]["thinking"] == {"type": "enabled"}

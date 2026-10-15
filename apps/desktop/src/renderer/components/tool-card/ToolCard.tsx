@@ -6,8 +6,9 @@ import {
 } from "react";
 
 import "./ToolCard.css";
+import type { ToolDisplayStatus } from "../../../shared/toolStatus";
 
-export type ToolCardStatus = "running" | "approval" | "done" | "error";
+export type ToolCardStatus = ToolDisplayStatus;
 export type ToolCategory = "shell" | "read" | "write" | "search" | "generic";
 
 export interface ToolApproval {
@@ -83,10 +84,15 @@ const DEFAULT_OUTPUT_LIMIT: ToolOutputLimit = {
 };
 
 const STATUS_LABELS: Record<ToolCardStatus, string> = {
+  pending: "准备中",
   running: "执行中",
   approval: "等待审批",
   done: "已完成",
   error: "失败",
+  cancelled: "已取消",
+  timed_out: "已超时",
+  blocked: "未获准执行",
+  uncertain: "结果未知",
 };
 
 const CATEGORY_ICONS: Record<ToolCategory, string> = {

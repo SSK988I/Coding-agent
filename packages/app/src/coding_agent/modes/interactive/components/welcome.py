@@ -90,6 +90,7 @@ class WelcomeComponent(Component):
                 self._style_shortcuts,
             )
         )
+        lines.append(self._content_line("/permissions 权限  ·  Alt+P bypass", inner_width, self._style_shortcuts))
         lines.append(self._bottom_border(card_width))
 
         placed = [self._place(line, width, indent) for line in lines]

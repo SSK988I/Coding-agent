@@ -168,6 +168,7 @@ def message_to_dict(message: Message) -> dict:
             "role": "toolResult",
             "tool_call_id": message.tool_call_id,
             "tool_name": message.tool_name,
+            **({"status": message.status} if message.status is not None else {}),
             "content": [content_block_to_dict(b) for b in message.content],
             "details": message.details,
             "is_error": message.is_error,
@@ -205,6 +206,7 @@ def dict_to_message(d: dict) -> Message:
         return ToolResultMessage(
             tool_call_id=d.get("tool_call_id", ""),
             tool_name=d.get("tool_name", ""),
+            status=d.get("status"),
             content=[dict_to_content_block(b) for b in (d.get("content") or [])],
             details=d.get("details"),
             is_error=bool(d.get("is_error", False)),

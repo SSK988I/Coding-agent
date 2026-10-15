@@ -21,7 +21,8 @@
   background: #fffdf7;
 }
 
-.tool-card-view--error {
+.tool-card-view--error,
+.tool-card-view--timed_out {
   border-color: #dfaaa6;
   background: #fff9f8;
 }
@@ -73,11 +74,16 @@
   content: "";
 }
 
-.tool-card-view__status--approval {
+.tool-card-view__status--approval,
+.tool-card-view__status--pending,
+.tool-card-view__status--cancelled,
+.tool-card-view__status--blocked,
+.tool-card-view__status--uncertain {
   color: #8b6a24;
 }
 
-.tool-card-view__status--error {
+.tool-card-view__status--error,
+.tool-card-view__status--timed_out {
   color: #a44842;
 }
 

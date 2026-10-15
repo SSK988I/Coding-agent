@@ -36,6 +36,7 @@ from agent_core.session.types import (
     PlanRevisionEntry,
     PlanRunEntry,
     SessionEntry,
+    SubagentTaskEntry,
     SessionHeader,
     SessionInfo,
     SessionInfoEntry,
@@ -160,10 +161,13 @@ def entry_to_line_dict(entry: SessionEntry) -> dict:
             "fromHook": entry.from_hook,
         }
         if entry.details is not None:
-            d["details"] = {
+            details_payload: dict[str, Any] = {
                 "readFiles": list(entry.details.read_files),
                 "modifiedFiles": list(entry.details.modified_files),
             }
+            if entry.details.context_pivot_direction is not None:
+                details_payload["contextPivotDirection"] = entry.details.context_pivot_direction
+            d["details"] = details_payload
         return d
     if isinstance(entry, ModelChangeEntry):
         return {
@@ -232,6 +236,11 @@ def entry_to_line_dict(entry: SessionEntry) -> dict:
             "assistantMessageId": entry.assistant_message_id,
             "stopReason": entry.stop_reason,
         }
+    if isinstance(entry, SubagentTaskEntry):
+        return {
+            "type": "subagent_task", "id": entry.id, "parentId": entry.parent_id,
+            "timestamp": entry.timestamp, "task": entry.task,
+        }
     raise TypeError(f"Cannot serialize entry of type {type(entry)!r}")
 
 
@@ -275,6 +284,7 @@ def line_dict_to_entry(d: dict) -> SessionEntry:
             details = CompactionDetails(
                 read_files=list(details_raw.get("readFiles") or []),
                 modified_files=list(details_raw.get("modifiedFiles") or []),
+                context_pivot_direction=details_raw.get("contextPivotDirection"),
             )
         return CompactionEntry(
             summary=d.get("summary", ""),
@@ -359,6 +369,15 @@ def line_dict_to_entry(d: dict) -> SessionEntry:
             stop_reason=d.get("stopReason"),
             parent_id=parent_id, timestamp=timestamp,
         )
+    if etype == "subagent_task":
+        task = d.get("task")
+        if (
+            not isinstance(task, dict) or not isinstance(task.get("taskId"), str)
+            or task.get("status") not in {"queued", "running", "completed", "failed", "cancelled", "timed_out", "uncertain"}
+            or not isinstance(task.get("prompt"), str)
+        ):
+            raise ValueError("Invalid subagent task snapshot")
+        return SubagentTaskEntry(task=task, id=entry_id, parent_id=parent_id, timestamp=timestamp)
     raise ValueError(f"Unknown entry type in session file: {etype!r}")
 
 
@@ -420,7 +439,7 @@ def append_entry_line(path: Path, entry: SessionEntry) -> None:
     encoded = (json.dumps(entry_to_line_dict(entry), ensure_ascii=False) + "\n").encode("utf-8")
     durable = isinstance(entry, (
         CollaborationModeChangeEntry, PlanQuestionEntry, PlanQuestionAnswerEntry,
-        PlanRevisionEntry, PlanRunEntry,
+        PlanRevisionEntry, PlanRunEntry, CompactionEntry, SubagentTaskEntry,
     ))
     with open(path, "a+b", buffering=0) as stream:
         stream.seek(0, os.SEEK_END)

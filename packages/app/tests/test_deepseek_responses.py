@@ -4,9 +4,12 @@ import asyncio
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 from agent_llm import (
     AssistantMessage,
     Context,
+    ImageContent,
     TextContent,
     ThinkingContent,
     Tool,
@@ -19,7 +22,7 @@ from agent_llm.providers.deepseek_models import DEEPSEEK_MODELS
 
 
 def test_build_params_exposes_native_search_and_responses_function_tools() -> None:
-    model = DEEPSEEK_MODELS["deepseek-v4-flash"]
+    model = DEEPSEEK_MODELS["deepseek-flash"]
     context = Context(
         system_prompt="Be useful",
         messages=[UserMessage(content="latest Python release")],
@@ -31,6 +34,7 @@ def test_build_params_exposes_native_search_and_responses_function_tools() -> No
     )
     params = build_params(model, context, {"api_key": "x", "web_search": True})
 
+    assert params["model"] == "deepseek-flash"
     assert params["instructions"] == "Be useful"
     assert params["reasoning"] == {"effort": "none"}
     assert params["tools"][0] == {
@@ -41,6 +45,30 @@ def test_build_params_exposes_native_search_and_responses_function_tools() -> No
         "strict": False,
     }
     assert params["tools"][1] == {"type": "web_search"}
+
+
+@pytest.mark.parametrize(
+    ("level", "effort"),
+    [(None, "none"), ("minimal", "low"), ("low", "low"),
+     ("medium", "high"), ("high", "high"), ("xhigh", "max")],
+)
+def test_v4_1_flash_requests_use_supported_reasoning_levels(level, effort) -> None:
+    params = build_params(DEEPSEEK_MODELS["deepseek-flash"], Context(), {"reasoning": level})
+    assert params["reasoning"] == {"effort": effort}
+
+
+def test_v4_1_flash_image_input_uses_responses_content_parts() -> None:
+    model = DEEPSEEK_MODELS["deepseek-flash"]
+    assert "image" in model.input
+    params = build_params(model, Context(messages=[UserMessage(content=[
+        TextContent(text="Describe the image"),
+        ImageContent(data="aW1hZ2U=", mime_type="image/png"),
+    ])]))
+    assert params["input"] == [{"role": "user", "content": [
+        {"type": "input_text", "text": "Describe the image"},
+        {"type": "input_image", "detail": "auto", "image_url": "data:image/png;base64,aW1hZ2U="},
+    ]}]
+    assert params["max_output_tokens"] == 393_216
 
 
 def test_convert_input_replays_provider_items_and_function_results() -> None:
@@ -130,7 +158,7 @@ def test_stream_maps_text_citations_usage_and_native_search_history(monkeypatch)
     )
     response = SimpleNamespace(
         id="resp-1",
-        model="deepseek-v4-flash",
+        model="deepseek-flash",
         usage=usage,
         output=[search_item, message_item],
     )
@@ -160,7 +188,7 @@ def test_stream_maps_text_citations_usage_and_native_search_history(monkeypatch)
 
     async def scenario():
         event_stream = stream(
-            DEEPSEEK_MODELS["deepseek-v4-flash"],
+            DEEPSEEK_MODELS["deepseek-flash"],
             Context(messages=[UserMessage(content="what is current?")]),
             {"api_key": "secret", "web_search": True},
         )
@@ -174,5 +202,8 @@ def test_stream_maps_text_citations_usage_and_native_search_history(monkeypatch)
     assert result.response_id == "resp-1"
     assert result.usage.input == 10
     assert result.usage.cache_read == 2
+    assert result.usage.cost.total == pytest.approx((10 * 0.3 + 2 * 0.006 + 8 * 1.2) / 1_000_000)
     assert result.provider_data["response_items"][0]["type"] == "web_search_call"
     assert captured["tools"] == [{"type": "web_search"}]
+    assert captured["model"] == "deepseek-flash"
+    assert captured["client"]["max_retries"] == 0

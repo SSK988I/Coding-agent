@@ -12,7 +12,7 @@ from typing import Any, Literal
 from agent_tui import Component, Loader
 
 StatusIndicatorKind = Literal["working", "retry", "compaction", "branchSummary"]
-CompactionStatusReason = Literal["manual", "threshold", "overflow"]
+CompactionStatusReason = Literal["manual", "threshold", "overflow", "pivot"]
 
 #: Hint shown next to cancellable operations. Resolved from the keybinding
 #: table so it stays in sync with the configured interrupt key.
@@ -60,7 +60,9 @@ class CompactionStatusIndicator(StatusIndicator):
     """Spinner shown while the session is being compacted."""
 
     def __init__(self, tui: Any, reason: CompactionStatusReason, theme: Any | None = None) -> None:
-        if reason == "manual":
+        if reason == "pivot":
+            label = f"Preparing next-phase brief... {_INTERRUPT_HINT}"
+        elif reason == "manual":
             label = f"Compacting context... {_INTERRUPT_HINT}"
         else:
             prefix = "Context overflow detected, " if reason == "overflow" else ""

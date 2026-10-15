@@ -5,9 +5,10 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
-from agent_llm import Context, Model, ModelCost, Tool
+from agent_llm import AssistantMessage, AssistantMessageEventStream, Context, Model, ModelCost, TextContent, Tool
 
 from coding_agent.core.agent_session import AgentSession, AgentSessionConfig
+from coding_agent.core.retry import RetryPolicy
 from coding_agent.core.settings import SettingsManager
 from coding_agent.desktop.runtime import DesktopRuntime
 from coding_agent.search.backends.mcp import McpSearchCall, McpSearchClient, map_mcp_error
@@ -292,6 +293,95 @@ def test_deepseek_uses_native_search_without_exposing_duplicate_function(monkeyp
     assert [tool.name for tool in captured["context"].tools] == ["read"]
     assert "Do not claim that web access is unavailable" in captured["context"].system_prompt
     session.dispose()
+
+
+def test_native_search_rebuilds_authorization_context_and_options_for_each_retry(monkeypatch) -> None:
+    async def scenario():
+        decisions = iter([True, False, True])
+        checks, captured = [], []
+        async def authorize(_signal):
+            allowed = next(decisions)
+            checks.append(allowed)
+            return allowed
+        session = AgentSession(AgentSessionConfig(
+            model=Model(id="test", provider="deepseek", cost=ModelCost(0, 0, 0, 0)),
+            web_search_enabled=True, web_search_backend=_FakeBackend(),
+            before_native_web_search=authorize,
+            retry_policy=RetryPolicy(max_retries=2, initial_delay=0, max_delay=0),
+        ))
+        def provider(_model, context, options):
+            captured.append((context, dict(options or {})))
+            stream = AssistantMessageEventStream()
+            if len(captured) < 3:
+                stream.push({"type": "error", "reason": "error", "error": AssistantMessage(stop_reason="error", error_message="HTTP 503 service unavailable")})
+            else:
+                stream.push({"type": "done", "reason": "stop", "message": AssistantMessage(content=[TextContent(text="ok")])})
+            return stream
+        monkeypatch.setattr("agent_llm.compat.stream_simple", provider)
+        context = Context(system_prompt="original", tools=[Tool(name="read"), Tool(name="web_search")])
+        options = {"web_search": True, "max_tokens": 123}
+        stream = session._create_stream_fn()(session.model, context, options)
+        try:
+            async for _event in stream:
+                pass
+            assert (await stream.result()).stop_reason == "stop"
+            assert checks == [True, False, True]
+            assert [bool(item[1].get("web_search")) for item in captured] == checks
+            for (sent_context, sent_options), allowed in zip(captured, checks, strict=True):
+                assert sent_options.get("max_tokens") == 123
+                assert [tool.name for tool in (sent_context.tools or [])] == ["read"]
+                assert sent_context.system_prompt.count("<native_web_search>") == int(allowed)
+            assert captured[1][0].system_prompt == "original"
+            assert context.system_prompt == "original"
+            assert [tool.name for tool in context.tools] == ["read", "web_search"]
+            assert options == {"web_search": True, "max_tokens": 123}
+        finally:
+            await stream.aclose()
+            await session.aclose()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("transition", ["before_retry_without_hook", "during_retry_authorization"])
+def test_native_search_rechecks_core_plan_policy_on_retry(monkeypatch, transition) -> None:
+    async def scenario():
+        captured, checks = [], []
+        async def authorize(_signal):
+            checks.append(True)
+            if len(checks) == 2:
+                session.enter_plan_mode()
+            return True
+        session = AgentSession(AgentSessionConfig(
+            model=Model(id="test", provider="deepseek", cost=ModelCost(0, 0, 0, 0)),
+            web_search_enabled=True, web_search_backend=_FakeBackend(), permission_mode="full_access",
+            before_native_web_search=authorize if transition == "during_retry_authorization" else None,
+            retry_policy=RetryPolicy(max_retries=1, initial_delay=0, max_delay=0),
+        ))
+        def provider(_model, context, options):
+            captured.append((context, dict(options or {}), session.collaboration_mode))
+            stream = AssistantMessageEventStream()
+            if len(captured) == 1:
+                stream.push({"type": "error", "reason": "error", "error": AssistantMessage(stop_reason="error", error_message="HTTP 503 service unavailable")})
+            else:
+                stream.push({"type": "done", "reason": "stop", "message": AssistantMessage(content=[TextContent(text="ok")])})
+            return stream
+        monkeypatch.setattr("agent_llm.compat.stream_simple", provider)
+        if transition == "before_retry_without_hook":
+            session.on_event(lambda event: session.enter_plan_mode() if event.get("type") == "retry" else None)
+        stream = session._create_stream_fn()(session.model, Context(tools=[Tool(name="web_search")]), {"web_search": True})
+        try:
+            async for _event in stream:
+                pass
+            assert (await stream.result()).stop_reason == "stop"
+            assert len(captured) == 2
+            assert captured[0][1].get("web_search") is True
+            assert not captured[1][1].get("web_search")
+            assert "<native_web_search>" not in (captured[1][0].system_prompt or "")
+            assert not any(tool.name == "web_search" for tool in (captured[1][0].tools or []))
+            assert captured[1][2] == "plan"
+        finally:
+            await stream.aclose()
+            await session.aclose()
+    asyncio.run(scenario())
 
 
 def test_default_search_backend_uses_dedicated_credential_resolver() -> None:

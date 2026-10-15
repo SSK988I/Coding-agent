@@ -16,6 +16,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from agent_llm import Model, ModelCost
@@ -42,7 +44,7 @@ def _model(provider: str, mid: str = "m") -> Model:
     )
 
 
-def _make_mode(provider: str = "deepseek", mid: str = "deepseek-v4-flash"):
+def _make_mode(provider: str = "deepseek", mid: str = "deepseek-flash"):
     sm = SessionManager.create(cwd=".", in_memory=True)
     session = AgentSession(AgentSessionConfig(model=_model(provider, mid), cwd=".", session_manager=sm))
     return InteractiveMode(session)
@@ -56,10 +58,10 @@ def test_default_model_per_provider_has_both_builtins():
     assert "zai-coding-cn" in DEFAULT_MODEL_PER_PROVIDER
 
 
-def test_default_model_for_deepseek_is_v4_pro():
+def test_default_model_for_deepseek_is_v4_1_flash():
     m = get_default_model_for_provider("deepseek")
     assert m is not None
-    assert m.id == "deepseek-v4-pro"
+    assert m.id == "deepseek-flash"
 
 
 def test_default_model_for_zhipu_is_glm_5_1():
@@ -75,9 +77,10 @@ def test_default_model_for_unknown_provider_returns_none():
 
 def test_get_all_models_lists_every_model_from_every_provider():
     ids = {m.id for m in get_all_models()}
-    # 2 DeepSeek + 6 GLM = 8 models total.
+    # 1 DeepSeek + 6 GLM = 7 models total.
     assert ids == {
-        "deepseek-v4-flash", "deepseek-v4-pro",
+        "deepseek-flash",
+        "deepseek-v4-pro",
         "glm-4.5-air", "glm-4.7", "glm-5-turbo", "glm-5.1", "glm-5.2", "glm-5v-turbo",
     }
 
@@ -152,7 +155,7 @@ def test_get_configured_models_filters_unconfigured():
     assert all(m.provider == "zai-coding-cn" for m in models)
     assert len(models) == 6
 
-    # Both configured → all 8.
+    # Both configured → six GLM models plus Flash and Pro.
     models = get_configured_models(
         stored_keys={"deepseek": {"type": "api_key", "key": "d"}},
         env={"ZHIPU_API_KEY": "g"},
@@ -175,7 +178,7 @@ def test_login_to_glm_switches_session_to_glm_5_1(monkeypatch, tmp_path):
     import coding_agent.modes.interactive.interactive_mode as imod
     monkeypatch.setattr(imod, "AUTH_FILE", auth_file)
 
-    mode = _make_mode(provider="deepseek", mid="deepseek-v4-flash")
+    mode = _make_mode(provider="deepseek", mid="deepseek-flash")
     assert mode._session.model.provider == "deepseek"
 
     mode._open_login_dialog()
@@ -199,14 +202,14 @@ def test_login_to_same_provider_keeps_current_model(monkeypatch, tmp_path):
     import coding_agent.modes.interactive.interactive_mode as imod
     monkeypatch.setattr(imod, "AUTH_FILE", auth_file)
 
-    mode = _make_mode(provider="deepseek", mid="deepseek-v4-flash")
+    mode = _make_mode(provider="deepseek", mid="custom-deepseek")
     mode._open_login_dialog()
     mode._current_selector._on_select("deepseek")
     mode._current_selector._on_submit_outer("new-ds-key")
 
-    # Still on deepseek-v4-flash (NOT switched to default deepseek-v4-pro).
+    # Re-authenticating preserves the current model.
     assert mode._session.model.provider == "deepseek"
-    assert mode._session.model.id == "deepseek-v4-flash"
+    assert mode._session.model.id == "custom-deepseek"
 
 
 def test_login_to_deepseek_switches_from_glm(monkeypatch, tmp_path):
@@ -226,7 +229,7 @@ def test_login_to_deepseek_switches_from_glm(monkeypatch, tmp_path):
     mode._current_selector._on_submit_outer("ds-key")
 
     assert mode._session.model.provider == "deepseek"
-    assert mode._session.model.id == "deepseek-v4-pro"  # DS default
+    assert mode._session.model.id == "deepseek-flash"  # DS default
 
 
 # ─── /model lists configured providers only ───────────────────────────────
@@ -266,11 +269,11 @@ def test_model_selector_only_configured_provider_shows(monkeypatch):
     Unconfigured providers are
     hidden so users can't switch to models that will fail without an API key.
     """
-    mode = _make_mode(provider="deepseek", mid="deepseek-v4-flash")
+    mode = _make_mode(provider="deepseek", mid="deepseek-flash")
     _configure_only_deepseek(monkeypatch, mode)
     mode._open_model_selector("")
     ids = {m.id for m in mode._current_selector._models}
-    assert ids == {"deepseek-v4-flash", "deepseek-v4-pro"}
+    assert ids == {"deepseek-flash", "deepseek-v4-pro"}
     assert "glm-5.2" not in ids
 
 
@@ -281,12 +284,12 @@ def test_model_selector_only_glm_configured_shows_only_glm(monkeypatch):
     mode._open_model_selector("")
     ids = {m.id for m in mode._current_selector._models}
     assert ids == {"glm-4.5-air", "glm-4.7", "glm-5-turbo", "glm-5.1", "glm-5.2", "glm-5v-turbo"}
-    assert "deepseek-v4-flash" not in ids
+    assert "deepseek-flash" not in ids
 
 
 def test_model_selector_both_configured_shows_all(monkeypatch):
-    """Both providers configured → /model shows all 8 models."""
-    mode = _make_mode(provider="deepseek", mid="deepseek-v4-flash")
+    """Both providers configured → /model shows all 7 models."""
+    mode = _make_mode(provider="deepseek", mid="deepseek-flash")
     _configure_both(monkeypatch, mode)
     mode._open_model_selector("")
     ids = {m.id for m in mode._current_selector._models}
@@ -295,7 +298,7 @@ def test_model_selector_both_configured_shows_all(monkeypatch):
 
 def test_model_selector_no_auth_shows_nothing_with_hint(monkeypatch):
     """Nothing configured → /model shows a "use /login" hint, no selector."""
-    mode = _make_mode(provider="deepseek", mid="deepseek-v4-flash")
+    mode = _make_mode(provider="deepseek", mid="deepseek-flash")
     _configure_none(monkeypatch, mode)
     mode._open_model_selector("")
     # No selector mounted; the system message guides the user to /login.
@@ -307,7 +310,7 @@ def test_model_selector_no_auth_shows_nothing_with_hint(monkeypatch):
 
 def test_model_selector_env_var_alone_counts_as_configured(monkeypatch):
     """A provider with only an env var (no /login) should also be listed."""
-    mode = _make_mode(provider="deepseek", mid="deepseek-v4-flash")
+    mode = _make_mode(provider="deepseek", mid="deepseek-flash")
     _configure_none(monkeypatch, mode)
     monkeypatch.setenv("ZHIPU_API_KEY", "from-env")
     mode._open_model_selector("")
@@ -318,7 +321,7 @@ def test_model_selector_env_var_alone_counts_as_configured(monkeypatch):
 
 def test_model_selector_can_switch_to_other_configured_provider(monkeypatch):
     """With both configured, picking a GLM model switches the session."""
-    mode = _make_mode(provider="deepseek", mid="deepseek-v4-flash")
+    mode = _make_mode(provider="deepseek", mid="deepseek-flash")
     _configure_both(monkeypatch, mode)
     mode._open_model_selector("")
     mode._current_selector._on_select("glm-5.2")
@@ -332,10 +335,19 @@ def test_model_selector_can_switch_back_to_deepseek(monkeypatch):
     mode = _make_mode(provider="zai-coding-cn", mid="glm-5.1")
     _configure_both(monkeypatch, mode)
     mode._open_model_selector("")
-    mode._current_selector._on_select("deepseek-v4-pro")
+    mode._current_selector._on_select("deepseek-flash")
 
     assert mode._session.model.provider == "deepseek"
-    assert mode._session.model.id == "deepseek-v4-pro"
+    assert mode._session.model.id == "deepseek-flash"
+
+
+@pytest.mark.parametrize("legacy_id", ["deepseek-v4-flash", "deepseek-v4-pro"])
+def test_model_command_migrates_flash_but_preserves_explicit_pro(monkeypatch, legacy_id):
+    mode = _make_mode(provider="zai-coding-cn", mid="glm-5.1")
+    _configure_both(monkeypatch, mode)
+    mode._open_model_selector(legacy_id)
+    assert mode._session.model.provider == "deepseek"
+    assert mode._session.model.id == ("deepseek-v4-pro" if legacy_id == "deepseek-v4-pro" else "deepseek-flash")
 
 
 def test_model_selector_cannot_switch_to_unconfigured_provider(monkeypatch):
@@ -345,7 +357,7 @@ def test_model_selector_cannot_switch_to_unconfigured_provider(monkeypatch):
     but hasn't configured GLM, the switch silently doesn't happen (matches
     the availability filter runs before model resolution).
     """
-    mode = _make_mode(provider="deepseek", mid="deepseek-v4-flash")
+    mode = _make_mode(provider="deepseek", mid="deepseek-flash")
     _configure_only_deepseek(monkeypatch, mode)
     mode._open_model_selector("glm-5.2")
     # glm-5.2 isn't in the configured list, so exact-match fails → selector
@@ -354,12 +366,12 @@ def test_model_selector_cannot_switch_to_unconfigured_provider(monkeypatch):
     assert isinstance(mode._current_selector, ModelSelectorComponent)
     # Session unchanged.
     assert mode._session.model.provider == "deepseek"
-    assert mode._session.model.id == "deepseek-v4-flash"
+    assert mode._session.model.id == "deepseek-flash"
 
 
 def test_model_selector_exact_match_switches_when_configured(monkeypatch):
     """``/model glm-5.2`` switches directly when GLM IS configured."""
-    mode = _make_mode(provider="deepseek", mid="deepseek-v4-flash")
+    mode = _make_mode(provider="deepseek", mid="deepseek-flash")
     _configure_both(monkeypatch, mode)
     mode._open_model_selector("glm-5.2")
     from coding_agent.modes.interactive.components.model_selector import ModelSelectorComponent
@@ -374,7 +386,7 @@ def test_model_selector_filter_only_sees_configured(monkeypatch):
     With only DeepSeek configured, filtering by "glm" returns nothing —
     the user can't see GLM models they can't actually run.
     """
-    mode = _make_mode(provider="deepseek", mid="deepseek-v4-flash")
+    mode = _make_mode(provider="deepseek", mid="deepseek-flash")
     _configure_only_deepseek(monkeypatch, mode)
     mode._open_model_selector("")
     selector = mode._current_selector

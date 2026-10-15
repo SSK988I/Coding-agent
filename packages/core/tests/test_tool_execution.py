@@ -17,6 +17,8 @@ from __future__ import annotations
 import asyncio
 import time
 
+import pytest
+
 from agent_llm import AssistantMessage, TextContent, ToolCall
 
 from agent_core.agent_loop import (
@@ -61,6 +63,56 @@ def _sink():
         events.append(event)
 
     return events, sink
+
+
+def test_nonzero_shell_exit_is_a_structured_failure(tmp_path):
+    from agent_core.tools.bash import BashTool
+    from agent_core.session.serde import dict_to_message, message_to_dict
+
+    tool = BashTool(cwd=str(tmp_path))
+    tc = _tc("bash", {"command": "exit 7"})
+    events, sink = _sink()
+    results, terminate = _run(_execute_tool_calls(
+        [tc], _ctx([tool]), _msg([tc]), _config(), sink, None,
+    ))
+    assert results[0].is_error
+    assert results[0].status == "failed"
+    assert results[0].details["exitCode"] == 7
+    assert dict_to_message(message_to_dict(results[0])).status == "failed"
+    assert events[-1]["status"] == "failed"
+    assert not terminate
+
+
+@pytest.mark.parametrize("execution", ["sequential", "parallel"])
+def test_tool_does_not_report_running_before_approval(execution):
+    events, sink = _sink()
+    tc = _tc("fake")
+
+    async def before(context, signal):
+        assert events[-1]["type"] == "tool_execution_start"
+        assert events[-1]["status"] == "pending"
+        assert not any(e["type"] == "tool_execution_running" for e in events)
+
+    _run(_execute_tool_calls(
+        [tc], _ctx([FakeTool()]), _msg([tc]),
+        _config(tool_execution=execution, before_tool_call=before), sink, None,
+    ))
+    assert [e["type"] for e in events] == [
+        "tool_execution_start", "tool_execution_running", "tool_execution_end",
+    ]
+    assert events[-1]["status"] == "completed"
+
+
+def test_rejected_tool_is_blocked_and_never_running():
+    events, sink = _sink()
+    tc = _tc("fake")
+    results, _ = _run(_execute_tool_calls(
+        [tc], _ctx([FakeTool()]), _msg([tc]),
+        _config(before_tool_call=lambda *_: BeforeToolCallResult(block=True)), sink, None,
+    ))
+    assert results[0].is_error
+    assert results[0].status == "blocked"
+    assert not any(e["type"] == "tool_execution_running" for e in events)
 
 
 # ─── fake tool ─────────────────────────────────────────────────────────

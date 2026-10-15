@@ -157,6 +157,17 @@ class PlanState:
     recovery_error: PlanRecoveryError | None = None
     handoff_target_session_id: str | None = None
     legacy_candidate: bool = False
+    handoff_source_session_id: str | None = None
+
+    @property
+    def can_handoff(self) -> bool:
+        """A review episode can be revised, but cannot hand off recursively."""
+        return (
+            self.mode == "plan"
+            and self.phase == "ready"
+            and self.latest_revision is not None
+            and self.handoff_source_session_id is None
+        )
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -174,6 +185,8 @@ class PlanState:
                 self.recovery_error.to_payload() if self.recovery_error else None
             ),
             "handoffTargetSessionId": self.handoff_target_session_id,
+            "handoffSourceSessionId": self.handoff_source_session_id,
+            "canHandoff": self.can_handoff,
             "legacyCandidate": self.legacy_candidate,
         }
 
@@ -543,6 +556,7 @@ def reduce_plan_state(
                     mode="plan",
                     phase="drafting",
                     active_plan_id=entry.plan_id,
+                    handoff_source_session_id=handoff_origin_session_id,
                 )
             else:
                 valid_exit_state = (

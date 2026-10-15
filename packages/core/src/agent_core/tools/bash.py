@@ -147,9 +147,12 @@ class BashTool:
         except TimeoutError:
             if proc is not None:
                 await self._terminate_process_tree(proc)
-            raise RuntimeError(
-                f"Command timed out after {int(timeout_s)}s: {command}"
-            )
+            from agent_core.types import ToolExecutionError
+
+            raise ToolExecutionError(
+                f"Command timed out after {timeout_s:g}s: {command}",
+                status="timed_out", details={"timeoutSeconds": timeout_s},
+            ) from None
         except asyncio.CancelledError:
             if proc is not None:
                 await self._terminate_process_tree(proc)
@@ -170,7 +173,10 @@ class BashTool:
         if exit_code != 0:
             text += f"\n[exit code: {exit_code}]"
 
-        return AgentToolResult(content=[TextContent(text=text)])
+        return AgentToolResult(
+            content=[TextContent(text=text)], details={"exitCode": exit_code},
+            status="completed" if exit_code == 0 else "failed",
+        )
 
     async def _collect_output(
         self,
@@ -224,7 +230,9 @@ class BashTool:
                     await self._terminate_process_tree(proc)
                     read_task.cancel()
                     await asyncio.gather(read_task, return_exceptions=True)
-                    raise RuntimeError("Operation aborted")
+                    from agent_core.types import ToolExecutionError
+
+                    raise ToolExecutionError("Operation aborted", status="cancelled")
                 await read_task
             await proc.wait()
         finally:

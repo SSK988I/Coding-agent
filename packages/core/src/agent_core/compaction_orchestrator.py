@@ -18,11 +18,19 @@ from typing import Any, Callable, Literal
 
 from agent_core.session.compaction import (
     estimate_context_tokens,
+    extract_file_operations,
     prepare_compaction,
     should_compact,
 )
 from agent_core.session.summarize import compact as run_compact
-from agent_core.session.types import CompactionResult, CompactionSettings
+from agent_core.session.messages import CompactionSummaryMessage
+from agent_core.session.types import (
+    CompactionDetails,
+    CompactionPreparation,
+    CompactionResult,
+    CompactionSettings,
+    validate_compaction_summary,
+)
 
 __all__ = [
     "CompactionOrchestrator",
@@ -30,7 +38,7 @@ __all__ = [
     "CompactionReason",
 ]
 
-CompactionReason = Literal["manual", "threshold", "overflow"]
+CompactionReason = Literal["manual", "threshold", "overflow", "pivot"]
 
 #: Callback shape: (event: {"type": "compaction_start"|"compaction_end", ...}) -> None.
 #: The orchestrator calls it around each compaction so the caller (AgentSession)
@@ -65,6 +73,12 @@ class CompactionOrchestrator:
         self.on_event: CompactionEventCallback | None = None
         #: Abort signal for the in-flight compaction summary LLM call.
         self._abort_signal: asyncio.Event | None = None
+        self._summary_task: asyncio.Task[CompactionResult] | None = None
+        self.timeout_seconds = 90.0
+
+    @property
+    def is_compacting(self) -> bool:
+        return self._abort_signal is not None
 
     def abort(self) -> None:
         """Request abort of the in-flight compaction (best-effort).
@@ -74,6 +88,9 @@ class CompactionOrchestrator:
         """
         if self._abort_signal is not None:
             self._abort_signal.set()
+        summary_task = getattr(self, "_summary_task", None)
+        if summary_task is not None:
+            summary_task.cancel()
 
     def reset_overflow_guard(self) -> None:
         """Call at the start of each user turn."""
@@ -107,6 +124,7 @@ class CompactionOrchestrator:
         *,
         reason: CompactionReason,
         custom_instructions: str | None = None,
+        direction: str | None = None,
     ) -> CompactionOutcome:
         """Prepare + run + persist compaction, then rebuild agent state.
 
@@ -114,9 +132,24 @@ class CompactionOrchestrator:
         optional ``on_event`` callback), so the caller can surface the lifecycle
         to UI listeners. Honors an abort signal set by :meth:`abort`.
         """
-        branch = self.session_manager.get_branch()
+        if self.is_compacting:
+            return CompactionOutcome(performed=False, reason=reason, error="Compaction already running")
+        manager = self.session_manager
+        leaf_id = manager.leaf_id
+        branch = manager.get_branch()
         settings = self._settings()
-        preparation = prepare_compaction(branch, settings)
+        if direction is None:
+            preparation = prepare_compaction(branch, settings)
+        else:
+            active = manager.build_session_context().messages
+            previous = next((m.summary for m in active if isinstance(m, CompactionSummaryMessage)), None)
+            messages = [m for m in active if not isinstance(m, CompactionSummaryMessage)]
+            preparation = CompactionPreparation(
+                first_kept_entry_id="", messages_to_summarize=messages,
+                turn_prefix_messages=[], is_split_turn=False,
+                tokens_before=estimate_context_tokens(active).tokens,
+                previous_summary=previous, file_ops=extract_file_operations(messages), settings=settings,
+            ) if messages or previous else None
         if preparation is None:
             # Nothing to compact (e.g. last entry is already a compaction).
             if branch and _last_is_compaction(branch):
@@ -124,38 +157,52 @@ class CompactionOrchestrator:
             return CompactionOutcome(performed=False, reason=reason, error="Nothing to compact")
 
         # Emit compaction_start and arm the abort signal for this run.
-        self._abort_signal = asyncio.Event()
+        signal = asyncio.Event()
+        self._abort_signal = signal
         self._emit({"type": "compaction_start", "reason": reason})
         try:
-            result: CompactionResult = await run_compact(
+            self._summary_task = asyncio.create_task(run_compact(
                 preparation,
                 model=self._model(),
                 stream_fn=self._stream_fn(),
                 get_api_key=self._get_api_key(),
                 reasoning=self._reasoning(),
                 custom_instructions=custom_instructions,
-            )
+            ))
+            async with asyncio.timeout(self.timeout_seconds):
+                result = await self._summary_task
+            if signal.is_set():
+                raise asyncio.CancelledError
+            if self.session_manager is not manager or manager.leaf_id != leaf_id:
+                raise ValueError("Session branch changed during compaction; summary discarded")
+            if direction is not None:
+                result.summary = (
+                    f"## Next-phase brief\nDirection: {direction}\n\n"
+                    "This is retained context, not execution authorization or verified completion.\n\n"
+                    + result.summary
+                )
+                if result.details is None:
+                    result.details = CompactionDetails()
+                result.details.context_pivot_direction = direction
+            validate_compaction_summary(result.summary)
+            # Materialize any buffered history first. append_compaction then
+            # persists before committing a new in-memory context.
+            manager.flush()
+            manager.append_compaction(result)
+            self.agent.load_messages(manager.build_session_context().messages)
+        except asyncio.CancelledError:
+            self._emit({"type": "compaction_end", "reason": reason, "aborted": True})
+            if not signal.is_set():
+                raise
+            return CompactionOutcome(performed=False, reason=reason, error="Compaction aborted")
         except Exception as e:
             # Pair the start event with an end so listeners aren't left waiting.
-            self._abort_signal = None
-            self._emit({"type": "compaction_end", "reason": reason, "aborted": True, "error": str(e)})
-            return CompactionOutcome(performed=False, reason=reason, error=str(e))
+            error = "Compaction timed out; original context retained" if isinstance(e, TimeoutError) else str(e)
+            self._emit({"type": "compaction_end", "reason": reason, "aborted": False, "error": error})
+            return CompactionOutcome(performed=False, reason=reason, error=error)
         finally:
-            signal, self._abort_signal = self._abort_signal, None
-
-        # Best-effort abort: if abort() was called during the summary call, drop
-        # the result. (run_compact does not accept a signal; full cooperative
-        # cancellation is observed before and after the LLM call.)
-        if signal is not None and signal.is_set():
-            self._emit({"type": "compaction_end", "reason": reason, "aborted": True})
-            return CompactionOutcome(performed=False, reason=reason, error="Compaction aborted")
-
-        # Persist the compaction entry.
-        self.session_manager.append_compaction(result)
-
-        # Rebuild the agent transcript from the session (applies the compaction).
-        ctx = self.session_manager.build_session_context()
-        self.agent.load_messages(ctx.messages)
+            self._abort_signal = None
+            self._summary_task = None
 
         outcome = CompactionOutcome(
             performed=True, reason=reason,
@@ -182,6 +229,22 @@ class CompactionOrchestrator:
     async def manual_compact(self, custom_instructions: str | None = None) -> CompactionOutcome:
         return await self._perform_compaction(
             reason="manual", custom_instructions=custom_instructions,
+        )
+
+    async def context_pivot(self, direction: str) -> CompactionOutcome:
+        """Replace active context with a brief oriented toward the user's next phase."""
+        if not isinstance(direction, str) or not direction.strip() or len(direction) > 2000:
+            raise ValueError("Direction must contain 1–2000 characters")
+        direction = direction.strip()
+        return await self._perform_compaction(
+            reason="pivot", direction=direction,
+            custom_instructions=(
+                "Prepare a next-phase brief for: " + direction + "\n"
+                "Preserve the user's goal, constraints, decisions and their rationale, current code state, "
+                "relevant file paths, test evidence, failed attempts, blockers and concrete next steps. "
+                "Separate verified facts from hypotheses. Omit unrelated investigation noise. "
+                "Do not invent results, change Plan approval, or carry out the next phase."
+            ),
         )
 
     # ─── automatic threshold + overflow ───

@@ -26,6 +26,7 @@ export interface RpcErrorPayload {
 }
 
 export interface WorkspacePayload {
+  permissionMode?: PermissionMode;
   path: string;
   sessionId: string;
   model: { id: string; name: string; provider: string };
@@ -35,6 +36,21 @@ export interface WorkspacePayload {
   collaborationMode: "default" | "plan";
   planState: PlanStatePayload;
   memory: MemoryStatePayload;
+  subagents?: SubagentTaskPayload[];
+}
+
+export interface SubagentTaskPayload {
+  taskId: string;
+  sessionId: string;
+  purpose: "investigate" | "review";
+  prompt: string;
+  status: "queued" | "running" | "completed" | "failed" | "cancelled" | "timed_out" | "uncertain";
+  turns: number;
+  lastTool: string | null;
+  output: string;
+  error: string | null;
+  maxTurns: number;
+  timeoutSeconds: number;
 }
 
 export interface MemoryStatePayload {
@@ -111,18 +127,34 @@ export interface PlanStatePayload {
   latestRun?: PlanRunPayload | null;
   recoveryError?: PlanRecoveryErrorPayload | null;
   handoffTargetSessionId?: string | null;
+  handoffSourceSessionId?: string | null;
+  canHandoff?: boolean;
   legacyCandidate?: boolean;
 }
 
 export interface SessionSnapshotPayload {
+  permissionMode?: PermissionMode;
   sessionId: string;
   messages: AgentMessage[];
   stats: Record<string, unknown>;
   collaborationMode: "default" | "plan";
   planState: PlanStatePayload;
+  subagents?: SubagentTaskPayload[];
+}
+
+export type PermissionMode = "ask" | "auto" | "full_access";
+
+export interface PermissionModePayload {
+  sessionId: string;
+  permissionMode: PermissionMode;
 }
 
 export interface AgentMessage {
+  tool_call_id?: string;
+  tool_name?: string;
+  details?: unknown;
+  is_error?: boolean;
+  status?: string | null;
   role: string;
   content: string | ContentBlock[];
   summary?: string;
@@ -162,6 +194,8 @@ export interface DesktopBridge {
 }
 
 export interface DesktopShell {
+  workbenchRequest?<T = unknown>(method: string, params: Record<string, unknown>): Promise<T>;
+  onWorkbenchEvent?(listener: (event: import("./workbench").WorkbenchNativeEvent) => void): () => void;
   chooseWorkspace(): Promise<string | null>;
   getBootstrap(): Promise<BootstrapInfo>;
 }

@@ -1,5 +1,6 @@
-onlyBuiltDependencies:
-  - electron
+allowBuilds:
+  electron: true
+  node-pty: true
 
 overrides:
   yauzl: ^3.3.1

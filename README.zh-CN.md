@@ -38,6 +38,7 @@ Coding Agent 是一个面向本地开发工作的编程 Agent。项目以 Python
 - 展示工具调用状态和执行结果
 - 对 `bash`、`write`、`edit` 请求执行确认
 - 输入 `/` 打开命令面板
+- 右上角“工具栏”：独立侧边对话、逐行变更、交互终端、内嵌浏览器和文件树预览；使用与权限边界见[桌面工作栏](docs/specs/workbench.md)
 - `/help`、`/new`、`/model`、`/compact`、`/clear`、`/session`、`/plan`、`/cancel-plan`、`/execute-plan`、`/memory`
 
 ## 环境要求
@@ -158,6 +159,14 @@ uv run coding-agent --no-session
 
 交互模式可通过 `/plan`、`Shift+Tab` 或 `Alt+M` 进入 Plan Mode。再次按 `Shift+Tab`/`Alt+M` 只会取消规划，不会执行计划。思考级别循环迁移到 `Alt+T`；`Ctrl+T` 仍只展开或折叠 thinking block。
 
+### 访问权限
+
+桌面输入框提供“请求批准 / 帮我批准 / 完全访问权限”菜单；TUI 使用 `/permissions` 选择相同策略。`/permissions on` 或 `Alt+P` 开启完全访问，底栏显示 `bypass permissions on`；`/permissions off` 恢复审批，`/permissions auto` 使用自动审批。双端设置分别保存。
+
+启动参数 `--dangerously-skip-permissions` 或 `--permission-mode bypassPermissions` 只对本次启动生效。完全访问仅跳过工具审批，不绕过 Plan 工具限制或操作系统权限。详见[访问权限规范](docs/specs/desktop-permissions.md)。
+
+### Plan 会话控制
+
 非交互模式使用可恢复控制参数：
 
 ```powershell
@@ -173,10 +182,12 @@ Plan State 从活动 JSONL v4 分支归约，可由 CLI 或桌面端交叉恢复
 ### 选择 Provider 和模型
 
 ```powershell
-uv run coding-agent --model deepseek-v4-pro
+uv run coding-agent --model deepseek-flash
 uv run coding-agent --provider zhipu --model glm-5.2
 uv run coding-agent --model zhipu/glm-5.2:high
 ```
+
+DeepSeek 默认使用 V4.1 Flash（`deepseek-flash`），支持文本和图片输入。只有已下线的 V4 Flash / Flash Vision 名称会迁移到 Flash。V4 Pro（`deepseek-v4-pro`）仍是独立的纯文本模型；显式 CLI 请求、设置及保存会话中的 Pro 选择保持不变，不会静默切成 Flash。若旧版本已经把选择保存成 Flash，需手动重新选择 Pro。费用分别按各模型高峰价估算，闲时单价为一半。详见当前[模型目录](https://api-docs.deepseek.com/zh-cn/api/list-models/)、[更新日志](https://api-docs.deepseek.com/zh-cn/updates/)和[定价](https://api-docs.deepseek.com/quick_start/pricing/)。
 
 ### 限制工具
 

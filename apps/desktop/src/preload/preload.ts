@@ -16,6 +16,12 @@ const agent: DesktopBridge = {
 };
 
 const desktop: DesktopShell = {
+  workbenchRequest: (method, params) => ipcRenderer.invoke("desktop:workbench-request", method, params),
+  onWorkbenchEvent: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, payload: import("../shared/workbench").WorkbenchNativeEvent) => listener(payload);
+    ipcRenderer.on("desktop:workbench-event", handler);
+    return () => ipcRenderer.removeListener("desktop:workbench-event", handler);
+  },
   chooseWorkspace: () => ipcRenderer.invoke("desktop:choose-workspace"),
   getBootstrap: () => ipcRenderer.invoke("desktop:get-bootstrap"),
 };

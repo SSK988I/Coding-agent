@@ -58,6 +58,9 @@ def _run_git(cwd: Path, *args: str) -> str | None:
     try:
         result = subprocess.run(
             ["git", "-C", str(cwd), *args],
+            # The desktop's stdin is its RPC transport. Inheriting it can
+            # block Git and the Python event loop under Windows OS pipes.
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             encoding="utf-8",

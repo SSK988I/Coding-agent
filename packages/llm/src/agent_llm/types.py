@@ -171,6 +171,9 @@ class AssistantMessage:
     timestamp: float = field(default_factory=_now_ms)
 
 
+ToolResultStatus = Literal["completed", "failed", "cancelled", "timed_out", "blocked", "uncertain"]
+
+
 @dataclass
 class ToolResultMessage:
     """把 tool 的输出带回给 model。"""
@@ -181,6 +184,7 @@ class ToolResultMessage:
     details: Any = None  # 给日志/UI 用的结构化详情,不会原样发给 model
     is_error: bool = False
     timestamp: float = field(default_factory=_now_ms)
+    status: ToolResultStatus | None = None  # None preserves legacy result semantics
 
 
 #: 三种面向 LLM 的 message 角色。

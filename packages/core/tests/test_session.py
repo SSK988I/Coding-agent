@@ -213,6 +213,20 @@ def test_build_context_honors_compaction():
     assert ctx.messages[2].role == "assistant"
 
 
+def test_append_compaction_rejects_oversize_final_summary():
+    sm = SessionManager.create(in_memory=True)
+    original = sm.append_message(_msg_user("keep me"))
+
+    with pytest.raises(ValueError, match="exceeds 64 KiB"):
+        sm.append_compaction(CompactionResult(
+            summary="x" * 65537,
+            first_kept_entry_id=original.id,
+            tokens_before=1000,
+        ))
+
+    assert sm.entries == [original]
+
+
 def test_build_context_without_compaction_keeps_all():
     sm = SessionManager.create(in_memory=True)
     sm.append_message(_msg_user("a"))

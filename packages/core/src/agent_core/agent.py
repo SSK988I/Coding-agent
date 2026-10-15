@@ -17,7 +17,7 @@ steering, follow-up messages, and queue clearing.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Literal
 
 from agent_llm import AssistantMessage, Message, Model, TextContent, Usage, UsageCost
 
@@ -115,6 +115,7 @@ class Agent:
         )
         self._listeners: list[Callable[[AgentEvent, asyncio.Event], "Awaitable[None] | None"]] = []
         self._active_run: _ActiveRun | None = None
+        self.last_run_status: Literal["completed", "failed", "cancelled"] | None = None
         self.convert_to_llm = convert_to_llm
         self.stream_fn = stream_fn
         self.get_api_key = get_api_key
@@ -155,6 +156,12 @@ class Agent:
         """Active run's abort signal, if a run is active."""
         return self._active_run.abort_event if self._active_run else None
 
+    @property
+    def is_accepting_messages(self) -> bool:
+        """Whether an active loop can still consume steering/follow-up input."""
+        run = self._active_run
+        return run is not None and run.accepting_messages and not run.abort_event.is_set()
+
     # ── queues (steering / follow-up) ─────────────────────────────────
 
     def steer(self, message) -> None:
@@ -163,7 +170,8 @@ class Agent:
         Steering messages are injected before the next assistant turn —
         i.e. they cut in line on the current run while it is still looping.
         """
-        self._steering_queue.enqueue(message)
+        for item in self._normalize_prompt_input(message):
+            self._steering_queue.enqueue(item)
 
     def follow_up(self, message) -> None:
         """Enqueue a follow-up message.
@@ -172,7 +180,8 @@ class Agent:
         stops (no more tool calls, no steering pending), starting a new
         inner run.
         """
-        self._follow_up_queue.enqueue(message)
+        for item in self._normalize_prompt_input(message):
+            self._follow_up_queue.enqueue(item)
 
     def clear_steering_queue(self) -> None:
         self._steering_queue.clear()
@@ -229,11 +238,13 @@ class Agent:
         If a session_manager is attached, ``detach_session`` first so the
         session file is left intact (callers start a fresh session separately).
         """
+        self.clear_all_queues()
         self._state.messages = []
         self._state.is_streaming = False
         self._state.streaming_message = None
         self._state.pending_tool_calls = set()
         self._state.error_message = None
+        self.last_run_status = None
 
     def load_messages(self, messages: list) -> None:
         """Replace the transcript with the given messages (for session resume).
@@ -242,6 +253,7 @@ class Agent:
         may start with a CompactionSummaryMessage). Does not persist again —
         the caller is responsible for reattaching/creating a session if needed.
         """
+        self.clear_all_queues()
         self._state.messages = list(messages)
 
     def attach_session(self, session_manager: Any) -> None:
@@ -295,6 +307,7 @@ class Agent:
         abort_event = asyncio.Event()
         done = asyncio.Event()
         self._active_run = _ActiveRun(abort_event=abort_event, done=done)
+        self.last_run_status = None
 
         self._state.is_streaming = True
         self._state.streaming_message = None
@@ -302,9 +315,16 @@ class Agent:
 
         try:
             await executor(abort_event)
+        except asyncio.CancelledError:
+            abort_event.set()
+            raise
         except Exception as e:  # noqa: BLE001
             await self._handle_run_failure(e, abort_event.is_set())
         finally:
+            if abort_event.is_set():
+                self.last_run_status = "cancelled"
+            elif self.last_run_status is None:
+                self.last_run_status = "completed"
             self._finish_run()
 
     async def _handle_run_failure(self, error: Any, aborted: bool) -> None:
@@ -324,6 +344,9 @@ class Agent:
         await self._process_events({"type": "agent_end", "messages": [failure]})
 
     def _finish_run(self) -> None:
+        # Errors, cancellation and terminating control tools can leave input
+        # unconsumed. It belongs to this run, never the next unrelated prompt.
+        self.clear_all_queues()
         self._state.is_streaming = False
         self._state.streaming_message = None
         self._state.pending_tool_calls = set()
@@ -343,6 +366,12 @@ class Agent:
             self._state.streaming_message = event["message"]
         elif etype == "message_end":
             self._state.streaming_message = None
+            message = event["message"]
+            if getattr(message, "role", None) == "assistant":
+                if getattr(message, "stop_reason", None) == "error":
+                    self.last_run_status = "failed"
+                elif getattr(message, "stop_reason", None) == "aborted":
+                    self.last_run_status = "cancelled"
             self._state.messages.append(event["message"])
             # Persist user + assistant messages to the session (if attached).
             if self.session_manager is not None:
@@ -379,6 +408,8 @@ class Agent:
                         pass
         elif etype == "agent_end":
             self._state.streaming_message = None
+            if self._active_run is not None:
+                self._active_run.accepting_messages = False
 
         # Forward to listeners.
         signal = self._active_run.abort_event if self._active_run else asyncio.Event()
@@ -396,6 +427,7 @@ class _ActiveRun:
     def __init__(self, *, abort_event: asyncio.Event, done: asyncio.Event) -> None:
         self.abort_event = abort_event
         self.done = done
+        self.accepting_messages = True
 
 
 def _make_async_convert(

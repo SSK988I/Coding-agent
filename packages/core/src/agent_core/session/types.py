@@ -15,6 +15,13 @@ from typing import Any, Literal
 from agent_llm import Message
 
 CURRENT_SESSION_VERSION = 4
+MAX_COMPACTION_SUMMARY_BYTES = 64 * 1024
+
+
+def validate_compaction_summary(summary: str) -> None:
+    """Reject new compaction records whose final UTF-8 payload exceeds 64 KiB."""
+    if len(summary.encode("utf-8")) > MAX_COMPACTION_SUMMARY_BYTES:
+        raise ValueError("Summary exceeds 64 KiB; original context retained")
 
 #: Discriminator values for entry types.
 EntryType = Literal[
@@ -77,6 +84,7 @@ class CompactionDetails:
     """File operations tracked across a compaction."""
     read_files: list[str] = field(default_factory=list)
     modified_files: list[str] = field(default_factory=list)
+    context_pivot_direction: str | None = None
 
 
 @dataclass(kw_only=True)
@@ -200,6 +208,14 @@ class PlanRunEntry(SessionEntry):
 
 
 # ─── 会话树节点（供 UI 渲染） ──────────────────────────────────────────
+
+@dataclass(kw_only=True)
+class SubagentTaskEntry(SessionEntry):
+    """Branch-local snapshot of a read-only delegated task, not model context."""
+
+    type: Literal["subagent_task"] = "subagent_task"
+    task: dict[str, Any] = field(default_factory=dict)
+
 
 @dataclass
 class SessionTreeNode:
