@@ -206,3 +206,4 @@ def test_stream_maps_text_citations_usage_and_native_search_history(monkeypatch)
     assert result.provider_data["response_items"][0]["type"] == "web_search_call"
     assert captured["tools"] == [{"type": "web_search"}]
     assert captured["model"] == "deepseek-flash"
+    assert captured["client"]["max_retries"] == 0

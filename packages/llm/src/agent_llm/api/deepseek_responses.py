@@ -436,6 +436,9 @@ def stream(
             client = AsyncOpenAI(
                 api_key=api_key,
                 base_url=opts.get("base_url", model.base_url),
+                # Each retry must return to the host's current capability gate.
+                # Never let SDK retries resend previously authorized search.
+                max_retries=0,
             )
             created = await client.responses.create(**build_params(model, context, opts))
             terminal = False
