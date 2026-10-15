@@ -9,6 +9,8 @@ from agent_core import AgentContext, BeforeToolCallContext, SessionManager
 from agent_llm import AssistantMessage, AssistantMessageEventStream, Model, ModelCost, TextContent, ToolCall, UserMessage
 
 from coding_agent.core.agent_session import AgentSession, AgentSessionConfig
+from coding_agent.core.plan_mode import PlanState
+from coding_agent.core.retry import RetryPolicy
 from coding_agent.desktop.protocol import RpcError
 from coding_agent.desktop.runtime import DesktopRuntime
 from coding_agent.desktop.side_conversations import SideConversations
@@ -491,6 +493,85 @@ def test_native_search_approval_is_once_per_side_run_not_shared_with_parent(tmp_
             assert len(ids) == 2
             assert len(captured) == 3 and all(options.get("web_search") for options in captured)
             assert parent.state.messages == []
+        finally:
+            await side.close()
+            await parent.aclose()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("transition", ["unchanged", "plan", "recovery_error", "tool_removed", "closed", "stop"])
+def test_native_side_search_rechecks_parent_on_provider_retry(tmp_path, monkeypatch, transition):
+    async def scenario():
+        parent = AgentSession(AgentSessionConfig(
+            cwd=str(tmp_path), model=Model(id="test", provider="deepseek", cost=ModelCost(0, 0, 0, 0)),
+            web_search_enabled=True,
+            retry_policy=RetryPolicy(max_retries=1, initial_delay=0, max_delay=0),
+        ))
+        approvals, captured, retries = [], [], []
+        waiting = asyncio.Event()
+        def emit(_event, payload):
+            approval = payload.get("approval")
+            if approval:
+                approvals.append(approval["approvalId"])
+                waiting.set()
+        def provider(_model, context, options):
+            captured.append((context, dict(options or {}), parent.collaboration_mode))
+            stream = AssistantMessageEventStream()
+            if len(captured) == 1:
+                message = AssistantMessage(stop_reason="error", error_message="HTTP 503 service unavailable")
+                stream.push({"type": "error", "reason": "error", "error": message})
+            else:
+                message = AssistantMessage(content=[TextContent(text="done")])
+                stream.push({"type": "done", "reason": "stop", "message": message})
+            return stream
+        monkeypatch.setattr("agent_llm.compat.stream_simple", provider)
+        side = SideConversations(parent, tmp_path / "cache", emit, lambda: "ask")
+        identity = side.open()["conversationId"]
+        live = side.records[identity]
+        checks = []
+        authorize = live.session._config.before_native_web_search
+        async def checked_authorize(signal):
+            allowed = await authorize(signal)
+            checks.append(allowed)
+            return allowed
+        live.session._config.before_native_web_search = checked_authorize
+        def on_retry(event):
+            if event.get("type") != "retry":
+                return
+            retries.append(event)
+            if transition == "plan":
+                parent.enter_plan_mode()
+            elif transition == "recovery_error":
+                parent._plan_state = PlanState(mode="default", phase="recovery_error")
+                parent._refresh_collaboration_runtime()
+            elif transition == "tool_removed":
+                parent._tools = [tool for tool in parent.tools if tool.name != "web_search"]
+            elif transition == "closed":
+                side.closed = True
+            elif transition == "stop":
+                live.session._retry_abort_event.set()
+        live.session.on_event(on_retry)
+        try:
+            side.send(identity, "research")
+            await asyncio.wait_for(waiting.wait(), 2)
+            side.resolve(identity, live.approval["approvalId"], True)
+            await asyncio.wait_for(live.task, 2)
+            assert len(set(approvals)) == 1, "Retries must not repeat the same run's user approval"
+            assert len(retries) == 1
+            assert captured[0][1].get("web_search") is True
+            if transition == "stop":
+                assert len(captured) == 1
+                return
+            assert len(captured) == 2
+            allowed = transition == "unchanged"
+            assert bool(captured[1][1].get("web_search")) is allowed
+            assert checks == [True, allowed], "Every actual Provider attempt must recheck the parent"
+            for context, options, _mode in captured:
+                assert not any(tool.name == "web_search" for tool in (context.tools or []))
+                assert (context.system_prompt or "").count("<native_web_search>") == int(bool(options.get("web_search")))
+            if transition == "plan":
+                assert captured[1][2] == "plan"
+            assert live.status == "settled"
         finally:
             await side.close()
             await parent.aclose()

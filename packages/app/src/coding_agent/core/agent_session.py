@@ -1810,26 +1810,32 @@ class AgentSession:
         from agent_llm.event_stream import lazy_stream
 
         def _stream(model: Model, context, options=None):
-            effective_options: dict[str, Any] = dict(options or {})
-            effective_context = context
-            search_allowed = (
-                self._plan_state.mode == "default"
-                and self._plan_state.phase not in {"uncertain", "recovery_error"}
+            provider_native = (
+                model.provider == "deepseek"
                 and any(tool.name == "web_search" for tool in (context.tools or []))
             )
-            native_search = self.web_search_enabled and model.provider == "deepseek" and search_allowed
+
+            def native_search_enabled() -> bool:
+                return (
+                    provider_native and self.web_search_enabled
+                    and self._plan_state.mode == "default"
+                    and self._plan_state.phase not in {"uncertain", "recovery_error"}
+                )
 
             def start(native_allowed: bool = True):
-                nonlocal effective_context
+                # Rebuild from the original input for each actual attempt, after
+                # authorization awaits. No retry may reuse a search flag/prompt.
+                effective_options: dict[str, Any] = dict(options or {})
+                effective_context = context
                 # A caller-supplied flag must not bypass host authorization.
                 effective_options.pop("web_search", None)
-                if native_search:
+                if provider_native:
                     effective_context = Context(
                         system_prompt=context.system_prompt,
                         messages=context.messages,
                         tools=[tool for tool in (context.tools or []) if tool.name != "web_search"] or None,
                     )
-                if native_search and native_allowed:
+                if native_allowed and native_search_enabled():
                     # DeepSeek owns search server-side. Do not expose a duplicate
                     # function tool alongside its authorized native capability.
                     effective_options["web_search"] = True
@@ -1850,33 +1856,36 @@ class AgentSession:
                         messages=context.messages,
                         tools=effective_context.tools,
                     )
-                return retrying_stream(
-                    lambda: stream_simple(
-                        model,
-                        effective_context,
-                        cast(Any, effective_options or None),
-                    ),
-                    self.retry_policy,
-                    on_retry=None if isolated else lambda attempt, delay, error: self._emit_event({
-                        "type": "retry",
-                        "attempt": attempt,
-                        "max_retries": self.retry_policy.max_retries,
-                        "delay": delay,
-                        "error": error,
-                    }),
-                    abort_event=None if isolated else self._retry_abort_event,
+                return stream_simple(
+                    model,
+                    effective_context,
+                    cast(Any, effective_options or None),
                 )
 
-            if native_search and self._config.before_native_web_search is not None:
-                async def authorize_search():
-                    allowed = await self._config.before_native_web_search(self._retry_abort_event)
-                    if self._retry_abort_event.is_set():
-                        raise asyncio.CancelledError
-                    return start(bool(allowed))
-                return lazy_stream(model, authorize_search)
-            if native_search and self.permission_mode == "ask":
-                return start(False)
-            return start()
+            def attempt():
+                # Authorization belongs inside the retry factory: the host can
+                # revoke capabilities during backoff or while approval waits.
+                if native_search_enabled() and self._config.before_native_web_search is not None:
+                    async def authorize_search():
+                        allowed = await self._config.before_native_web_search(self._retry_abort_event)
+                        if self._retry_abort_event.is_set():
+                            raise asyncio.CancelledError
+                        return start(bool(allowed))
+                    return lazy_stream(model, authorize_search)
+                return start(self.permission_mode != "ask")
+
+            return retrying_stream(
+                attempt,
+                self.retry_policy,
+                on_retry=None if isolated else lambda attempt, delay, error: self._emit_event({
+                    "type": "retry",
+                    "attempt": attempt,
+                    "max_retries": self.retry_policy.max_retries,
+                    "delay": delay,
+                    "error": error,
+                }),
+                abort_event=None if isolated else self._retry_abort_event,
+            )
 
         setattr(_stream, "for_subagent", lambda: self._create_stream_fn(isolated=True))
         return _stream
