@@ -12,13 +12,16 @@ export const nativeRequest = <T,>(scope: WorkbenchScope, method: string, params:
 
 export function DiffView({ diff, wrap }: { diff: string; wrap: boolean }) {
   let oldLine = 0, newLine = 0;
+  let inHunk = false;
   const rows = diff.split("\n").flatMap((line, index) => {
     const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)$/.exec(line);
     if (hunk) {
+      inHunk = true;
       oldLine = Number(hunk[1]); newLine = Number(hunk[2]);
       return [<tr key={index} className="diff-hunk"><td colSpan={3}>{line}{oldLine > 1 ? " · 未改动行已折叠" : ""}</td></tr>];
     }
-    if (/^(diff |index |--- |\+\+\+ |new file |deleted file |old mode |new mode )/.test(line) || !line) return [];
+    if (line.startsWith("diff ")) inHunk = false;
+    if ((!inHunk && /^(diff |index |--- |\+\+\+ |new file |deleted file |old mode |new mode )/.test(line)) || !line) return [];
     const kind = line.startsWith("+") ? "add" : line.startsWith("-") ? "remove" : line.startsWith(" ") ? "context" : "note";
     const old = kind === "remove" || kind === "context" ? oldLine++ : "";
     const next = kind === "add" || kind === "context" ? newLine++ : "";
@@ -77,6 +80,7 @@ export function ChangesPanel({ scope, active, onOpenFile }: { scope: WorkbenchSc
         <summary><span className={`file-status status-${file.status}`}>{file.status}</span><span className="changed-file-path" title={file.path}>{file.path}</span><span className="diff-add-count">+{file.additions}</span><span className="diff-remove-count">−{file.deletions}</span></summary>
         <div className="diff-file-actions"><button type="button" onClick={() => onOpenFile(file.path)} disabled={file.status === "D"}>在文件中打开 ↗</button><button type="button" onClick={() => void navigator.clipboard.writeText(file.path).catch((reason) => setError(String(reason)))}>复制路径</button></div>
         {file.binary ? <p className="workbench-notice">二进制文件发生变更</p> : <DiffView diff={file.diff} wrap={wrap} />}
+        {file.truncated && <p className="workbench-notice">当前文件差异已截断，内容不完整。</p>}
       </details>)}
       {current && !current.files.length && !loading && <div className="workbench-empty">当前来源没有变更</div>}
       {!current && loading && <div className="workbench-empty" role="status">正在读取变更…</div>}

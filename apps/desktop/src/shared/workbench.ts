@@ -3,7 +3,7 @@ import type { AgentMessage } from "./types";
 export interface WorkbenchScope { workspacePath: string; sessionId: string }
 export type WorkbenchTool = "chat" | "changes" | "terminal" | "browser" | "files";
 export type ChangeSource = "unstaged" | "staged" | "branch" | "session" | "turn";
-export interface ChangedFile { path: string; status: string; additions: number; deletions: number; binary: boolean; diff: string }
+export interface ChangedFile { path: string; status: string; additions: number; deletions: number; binary: boolean; diff: string; truncated?: boolean }
 export interface ChangesSnapshot extends WorkbenchScope {
   source: ChangeSource; files: ChangedFile[]; additions: number; deletions: number;
   branch: string; branches: string[]; baseRef: string | null; truncated: boolean;

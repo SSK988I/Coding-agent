@@ -1,4 +1,4 @@
-"""Retired model ids must restore the correct provider and canonical API model."""
+"""Retired Flash ids migrate; explicit Pro selections keep their model identity."""
 from __future__ import annotations
 
 import asyncio
@@ -17,7 +17,7 @@ from coding_agent.core.settings import Settings, SettingsManager
 from coding_agent.desktop.runtime import DesktopRuntime
 
 
-LEGACY_IDS = ["deepseek-v4-flash", "deepseek-v4-flash-vision-exp", "deepseek-v4-pro"]
+LEGACY_IDS = ["deepseek-v4-flash", "deepseek-v4-flash-vision-exp"]
 
 
 @pytest.mark.parametrize("legacy_id", LEGACY_IDS)
@@ -62,7 +62,7 @@ def test_aliases_do_not_change_other_providers_or_accept_unknown_models(tmp_path
         _resolve_model(Args(model="deepseek-v4.1-pro"), deepseek_provider())
 
 
-@pytest.mark.parametrize("legacy_id", LEGACY_IDS)
+@pytest.mark.parametrize("legacy_id", [*LEGACY_IDS, "deepseek-v4-pro"])
 def test_desktop_restores_legacy_deepseek_session_over_glm_default(
     tmp_path: Path, legacy_id: str,
 ) -> None:
@@ -85,20 +85,40 @@ def test_desktop_restores_legacy_deepseek_session_over_glm_default(
             })
             models = await runtime.dispatch("model.list", {})
             deepseek_models = [model for model in models if model["provider"] == "deepseek"]
-            assert deepseek_models == [{
-                "id": "deepseek-flash", "name": "DeepSeek V4.1 Flash",
-                "provider": "deepseek", "current": True,
-            }]
+            expected_id = "deepseek-v4-pro" if legacy_id == "deepseek-v4-pro" else "deepseek-flash"
+            assert {model["id"] for model in deepseek_models} == {"deepseek-flash", "deepseek-v4-pro"}
+            assert [model["id"] for model in deepseek_models if model["current"]] == [expected_id]
             assert runtime._session is not None
             assert runtime._session.state.messages[0].content == "existing question"
             selected = await runtime.dispatch("model.select", {
                 "provider": "deepseek", "modelId": legacy_id,
             })
-            assert selected["id"] == "deepseek-flash"
+            assert selected["id"] == expected_id
             assert runtime._session.session_manager.build_session_context().model == {
-                "provider": "deepseek", "model_id": "deepseek-flash",
+                "provider": "deepseek", "model_id": expected_id,
             }
         finally:
             await runtime.dispose()
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("qualified", [False, True])
+def test_explicit_pro_cli_does_not_silently_select_flash(qualified):
+    args = Args(model="deepseek/deepseek-v4-pro:low" if qualified else "deepseek-v4-pro")
+    _normalize_model_options(args)
+    model = _resolve_model(args, deepseek_provider())
+    assert model.id == "deepseek-v4-pro"
+    assert build_params(model, Context(), {"reasoning": args.thinking})["model"] == "deepseek-v4-pro"
+    assert model.input == ["text"]
+
+
+@pytest.mark.parametrize("provider", [None, "deepseek"])
+def test_saved_pro_and_existing_flash_choices_remain_distinct(tmp_path, provider):
+    for model_id in ("deepseek-v4-pro", "deepseek-flash"):
+        path = tmp_path / f"{model_id}.json"
+        path.write_text(json.dumps({"default_provider": provider, "default_model": model_id}), encoding="utf-8")
+        manager = SettingsManager(path)
+        assert manager.load().default_model == model_id
+        manager.save()
+        assert json.loads(path.read_text(encoding="utf-8"))["default_model"] == model_id

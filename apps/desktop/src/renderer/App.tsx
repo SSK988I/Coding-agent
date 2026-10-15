@@ -1763,7 +1763,7 @@ export function App() {
             </form>
           </div>
         </main>
-        {workspace && <Workbench key={workspace.sessionId} workspace={workspace} open={workbenchOpen} onClose={() => setWorkbenchOpen(false)} width={workbenchWidth} onWidth={setWorkbenchWidth} />}
+        {workspace && <Workbench key={workspace.sessionId} workspace={workspace} open={workbenchOpen} onClose={() => setWorkbenchOpen(false)} width={workbenchWidth} onWidth={setWorkbenchWidth} sidebarOpen={sidebarOpen} />}
       </div>
     </div>
   );

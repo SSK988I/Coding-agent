@@ -16,6 +16,7 @@ from coding_agent.desktop.protocol import RpcError
 
 MAX_PREVIEW_BYTES = 1024 * 1024
 MAX_BASELINE_BYTES = 32 * 1024 * 1024
+MAX_DIFF_BYTES = 4 * MAX_PREVIEW_BYTES
 MAX_FILES = 2000
 HIDDEN_DIRECTORIES = {".git", ".venv", "node_modules", "__pycache__", ".pytest_cache", ".tmp"}
 
@@ -171,6 +172,8 @@ class WorkspaceWorkbench:
             raise RpcError("BASELINE_INVALID", "变更基线与当前会话不匹配")
         current = self._snapshot()
         files = []
+        remaining = MAX_DIFF_BYTES
+        truncated = baseline["truncated"] or current["truncated"]
         for name in sorted(baseline["files"].keys() | current["files"].keys()):
             before = baseline["files"].get(name)
             after = current["files"].get(name)
@@ -185,8 +188,17 @@ class WorkspaceWorkbench:
             binary = old_text is None or new_text is None
             diff = "" if old_text is None or new_text is None else self._text_diff(old_text, new_text, f"a/{name}" if before else "/dev/null", f"b/{name}" if after else "/dev/null")
             additions, deletions = self._counts(diff)
-            files.append({"path": name, "status": "M" if before and after else "A" if after else "D", "additions": additions, "deletions": deletions, "binary": binary, "diff": diff})
-        return {"files": files, "truncated": baseline["truncated"] or current["truncated"]}
+            diff, clipped, remaining = self._bounded_diff(diff, remaining)
+            truncated |= clipped
+            files.append({"path": name, "status": "M" if before and after else "A" if after else "D", "additions": additions, "deletions": deletions, "binary": binary, "diff": diff, "truncated": clipped})
+        return {"files": files, "truncated": truncated}
+
+    @staticmethod
+    def _bounded_diff(diff: str, remaining: int) -> tuple[str, bool, int]:
+        encoded = diff.encode("utf-8")
+        limit = min(MAX_PREVIEW_BYTES, remaining)
+        preview = encoded[:limit].decode("utf-8", errors="ignore")
+        return preview, len(encoded) > limit, remaining - len(preview.encode("utf-8"))
 
     @staticmethod
     def _text_diff(old: str, new: str, before: str, after: str) -> str:
@@ -195,10 +207,17 @@ class WorkspaceWorkbench:
 
     @staticmethod
     def _counts(diff: str) -> tuple[int, int]:
-        return (
-            sum(line.startswith("+") and not line.startswith("+++ ") for line in diff.splitlines()),
-            sum(line.startswith("-") and not line.startswith("--- ") for line in diff.splitlines()),
-        )
+        additions = deletions = 0
+        in_hunk = False
+        for line in diff.splitlines():
+            if line.startswith("diff "):
+                in_hunk = False
+            elif line.startswith("@@ "):
+                in_hunk = True
+            elif in_hunk:
+                additions += line.startswith("+")
+                deletions += line.startswith("-")
+        return additions, deletions
 
     def changes(self, params: dict[str, Any]) -> dict[str, Any]:
         source = params.get("source", "unstaged")
@@ -231,6 +250,8 @@ class WorkspaceWorkbench:
             if source == "unstaged":
                 names.extend(part.decode("utf-8", errors="replace") for part in self.git("ls-files", "--others", "--exclude-standard", "-z", "--", ".").split(b"\0") if part)
             files = []
+            remaining = MAX_DIFF_BYTES
+            truncated = len(set(names)) > 500
             for name in sorted(set(names))[:500]:
                 self.path(name)
                 diff = self.git(*diff_args, "--", name).decode("utf-8", errors="replace")
@@ -251,8 +272,11 @@ class WorkspaceWorkbench:
                 elif "deleted file mode" in diff:
                     status = "D"
                 additions, deletions = self._counts(diff)
-                files.append({"path": name, "status": status, "additions": additions, "deletions": deletions, "binary": "Binary files" in diff, "diff": diff[:MAX_PREVIEW_BYTES]})
-            result = {"files": files, "truncated": len(names) > 500 or any(len(file["diff"]) >= MAX_PREVIEW_BYTES for file in files)}
+                binary = "Binary files" in diff
+                diff, clipped, remaining = self._bounded_diff(diff, remaining)
+                truncated |= clipped
+                files.append({"path": name, "status": status, "additions": additions, "deletions": deletions, "binary": binary, "diff": diff, "truncated": clipped})
+            result = {"files": files, "truncated": truncated}
         return {
             **result, "source": source, "branch": branch, "branches": branches, "baseRef": base,
             "additions": sum(file["additions"] for file in result["files"]),

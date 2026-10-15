@@ -5,12 +5,13 @@ import asyncio
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, cast
 import uuid
 
 from agent_core import BeforeToolCallContext, BeforeToolCallResult, SessionManager
 from coding_agent.core.agent_session import AgentSession, AgentSessionConfig, _create_plan_observation_tools
-from coding_agent.core.permissions import requires_approval, is_approval_safe_shell_command
+from coding_agent.core.permissions import PermissionMode, requires_approval, is_approval_safe_shell_command
+from coding_agent.core.plan_mode import enforce_plan_tool_policy
 from coding_agent.desktop.protocol import RpcError, to_jsonable
 
 CHILD_TOOLS = {"read", "write", "edit", "bash", "grep", "find", "ls", "git_status", "git_log", "git_diff", "git_show", "web_search"}
@@ -26,6 +27,7 @@ class SideConversation:
     approval: dict[str, Any] | None = None
     decision: asyncio.Future[bool] | None = None
     approval_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    native_search_decision: bool | None = None
 
 
 class SideConversations:
@@ -97,10 +99,12 @@ class SideConversations:
             get_api_key=self.parent._config.get_api_key, reasoning=self.parent.agent.reasoning,
             context_files=self.parent._config.context_files, retry_policy=self.parent.retry_policy,
             memory_configured=False,
+            permission_mode=cast(PermissionMode, self.permission()),
             append_system_prompt="This is a user-directed side conversation. Work independently. Its messages and results are not injected into the main conversation.",
         ))
         live = SideConversation(child)
         child._config.before_tool_call = lambda context, signal: self._approve(live, context, signal)
+        child._config.before_native_web_search = lambda signal: self._approve_native_search(live, signal)
         child.on_event(lambda event: self._on_event(live, event))
         try:
             saved_status = json.loads(self._status_file(live).read_text(encoding="utf-8"))
@@ -134,6 +138,8 @@ class SideConversations:
         except OSError as exc:
             live.status, live.error, live.streaming = previous
             raise RpcError("SIDE_CHAT_SAVE_FAILED", "侧边对话保存失败，未启动运行") from exc
+        live.native_search_decision = None
+        live.session._config.permission_mode = cast(PermissionMode, self.permission())
         live.task = asyncio.create_task(self._drive(live, text.strip()))
         self._changed(live)
         return self._snapshot(live)
@@ -177,20 +183,55 @@ class SideConversations:
                 return BeforeToolCallResult(block=True, reason="侧边对话已停止", status="cancelled")
             return await self._approve_one(live, context, signal)
 
-    async def _approve_one(self, live: SideConversation, context: BeforeToolCallContext, signal: asyncio.Event) -> BeforeToolCallResult | None:
+    async def _parent_policy(self, context: BeforeToolCallContext, signal: asyncio.Event) -> BeforeToolCallResult | None:
+        if signal.is_set():
+            return BeforeToolCallResult(block=True, reason="侧边对话已停止", status="cancelled")
         if self.closed or context.tool_call.name not in {tool.name for tool in self.parent.tools}:
             return BeforeToolCallResult(block=True, reason="主会话当前不允许此工具", code="PARENT_TOOL_UNAVAILABLE", status="blocked")
-        if not requires_approval(self.permission(), context.tool_call.name, context.args, Path(self.parent.cwd), is_approval_safe_shell_command):
-            return None
+        if self.parent.collaboration_mode == "plan" or self.parent.plan_state.phase in {"uncertain", "recovery_error"}:
+            return await enforce_plan_tool_policy(context, self.parent.cwd, phase=self.parent.plan_state.phase)
+        return None
+
+    async def _approve_one(self, live: SideConversation, context: BeforeToolCallContext, signal: asyncio.Event) -> BeforeToolCallResult | None:
+        blocked = await self._parent_policy(context, signal)
+        if blocked is not None:
+            return blocked
+        if requires_approval(self.permission(), context.tool_call.name, context.args, Path(self.parent.cwd), is_approval_safe_shell_command):
+            if not await self._request_decision(live, context.tool_call.name, context.args, signal):
+                return BeforeToolCallResult(block=True, reason="用户未批准侧边对话操作", status="cancelled" if signal.is_set() else "blocked")
+        # Approval cleanup awaits; the parent can enter Plan or close meanwhile.
+        return await self._parent_policy(context, signal)
+
+    def _native_search_allowed(self, signal: asyncio.Event) -> bool:
+        return (
+            not self.closed and not signal.is_set()
+            and self.parent.collaboration_mode == "default"
+            and self.parent.plan_state.phase not in {"uncertain", "recovery_error"}
+            and any(tool.name == "web_search" for tool in self.parent.tools)
+        )
+
+    async def _approve_native_search(self, live: SideConversation, signal: asyncio.Event) -> bool:
+        # Provider-native search never passes through before_tool_call. Share the
+        # side chat's approval queue, but revalidate the parent for every request.
+        async with live.approval_lock:
+            if not self._native_search_allowed(signal):
+                return False
+            if live.native_search_decision is None:
+                live.native_search_decision = (
+                    await self._request_decision(live, "web_search", {"native": True}, signal)
+                    if requires_approval(self.permission(), "web_search", {}, Path(self.parent.cwd), is_approval_safe_shell_command)
+                    else True
+                )
+            return live.native_search_decision and self._native_search_allowed(signal)
+
+    async def _request_decision(self, live: SideConversation, tool_name: str, args: dict[str, Any], signal: asyncio.Event) -> bool:
         live.decision = asyncio.get_running_loop().create_future()
-        live.approval = {"approvalId": uuid.uuid4().hex, "toolName": context.tool_call.name, "args": context.args}
+        live.approval = {"approvalId": uuid.uuid4().hex, "toolName": tool_name, "args": args}
         self._changed(live)
         stopped = asyncio.create_task(signal.wait())
         try:
             done, _ = await asyncio.wait({live.decision, stopped}, timeout=120, return_when=asyncio.FIRST_COMPLETED)
-            if live.decision in done and live.decision.result() and not signal.is_set():
-                return None
-            return BeforeToolCallResult(block=True, reason="用户未批准侧边对话操作", status="cancelled" if signal.is_set() else "blocked")
+            return live.decision in done and live.decision.result() and not signal.is_set()
         finally:
             stopped.cancel()
             await asyncio.gather(stopped, return_exceptions=True)

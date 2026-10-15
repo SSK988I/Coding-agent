@@ -1,7 +1,7 @@
 """DeepSeek model 目录。
 
 使用官方 API 名称 ``deepseek-flash``，对应 DeepSeek V4.1 Flash。
-旧 Flash / Pro 入口按官方 2026-09-10 公告迁移，不在选择器中重复展示。
+旧 Flash 入口归一化到 V4.1 Flash；V4 Pro 仍是独立服务，不跨模型迁移。
 价格使用美元高峰价估算；闲时及中国法定节假日的实际单价为一半。
 """
 from __future__ import annotations
@@ -30,7 +30,6 @@ _DEEPSEEK_THINKING_LEVEL_MAP = {
 DEEPSEEK_MODEL_ALIASES: dict[str, str] = {
     "deepseek-v4-flash": "deepseek-flash",
     "deepseek-v4-flash-vision-exp": "deepseek-flash",
-    "deepseek-v4-pro": "deepseek-flash",
 }
 
 DEEPSEEK_MODELS: dict[str, Model] = {
@@ -45,6 +44,20 @@ DEEPSEEK_MODELS: dict[str, Model] = {
         thinking_level_map=dict(_DEEPSEEK_THINKING_LEVEL_MAP),  # type: ignore[arg-type]
         input=["text", "image"],
         cost=ModelCost(input=0.3, output=1.2, cache_read=0.006, cache_write=0),
+        context_window=1_048_576,
+        max_tokens=393_216,
+    ),
+    "deepseek-v4-pro": Model(
+        id="deepseek-v4-pro",
+        name="DeepSeek V4 Pro",
+        api="openai-responses",
+        provider="deepseek",
+        base_url="https://api.deepseek.com",
+        compat=dict(_DEEPSEEK_COMPAT),
+        reasoning=True,
+        thinking_level_map=dict(_DEEPSEEK_THINKING_LEVEL_MAP),  # type: ignore[arg-type]
+        input=["text"],
+        cost=ModelCost(input=1.32, output=3.96, cache_read=0.044, cache_write=0),
         context_window=1_048_576,
         max_tokens=393_216,
     ),

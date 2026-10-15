@@ -50,7 +50,7 @@ async function main() {
   ipcMain.handle("wb:bootstrap", (event) => { trusted(event); return { defaultWorkspace: project, platform: process.platform }; });
   ipcMain.handle("wb:agent", (event, method, params) => { trusted(event); return request(method, params); });
   ipcMain.handle("wb:native", (event, method, params) => { trusted(event); return native.dispatch(method, params); });
-  const evaluate = (source) => window.webContents.executeJavaScript(source);
+  const evaluate = (source) => window.webContents.executeJavaScript(source).catch((error) => { throw Error("Renderer evaluation failed: " + source, { cause: error }); });
   const waitFor = async (source, contents = window.webContents) => {
     const deadline = Date.now() + 15000;
     while (Date.now() < deadline) { if (await contents.executeJavaScript(source)) return; await new Promise((resolve) => setTimeout(resolve, 40)); }
@@ -58,6 +58,16 @@ async function main() {
   };
   const click = (label) => evaluate(`(() => { const b=[...document.querySelectorAll('button')].find(b=>b.getAttribute('aria-label')===${JSON.stringify(label)} || b.textContent.trim()===${JSON.stringify(label)}); if(!b||b.disabled) throw Error('Missing button '+${JSON.stringify(label)}); b.click(); })()`);
   const screenshot = async (name) => fs.writeFile(path.join(output, name), (await window.capturePage()).toPNG());
+  const dragWidth = (delta) => evaluate(`(() => {
+    const separator=document.querySelector('.workbench-resize');
+    separator.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,clientX:1000}));
+    document.dispatchEvent(new PointerEvent('pointermove',{bubbles:true,clientX:1000-(${delta})}));
+    document.dispatchEvent(new PointerEvent('pointerup',{bubbles:true}));
+  })()`);
+  const assertWidth = async () => {
+    await waitFor(`(() => {const w=document.querySelector('.workbench').getBoundingClientRect();const c=document.querySelector('button[aria-label="关闭工具栏"]').getBoundingClientRect();return w.right<=innerWidth+1 && c.right<=innerWidth && c.left>=0})()`);
+    assert(await evaluate("document.querySelector('.conversation').getBoundingClientRect().width >= 280"));
+  };
   try {
     await window.loadFile(path.join(__dirname, "../dist-renderer/index.html"));
     await waitFor("document.querySelector('textarea') && !document.querySelector('textarea').disabled");
@@ -65,6 +75,24 @@ async function main() {
     await waitFor("document.querySelector('.workbench-launcher button')");
     assert.equal(await evaluate("document.querySelectorAll('.workbench-launcher > div > button').length"), 5);
     await screenshot("launcher-wide.png");
+    await dragWidth(2000);
+    await assertWidth();
+    await screenshot("workbench-max-width.png");
+    window.setSize(1200, 800);
+    await waitFor("innerWidth <= 1200 && innerWidth > 1150");
+    await assertWidth();
+    await evaluate("document.querySelector('.sidebar-toggle').click()");
+    await waitFor("document.querySelector('.workspace-grid.sidebar-closed')");
+    await dragWidth(2000);
+    await assertWidth();
+    await evaluate("document.querySelector('.sidebar-toggle').click()");
+    await waitFor("!document.querySelector('.workspace-grid.sidebar-closed')");
+    await assertWidth();
+    window.setSize(1440, 920);
+    await waitFor("innerWidth > 1400");
+    await dragWidth(-2000);
+    for (let step = 0; step < 3; step++) await evaluate("document.querySelector('.workbench-resize').dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowLeft',bubbles:true}))");
+    await assertWidth();
     await evaluate("[...document.querySelectorAll('.workbench-launcher button')].find(b=>b.textContent.includes('变更')).click()");
     await waitFor("document.querySelector('.changed-file')?.textContent.includes('README.md')");
     assert(await evaluate("document.querySelector('.diff-add')?.textContent.includes('Workbench')"));

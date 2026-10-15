@@ -12,7 +12,7 @@ from coding_agent.core.agent_session import AgentSession, AgentSessionConfig
 from coding_agent.desktop.protocol import RpcError
 from coding_agent.desktop.runtime import DesktopRuntime
 from coding_agent.desktop.side_conversations import SideConversations
-from coding_agent.desktop.workbench import WorkspaceWorkbench
+from coding_agent.desktop.workbench import MAX_PREVIEW_BYTES, WorkspaceWorkbench
 
 
 def git(root, *args):
@@ -306,4 +306,192 @@ def test_immediate_side_stop_is_terminal_even_before_task_starts(tmp_path):
         await side.close()
         assert live.status == "cancelled"
         await parent.aclose()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("transition", ["plan", "closed"])
+def test_side_rechecks_parent_after_approval_before_real_write(tmp_path, monkeypatch, transition):
+    async def scenario():
+        parent = make_parent(tmp_path)
+        waiting = asyncio.Event()
+        def emit(_event, payload):
+            if payload.get("approval"):
+                waiting.set()
+        side = SideConversations(parent, tmp_path / "cache", emit, lambda: "ask")
+        calls = 0
+        def provider(*_args):
+            nonlocal calls
+            calls += 1
+            message = AssistantMessage(content=[ToolCall(id="write", name="write", arguments={"path": ".env.pending", "content": "not authorized"})]) if calls == 1 else AssistantMessage(content=[TextContent(text="done")])
+            stream = AssistantMessageEventStream()
+            stream.push({"type": "done", "reason": "tool_use" if calls == 1 else "stop", "message": message})
+            return stream
+        monkeypatch.setattr("agent_llm.compat.stream_simple", provider)
+        identity = side.open()["conversationId"]
+        live = side.records[identity]
+        try:
+            side.send(identity, "write a file")
+            await asyncio.wait_for(waiting.wait(), 2)
+            approval_id = live.approval["approvalId"]
+            if transition == "plan":
+                parent.enter_plan_mode()
+                side.resolve(identity, approval_id, True)
+            else:
+                side.resolve(identity, approval_id, True)
+                side.closed = True
+            await asyncio.wait_for(live.task, 2)
+            assert not (tmp_path / ".env.pending").exists()
+            results = [message for message in live.session.state.messages if message.role == "toolResult"]
+            assert results and results[0].is_error
+        finally:
+            await side.close()
+            await parent.aclose()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("scenario_name", ["allow", "deny", "plan_before", "plan_during", "stop"])
+def test_native_side_search_obeys_own_approval_and_current_parent(tmp_path, monkeypatch, scenario_name):
+    async def scenario():
+        parent = AgentSession(AgentSessionConfig(
+            cwd=str(tmp_path), model=Model(id="test", provider="deepseek", cost=ModelCost(0, 0, 0, 0)),
+            session_manager=SessionManager.create(cwd=str(tmp_path), sessions_dir=tmp_path / "sessions"),
+            web_search_enabled=True,
+        ))
+        waiting = asyncio.Event()
+        approvals, captured = [], []
+        def emit(_event, payload):
+            if payload.get("approval"):
+                approvals.append(payload["approval"])
+                waiting.set()
+        def provider(_model, context, options):
+            captured.append((context, options or {}))
+            stream = AssistantMessageEventStream()
+            stream.push({"type": "done", "reason": "stop", "message": AssistantMessage(content=[TextContent(text="done")])})
+            return stream
+        monkeypatch.setattr("agent_llm.compat.stream_simple", provider)
+        side = SideConversations(parent, tmp_path / "cache", emit, lambda: "ask")
+        identity = side.open()["conversationId"]
+        live = side.records[identity]
+        waiter = None
+        try:
+            if scenario_name == "plan_before":
+                parent.enter_plan_mode()
+            side.send(identity, "research")
+            if scenario_name != "plan_before":
+                waiter = asyncio.create_task(waiting.wait())
+                await asyncio.wait({waiter, live.task}, timeout=2, return_when=asyncio.FIRST_COMPLETED)
+                assert waiting.is_set(), f"Native search started without a side approval: {live.status}, {live.error}, provider calls={len(captured)}"
+                assert captured == [], "Provider started before native search approval"
+                approval = live.approval
+                assert approval["toolName"] == "web_search"
+                if scenario_name == "stop":
+                    await side.stop(identity)
+                    assert captured == [] and live.approval is None
+                    return
+                if scenario_name == "plan_during":
+                    parent.enter_plan_mode()
+                side.resolve(identity, approval["approvalId"], scenario_name != "deny")
+            await asyncio.wait_for(live.task, 2)
+            assert bool(captured[0][1].get("web_search")) is (scenario_name == "allow")
+            assert not any(tool.name == "web_search" for tool in (captured[0][0].tools or []))
+            if scenario_name == "plan_before":
+                assert approvals == []
+        finally:
+            if waiter is not None:
+                waiter.cancel()
+                await asyncio.gather(waiter, return_exceptions=True)
+            await side.close()
+            await parent.aclose()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("source", ["unstaged", "session", "turn"])
+def test_diff_counts_keep_source_lines_that_look_like_file_headers(tmp_path, source):
+    root = repository(tmp_path)
+    file = root / "counter.py"
+    file.write_text("-- counter;\ncontext\n", encoding="utf-8", newline="\n")
+    git(root, "add", ".")
+    git(root, "commit", "-m", "counter")
+    workbench = WorkspaceWorkbench(root, "session", tmp_path / "cache")
+    asyncio.run(workbench.capture())
+    file.write_text("++ counter;\ncontext\n", encoding="utf-8", newline="\n")
+    changed = workbench.changes({"source": source})["files"][0]
+    assert changed["additions"] == changed["deletions"] == 1
+    assert "--- counter;\n+++ counter;" in changed["diff"]
+
+
+@pytest.mark.parametrize("source", ["session", "turn"])
+def test_baseline_diff_preview_is_byte_bounded_and_reports_truncation(tmp_path, source):
+    root = tmp_path / "project"
+    root.mkdir()
+    file = root / "large.txt"
+    file.write_bytes(b"a" * 600000 + b"\n")
+    workbench = WorkspaceWorkbench(root, "session", tmp_path / "cache")
+    asyncio.run(workbench.capture())
+    file.write_bytes(b"b" * 600000 + b"\n")
+    result = workbench.changes({"source": source})
+    assert len(result["files"][0]["diff"].encode("utf-8")) <= MAX_PREVIEW_BYTES
+    assert result["truncated"] and result["files"][0]["truncated"]
+
+
+@pytest.mark.parametrize("source", ["unstaged", "session", "turn"])
+def test_all_diff_sources_share_utf8_response_budget(tmp_path, monkeypatch, source):
+    root = repository(tmp_path)
+    for index in range(3):
+        (root / f"text{index}.txt").write_text("旧" * 200 + "\n", encoding="utf-8", newline="\n")
+    git(root, "add", ".")
+    git(root, "commit", "-m", "multi file baseline")
+    workbench = WorkspaceWorkbench(root, "session", tmp_path / "cache")
+    asyncio.run(workbench.capture())
+    for index in range(3):
+        (root / f"text{index}.txt").write_text("新" * 200 + "\n", encoding="utf-8", newline="\n")
+    monkeypatch.setattr("coding_agent.desktop.workbench.MAX_PREVIEW_BYTES", 1024)
+    monkeypatch.setattr("coding_agent.desktop.workbench.MAX_DIFF_BYTES", 1500)
+    result = workbench.changes({"source": source})
+    assert len(result["files"]) == 3
+    assert sum(len(file["diff"].encode("utf-8")) for file in result["files"]) <= 1500
+    assert all(len(file["diff"].encode("utf-8")) <= 1024 for file in result["files"])
+    assert result["truncated"] and all(file["truncated"] for file in result["files"])
+    assert result["additions"] == result["deletions"] == 3
+
+
+def test_native_search_approval_is_once_per_side_run_not_shared_with_parent(tmp_path, monkeypatch):
+    async def scenario():
+        parent = AgentSession(AgentSessionConfig(
+            cwd=str(tmp_path), model=Model(id="test", provider="deepseek", cost=ModelCost(0, 0, 0, 0)),
+            web_search_enabled=True,
+        ))
+        (tmp_path / "sample.txt").write_text("sample", encoding="utf-8")
+        approvals, captured = [], []
+        waiting = asyncio.Event()
+        def emit(_event, payload):
+            approval = payload.get("approval")
+            if approval:
+                approvals.append(approval)
+                waiting.set()
+        def provider(_model, _context, options):
+            captured.append(options or {})
+            message = AssistantMessage(content=[ToolCall(id="read", name="read", arguments={"path": "sample.txt"})]) if len(captured) == 1 else AssistantMessage(content=[TextContent(text="done")])
+            stream = AssistantMessageEventStream()
+            stream.push({"type": "done", "reason": "tool_use" if len(captured) == 1 else "stop", "message": message})
+            return stream
+        monkeypatch.setattr("agent_llm.compat.stream_simple", provider)
+        side = SideConversations(parent, tmp_path / "cache", emit, lambda: "ask")
+        identity = side.open()["conversationId"]
+        live = side.records[identity]
+        try:
+            for run in range(2):
+                waiting.clear()
+                side.send(identity, "research")
+                await asyncio.wait_for(waiting.wait(), 2)
+                assert len(captured) == (0 if run == 0 else 2)
+                side.resolve(identity, live.approval["approvalId"], True)
+                await asyncio.wait_for(live.task, 2)
+            ids = {approval["approvalId"] for approval in approvals}
+            assert len(ids) == 2
+            assert len(captured) == 3 and all(options.get("web_search") for options in captured)
+            assert parent.state.messages == []
+        finally:
+            await side.close()
+            await parent.aclose()
     asyncio.run(scenario())

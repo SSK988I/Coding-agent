@@ -15,7 +15,7 @@ const TOOLS: { kind: WorkbenchTool; label: string; description: string; path: st
 interface ToolTab { id: string; kind: WorkbenchTool; title: string }
 function ToolIcon({ kind }: { kind: WorkbenchTool }) { return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={TOOLS.find((tool) => tool.kind === kind)!.path} /></svg>; }
 
-export function Workbench({ workspace, open, onClose, width, onWidth }: { workspace: WorkspacePayload; open: boolean; onClose: () => void; width: number; onWidth: (width: number) => void }) {
+export function Workbench({ workspace, open, onClose, width, onWidth, sidebarOpen = true }: { workspace: WorkspacePayload; open: boolean; onClose: () => void; width: number; onWidth: (width: number) => void; sidebarOpen?: boolean }) {
   const scope = useMemo<WorkbenchScope>(() => ({ workspacePath: workspace.path, sessionId: workspace.sessionId }), [workspace.path, workspace.sessionId]);
   const [tabs, setTabs] = useState<ToolTab[]>([]);
   const [active, setActive] = useState<string | null>(null);
@@ -26,6 +26,16 @@ export function Workbench({ workspace, open, onClose, width, onWidth }: { worksp
   const terminalCounter = useRef(0);
   const tablist = useRef<HTMLDivElement>(null);
   const resizeCleanup = useRef<(() => void) | null>(null);
+  const [viewportWidth, setViewportWidth] = useState(window.innerWidth);
+  const maximumWidth = Math.max(360, viewportWidth - (sidebarOpen ? 268 : 0) - 280);
+  const constrain = (value: number) => Math.max(360, Math.min(window.innerWidth - (sidebarOpen ? 268 : 0) - 280, value));
+  const constrainedWidth = Math.max(360, Math.min(maximumWidth, width));
+  useEffect(() => {
+    const resized = () => setViewportWidth(window.innerWidth);
+    window.addEventListener("resize", resized);
+    return () => window.removeEventListener("resize", resized);
+  }, []);
+  useEffect(() => { if (width !== constrainedWidth) onWidth(constrainedWidth); }, [width, constrainedWidth, onWidth]);
   const activate = (id: string) => { history.current = [...history.current.filter((item) => item !== id), id]; setActive(id); setLauncher(false); };
   const openTool = (kind: WorkbenchTool) => {
     const old = tabs.find((tab) => tab.kind === kind);
@@ -46,8 +56,8 @@ export function Workbench({ workspace, open, onClose, width, onWidth }: { worksp
   const pointerResize = (event: React.PointerEvent<HTMLDivElement>) => {
     event.preventDefault();
     resizeCleanup.current?.();
-    const start = event.clientX, original = width;
-    const move = (next: PointerEvent) => onWidth(Math.max(360, Math.min(window.innerWidth - 300, original + start - next.clientX)));
+    const start = event.clientX, original = constrainedWidth;
+    const move = (next: PointerEvent) => onWidth(constrain(original + start - next.clientX));
     const done = () => { document.removeEventListener("pointermove", move); document.removeEventListener("pointerup", done); document.removeEventListener("pointercancel", done); document.body.style.cursor = ""; document.body.style.userSelect = ""; resizeCleanup.current = null; };
     resizeCleanup.current = done;
     document.body.style.cursor = "col-resize"; document.body.style.userSelect = "none";
@@ -55,7 +65,7 @@ export function Workbench({ workspace, open, onClose, width, onWidth }: { worksp
     document.addEventListener("pointercancel", done, { once: true });
   };
   return <aside className={`workbench ${maximized ? "maximized" : ""}`} hidden={!open} aria-label="工具栏" onKeyDown={(event) => { if (event.key === "Escape" && !(event.target instanceof HTMLTextAreaElement) && !((event.target as HTMLElement).closest(".xterm"))) { if (launcher && active) setLauncher(false); else onClose(); } }}>
-    <div className="workbench-resize" role="separator" aria-label="调整工具栏宽度" aria-orientation="vertical" tabIndex={0} onPointerDown={pointerResize} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); onWidth(Math.max(360, Math.min(window.innerWidth - 300, width + (event.key === "ArrowLeft" ? 40 : -40)))); } }} />
+    <div className="workbench-resize" role="separator" aria-label="调整工具栏宽度" aria-orientation="vertical" aria-valuemin={360} aria-valuemax={maximumWidth} aria-valuenow={constrainedWidth} tabIndex={0} onPointerDown={pointerResize} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); onWidth(constrain(constrainedWidth + (event.key === "ArrowLeft" ? 40 : -40))); } }} />
     <header className="workbench-header">
       <div className="workbench-tabs" ref={tablist} role="tablist" aria-label="打开的工具">
         {launcher && <span className="workbench-launcher-title">＋ 打开工具</span>}

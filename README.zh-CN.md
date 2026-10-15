@@ -187,7 +187,7 @@ uv run coding-agent --provider zhipu --model glm-5.2
 uv run coding-agent --model zhipu/glm-5.2:high
 ```
 
-DeepSeek 默认使用 V4.1 Flash（`deepseek-flash`），支持文本和图片输入。CLI 参数、设置和保存会话中的旧 V4 Flash / V4 Pro 名称会自动迁移到该模型。费用按高峰价估算，闲时实际单价为一半。详见 [DeepSeek 发布公告](https://api-docs.deepseek.com/news/news260910/)和[定价](https://api-docs.deepseek.com/quick_start/pricing/)。
+DeepSeek 默认使用 V4.1 Flash（`deepseek-flash`），支持文本和图片输入。只有已下线的 V4 Flash / Flash Vision 名称会迁移到 Flash。V4 Pro（`deepseek-v4-pro`）仍是独立的纯文本模型；显式 CLI 请求、设置及保存会话中的 Pro 选择保持不变，不会静默切成 Flash。若旧版本已经把选择保存成 Flash，需手动重新选择 Pro。费用分别按各模型高峰价估算，闲时单价为一半。详见当前[模型目录](https://api-docs.deepseek.com/zh-cn/api/list-models/)、[更新日志](https://api-docs.deepseek.com/zh-cn/updates/)和[定价](https://api-docs.deepseek.com/quick_start/pricing/)。
 
 ### 限制工具
 

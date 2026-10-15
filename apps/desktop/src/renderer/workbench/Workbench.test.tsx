@@ -33,7 +33,7 @@ beforeEach(() => {
   window.agent = { request, onEvent: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; }, onStatus: () => () => undefined };
   window.desktop = { chooseWorkspace: async () => null, getBootstrap: async () => ({ defaultWorkspace: scope.workspacePath, platform: "win32" }) };
 });
-afterEach(cleanup);
+afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
 describe("workspace workbench", () => {
   const props = { workspace, open: true, onClose: vi.fn(), width: 480, onWidth: vi.fn() };
@@ -81,6 +81,32 @@ describe("workspace workbench", () => {
     expect(screen.queryByRole("tab")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^侧边对话/ })).toBeVisible();
   });
+
+  it("limits pointer and keyboard resizing by sidebar and conversation widths", () => {
+    vi.stubGlobal("innerWidth", 1440);
+    vi.stubGlobal("PointerEvent", MouseEvent);
+    const onWidth = vi.fn();
+    render(<Workbench {...props} width={880} onWidth={onWidth} />);
+    const separator = screen.getByRole("separator");
+    fireEvent.keyDown(separator, { key: "ArrowLeft" });
+    expect(onWidth).toHaveBeenLastCalledWith(892);
+    fireEvent.pointerDown(separator, { clientX: 1000 });
+    fireEvent.pointerMove(document, { clientX: 0 });
+    fireEvent.pointerUp(document);
+    expect(onWidth).toHaveBeenLastCalledWith(892);
+  });
+
+  it("reclamps existing width when the sidebar opens or the window shrinks", () => {
+    vi.stubGlobal("innerWidth", 1440);
+    const onWidth = vi.fn();
+    const view = render(<Workbench {...props} width={1100} onWidth={onWidth} sidebarOpen={false} />);
+    expect(onWidth).not.toHaveBeenCalled();
+    view.rerender(<Workbench {...props} width={1100} onWidth={onWidth} sidebarOpen />);
+    expect(onWidth).toHaveBeenLastCalledWith(892);
+    vi.stubGlobal("innerWidth", 1200);
+    fireEvent.resize(window);
+    expect(onWidth).toHaveBeenLastCalledWith(652);
+  });
 });
 
 it("renders hunk line numbers, additions, removals and missing-newline notes", () => {
@@ -89,6 +115,16 @@ it("renders hunk line numbers, additions, removals and missing-newline notes", (
   expect(view.container.querySelector(".diff-remove")).toHaveTextContent("3old");
   expect(screen.getByText(/未改动行已折叠/)).toBeVisible();
   expect(screen.getByText(/No newline/)).toBeVisible();
+});
+
+it("keeps header-like source lines inside hunks and advances context line numbers", () => {
+  const diff = "--- a/counter.py\n+++ b/counter.py\n@@ -1,2 +1,2 @@\n--- counter;\n+++ counter;\n context\n";
+  const view = render(<DiffView diff={diff} wrap={false} />);
+  expect(view.container.querySelector(".diff-remove code")).toHaveTextContent("-- counter;");
+  expect(view.container.querySelector(".diff-add code")).toHaveTextContent("++ counter;");
+  const context = view.container.querySelector(".diff-context");
+  expect(context?.querySelectorAll(".diff-line-number")[0]).toHaveTextContent("2");
+  expect(context?.querySelectorAll(".diff-line-number")[1]).toHaveTextContent("2");
 });
 
 it("ignores an older diff response after changing the selected source", async () => {

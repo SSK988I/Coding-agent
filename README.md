@@ -185,7 +185,7 @@ uv run coding-agent --provider zhipu --model glm-5.2
 uv run coding-agent --model zhipu/glm-5.2:high
 ```
 
-DeepSeek defaults to V4.1 Flash (`deepseek-flash`), with text and image input. Retired V4 Flash and V4 Pro ids in CLI arguments, settings, and saved sessions resolve to this model. Cost estimates use peak rates; actual off-peak rates are half as much. See [DeepSeek's release notice](https://api-docs.deepseek.com/news/news260910/) and [pricing](https://api-docs.deepseek.com/quick_start/pricing/).
+DeepSeek defaults to V4.1 Flash (`deepseek-flash`), with text and image input. Only retired V4 Flash / Flash Vision ids resolve to Flash. V4 Pro (`deepseek-v4-pro`) remains a separate text-only model: explicit CLI requests, settings, and saved sessions keep Pro and are not silently switched to Flash. If a previous version already saved the selection as Flash, select Pro again manually. Cost estimates use each model's peak rates; off-peak rates are half as much. See the current [model catalog](https://api-docs.deepseek.com/api/list-models/), [change log](https://api-docs.deepseek.com/updates/) and [pricing](https://api-docs.deepseek.com/quick_start/pricing/).
 
 ### Tool restrictions
 

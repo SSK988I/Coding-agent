@@ -1,5 +1,5 @@
-.workspace-grid.with-workbench { grid-template-columns: 268px minmax(280px, 1fr) var(--workbench-width, 480px); }
-.workspace-grid.sidebar-closed.with-workbench { grid-template-columns: 0 minmax(280px, 1fr) var(--workbench-width, 480px); }
+.workspace-grid.with-workbench { grid-template-columns: 268px minmax(280px, 1fr) clamp(360px, var(--workbench-width, 480px), calc(100% - 548px)); }
+.workspace-grid.sidebar-closed.with-workbench { grid-template-columns: 0 minmax(280px, 1fr) clamp(360px, var(--workbench-width, 480px), calc(100% - 280px)); }
 .workbench { position: relative; min-width: 0; min-height: 0; display: flex; flex-direction: column; border-left: 1px solid var(--line); background: var(--surface); color: var(--text); }
 .workbench[hidden], .workbench-tool-panel[hidden] { display: none; }
 .workbench.maximized { position: absolute; inset: 54px 0 0 40px; z-index: 20; box-shadow: -6px 0 20px #0001; }

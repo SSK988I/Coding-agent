@@ -80,6 +80,7 @@ def test_get_all_models_lists_every_model_from_every_provider():
     # 1 DeepSeek + 6 GLM = 7 models total.
     assert ids == {
         "deepseek-flash",
+        "deepseek-v4-pro",
         "glm-4.5-air", "glm-4.7", "glm-5-turbo", "glm-5.1", "glm-5.2", "glm-5v-turbo",
     }
 
@@ -154,12 +155,12 @@ def test_get_configured_models_filters_unconfigured():
     assert all(m.provider == "zai-coding-cn" for m in models)
     assert len(models) == 6
 
-    # Both configured → all 7.
+    # Both configured → six GLM models plus Flash and Pro.
     models = get_configured_models(
         stored_keys={"deepseek": {"type": "api_key", "key": "d"}},
         env={"ZHIPU_API_KEY": "g"},
     )
-    assert len(models) == 7
+    assert len(models) == 8
 
 
 # ─── Bug 1: /login switches to authenticated provider's default ─────────
@@ -272,7 +273,7 @@ def test_model_selector_only_configured_provider_shows(monkeypatch):
     _configure_only_deepseek(monkeypatch, mode)
     mode._open_model_selector("")
     ids = {m.id for m in mode._current_selector._models}
-    assert ids == {"deepseek-flash"}
+    assert ids == {"deepseek-flash", "deepseek-v4-pro"}
     assert "glm-5.2" not in ids
 
 
@@ -292,7 +293,7 @@ def test_model_selector_both_configured_shows_all(monkeypatch):
     _configure_both(monkeypatch, mode)
     mode._open_model_selector("")
     ids = {m.id for m in mode._current_selector._models}
-    assert len(ids) == 7
+    assert len(ids) == 8
 
 
 def test_model_selector_no_auth_shows_nothing_with_hint(monkeypatch):
@@ -341,12 +342,12 @@ def test_model_selector_can_switch_back_to_deepseek(monkeypatch):
 
 
 @pytest.mark.parametrize("legacy_id", ["deepseek-v4-flash", "deepseek-v4-pro"])
-def test_model_command_accepts_retired_deepseek_ids(monkeypatch, legacy_id):
+def test_model_command_migrates_flash_but_preserves_explicit_pro(monkeypatch, legacy_id):
     mode = _make_mode(provider="zai-coding-cn", mid="glm-5.1")
     _configure_both(monkeypatch, mode)
     mode._open_model_selector(legacy_id)
     assert mode._session.model.provider == "deepseek"
-    assert mode._session.model.id == "deepseek-flash"
+    assert mode._session.model.id == ("deepseek-v4-pro" if legacy_id == "deepseek-v4-pro" else "deepseek-flash")
 
 
 def test_model_selector_cannot_switch_to_unconfigured_provider(monkeypatch):
