@@ -95,6 +95,7 @@ def dict_to_usage(d: dict | None) -> Usage:
     if not d:
         return Usage()
     cost_raw = d.get("cost") or {}
+    cache_read_reported = d.get("cache_read_reported")
     return Usage(
         input=int(d.get("input", 0) or 0),
         output=int(d.get("output", 0) or 0),
@@ -103,6 +104,7 @@ def dict_to_usage(d: dict | None) -> Usage:
         cache_write_1h=int(d.get("cache_write_1h", 0) or 0),
         reasoning=d.get("reasoning"),
         total_tokens=int(d.get("total_tokens", 0) or 0),
+        cache_read_reported=cache_read_reported if isinstance(cache_read_reported, bool) else None,
         cost=UsageCost(
             input=float(cost_raw.get("input", 0) or 0),
             output=float(cost_raw.get("output", 0) or 0),

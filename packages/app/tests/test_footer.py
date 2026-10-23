@@ -6,6 +6,9 @@ import subprocess
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
+import pytest
+from agent_tui.utils import visible_width
+
 from coding_agent.modes.interactive.components.footer import FooterComponent
 
 
@@ -33,14 +36,13 @@ class _Usage:
 
 
 @dataclass
-class _Msg:
-    role: str
-    usage: "_Usage | None" = None
-
-
-@dataclass
-class _Entry:
-    message: "_Msg | None" = None
+class _Metrics:
+    cache_hit_rate: float | None = None
+    input_tokens: int = 0
+    context_tokens: int | None = None
+    context_window: int | None = 1_000_000
+    context_percent: float | None = None
+    context_estimated: bool = False
 
 
 @dataclass
@@ -53,33 +55,31 @@ class _FakeModel:
 @dataclass
 class _Stats:
     tokens: _Usage = field(default_factory=_Usage)
+    metrics: _Metrics = field(default_factory=_Metrics)
     cost: float = 0.0
 
 
 class FakeSession:
     """Minimal session stub for footer render tests."""
 
-    def __init__(self, *, model=None, thinking_level="high", entries=None,
+    def __init__(self, *, model=None, thinking_level="high", metrics=None,
                  tokens_in=0, tokens_out=0, cost=0.0, cwd=".",
-                 collaboration_mode="default", plan_phase="idle"):
+                 collaboration_mode="default", plan_phase="idle", permission_mode=None):
         self.model = model or _FakeModel()
         self.thinking_level = thinking_level
         self.cwd = cwd
-        self._entries = entries or []
+        self._metrics = metrics or _Metrics(input_tokens=tokens_in)
         self._tokens_in = tokens_in
         self._tokens_out = tokens_out
         self._cost = cost
         self.collaboration_mode = collaboration_mode
         self.plan_state = SimpleNamespace(phase=plan_phase)
-        self.session_manager = type("SM", (), {"get_branch": self._branch})()
-
-    def _branch(self):
-        return self._entries
+        self.permission_mode = permission_mode
 
     def get_stats(self):
         u = _Usage(input=self._tokens_in, output=self._tokens_out,
                    total=self._tokens_in + self._tokens_out)
-        return _Stats(tokens=u, cost=self._cost)
+        return _Stats(tokens=u, metrics=self._metrics, cost=self._cost)
 
 
 def _make(**kw) -> "tuple[FooterComponent, FakeSession]":
@@ -154,38 +154,98 @@ def test_renders_token_counts():
     assert "out=1k" in line
 
 
-def test_no_token_part_when_zero():
+def test_zero_tokens_do_not_fabricate_cache_hit_or_context():
     footer, _ = _make(tokens_in=0, tokens_out=0)
-    line = _strip(footer.render(120)[0])
-    assert "in=" not in line
+    line = _strip("\n".join(footer.render(120)))
+    assert "in=0 out=0" in line
+    assert "cache —" in line
+    assert "ctx —/1.0m" in line
+    assert "0.0%" not in line
 
 
-def test_context_percent_from_last_assistant():
-    entries = [_Entry(message=_Msg(role="assistant", usage=_Usage(input=50000)))]
+def test_context_and_input_use_central_metrics_not_uncached_input():
     footer, _ = _make(
         model=_FakeModel(context_window=1_000_000),
-        entries=entries,
-        tokens_in=50000,
+        metrics=_Metrics(input_tokens=120_000, context_tokens=100_000,
+                         context_percent=10, cache_hit_rate=95),
+        tokens_in=5_000,
     )
-    line = _strip(footer.render(120)[0])
-    assert "ctx 5%" in line
+    line = _strip("\n".join(footer.render(160)))
+    assert "ctx 100k/1.0m (10.0%)" in line
+    assert "cache 95.0%" in line
+    assert "in=120k" in line
+    assert "in=5k" not in line
 
 
-def test_context_percent_none_when_no_entries():
-    footer, _ = _make(model=_FakeModel(context_window=1_000_000), entries=[])
+def test_context_unknown_remains_visible():
+    footer, _ = _make()
     line = _strip(footer.render(120)[0])
-    assert "ctx" not in line
+    assert "ctx —/1.0m" in line
 
 
 def test_context_percent_none_when_no_context_window():
-    entries = [_Entry(message=_Msg(role="assistant", usage=_Usage(input=50000)))]
     footer, _ = _make(
         model=_FakeModel(context_window=0),
-        entries=entries,
-        tokens_in=50000,
+        metrics=_Metrics(context_tokens=50_000, context_window=None),
     )
     line = _strip(footer.render(120)[0])
-    assert "ctx" not in line
+    assert "ctx 50k/—" in line
+
+
+@pytest.mark.parametrize("rate", [0.0, 100.0])
+def test_cache_extremes_are_real_percentages(rate):
+    footer, _ = _make(metrics=_Metrics(cache_hit_rate=rate))
+    text = _strip("\n".join(footer.render(120)))
+    assert f"cache {rate:.1f}%" in text
+
+
+def test_context_estimate_and_over_capacity_are_not_hidden():
+    footer, _ = _make(metrics=_Metrics(
+        context_tokens=120_000, context_window=100_000,
+        context_percent=120.0, context_estimated=True,
+    ))
+    text = _strip("\n".join(footer.render(160)))
+    assert "ctx ~120k/100k (120.0%)" in text
+
+
+@pytest.mark.parametrize("percent,style", [(69, None), (70, "warning"), (90, "error"), (120, "error")])
+def test_context_threshold_color_is_applied_after_layout(percent, style):
+    metrics = _Metrics(context_tokens=percent * 1000, context_window=100_000, context_percent=percent)
+    footer, _ = _make(metrics=metrics)
+    rows = footer.render(160)
+    raw = f"ctx {percent}k/100k ({percent:.1f}%)"
+    text = "\n".join(rows)
+    assert raw in _strip(text)
+    if style:
+        assert footer._theme.fg(style, raw) in text
+
+
+@pytest.mark.parametrize("width", [24, 40, 80, 180])
+def test_cjk_width_keeps_metrics_and_plan_permission_indicators(width):
+    footer, _ = _make(
+        cwd="G:/项目/非常长的中文工作目录/另一个目录",
+        plan_phase="recovery_error", permission_mode="full_access",
+        metrics=_Metrics(input_tokens=2_000_000, cache_hit_rate=80,
+                         context_tokens=120_000, context_window=100_000, context_percent=120),
+        tokens_out=20_000, cost=1.2,
+    )
+    rows = footer.render(width)
+    text = _strip("\n".join(rows))
+    assert "plan recovery" in text
+    assert "bypass on" in text or "bypass permissions on" in text
+    assert "cache 80.0%" in text
+    assert "ctx 120k/100k (120.0%)" in text
+    assert "in=2.0m out=20k" in text
+    assert "$1.2000" in text
+    assert all(visible_width(row) == width for row in rows)
+    assert "\x1b" not in _strip(text)
+
+
+def test_wide_footer_retains_single_inline_row():
+    footer, _ = _make(metrics=_Metrics(cache_hit_rate=20), plan_phase="ready", permission_mode="ask")
+    rows = footer.render(180)
+    assert len(rows) == 1
+    assert visible_width(rows[0]) == 180
 
 
 # ── git branch ─────────────────────────────────────────────────────────

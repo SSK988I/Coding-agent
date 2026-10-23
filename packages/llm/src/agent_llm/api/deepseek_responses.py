@@ -190,7 +190,7 @@ def _calculate_cost(model: Model, usage: Usage) -> UsageCost:
 
 def parse_usage(raw: Any, model: Model) -> Usage:
     if raw is None:
-        return Usage()
+        return Usage(cache_read_reported=False)
     input_total = int(getattr(raw, "input_tokens", 0) or 0)
     input_details = getattr(raw, "input_tokens_details", None)
     cache_read = int(getattr(input_details, "cached_tokens", 0) or 0)
@@ -203,6 +203,7 @@ def parse_usage(raw: Any, model: Model) -> Usage:
         cache_read=cache_read,
         reasoning=reasoning,
         total_tokens=int(getattr(raw, "total_tokens", input_total + output) or 0),
+        cache_read_reported=getattr(input_details, "cached_tokens", None) is not None,
     )
     usage.cost = _calculate_cost(model, usage)
     return usage

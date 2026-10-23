@@ -292,6 +292,8 @@ uv run coding-agent --provider zhipu --model glm-5v-turbo `
 
 ## 会话与配置
 
+桌面输入框下方和 TUI 底栏显示缓存命中率、当前上下文用量／容量、累计输入输出和费用估算；`/session` 可查看详情。非交互文本模式将用量摘要写入 stderr，不影响 stdout 或 JSON 输出。缺失数据使用 `—`，估算容量带“约”标识。计算口径见[用量指标](docs/specs/usage-metrics.md)。
+
 默认数据目录为 `~/.coding-agent`，可以通过 `CODING_AGENT_HOME` 修改：
 
 ```text

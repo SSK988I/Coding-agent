@@ -12,8 +12,10 @@ import type {
   SubagentTaskPayload,
   PermissionMode,
   PermissionModePayload,
+  SessionStats,
 } from "../shared/types";
 import { PermissionPicker } from "./components/PermissionPicker";
+import { UsageMetrics } from "./components/UsageMetrics";
 import { SubagentPanel } from "./components/SubagentPanel";
 import { ToolCard } from "./components/tool-card";
 import { Workbench } from "./workbench/Workbench";
@@ -335,6 +337,7 @@ export function App() {
         planState: snapshot.planState,
         messages: snapshot.messages,
         permissionMode: snapshot.permissionMode ?? current.permissionMode,
+        stats: snapshot.stats,
       };
     });
     setTimelineState(createTimelineStateFromMessages(snapshot.messages, snapshot.sessionId));
@@ -489,6 +492,13 @@ export function App() {
     const activeSubmission = planSubmissionRef.current;
     if (type.startsWith("run.") && activeSubmission?.runId
       && envelope.runId !== activeSubmission.runId) return;
+    if ((type === "session.statsChanged" || type === "run.completed"
+      || type === "run.cancelled" || type === "run.failed")
+      && envelope.sessionId === workspaceSessionIdRef.current
+      && payload.stats && typeof payload.stats === "object") {
+      setWorkspace((current) => current && current.sessionId === envelope.sessionId
+        ? { ...current, stats: payload.stats as SessionStats } : current);
+    }
     if (type === "run.started") {
       const submission = planSubmissionRef.current;
       if (submission && !submission.runId) submission.runId = envelope.runId;
@@ -701,7 +711,8 @@ export function App() {
         return;
       }
       if (name === "session") {
-        const snapshot = await window.agent.request<Record<string, unknown>>("session.snapshot");
+        const snapshot = await window.agent.request<SessionSnapshotPayload>("session.snapshot");
+        applySessionSnapshot(snapshot);
         addNotice(`### 当前会话\n\n\`\`\`json\n${JSON.stringify(snapshot.stats ?? {}, null, 2)}\n\`\`\``);
         return;
       }
@@ -1761,6 +1772,7 @@ export function App() {
                 )}
               </div>
             </form>
+            <UsageMetrics stats={workspace?.stats} />
           </div>
         </main>
         {workspace && <Workbench key={workspace.sessionId} workspace={workspace} open={workbenchOpen} onClose={() => setWorkbenchOpen(false)} width={workbenchWidth} onWidth={setWorkbenchWidth} sidebarOpen={sidebarOpen} />}
