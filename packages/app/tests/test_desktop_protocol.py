@@ -125,6 +125,9 @@ def test_memory_rpc_requires_confirmation_and_publishes_updated_status() -> None
     import asyncio
 
     class MemorySession:
+        def get_stats(self):
+            return {}
+
         memory_enabled = True
         memory_identity = MemoryIdentity("local-user", "project-a")
         settings_manager = None
@@ -171,6 +174,9 @@ def test_memory_v2_status_auto_extract_remember_and_queue_event() -> None:
     import asyncio
 
     class MemorySession:
+        def get_stats(self):
+            return {}
+
         memory_enabled = True
         memory_identity = MemoryIdentity("local-user", "project-a")
         memory_service = SimpleNamespace(auto_extract=True)
@@ -280,6 +286,7 @@ def test_manual_compaction_rehydrates_desktop_with_persisted_summary(tmp_path: P
     runtime._workspace = tmp_path
     runtime._session = SimpleNamespace(
         compact=compact,
+        get_stats=lambda: {},
         session_manager=SimpleNamespace(header=SimpleNamespace(id="session-compact")),
         model=SimpleNamespace(id="m", name="Model", provider="test"),
         thinking_level=None,
@@ -358,6 +365,7 @@ def test_plan_handoff_opens_fresh_review_session_after_core_persists(
     }
     target_session = SimpleNamespace(
         session_manager=target_manager,
+        get_stats=lambda: {},
         state=SimpleNamespace(messages=[]),
         model=SimpleNamespace(id="model", name="Model", provider="test"),
         thinking_level=None,

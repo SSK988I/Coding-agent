@@ -53,6 +53,7 @@ from agent_core import (
 )
 from agent_core.prompts import build_system_prompt
 from coding_agent.core.retry import RetryPolicy, retrying_stream
+from coding_agent.core.usage_metrics import UsageMetrics, project_usage_metrics
 from coding_agent.core.permissions import PERMISSION_MODES, PermissionMode, requires_approval, is_approval_safe_shell_command
 from coding_agent.core.subagents import SubagentError, SubagentManager, SubagentTool
 from coding_agent.memory.types import MemoryScope
@@ -168,6 +169,7 @@ class SessionStats:
     total_messages: int = 0
     tokens: _TokenStats = field(default_factory=lambda: _TokenStats())
     cost: float = 0.0
+    metrics: UsageMetrics = field(default_factory=UsageMetrics)
 
 
 @dataclass
@@ -323,6 +325,7 @@ class AgentSession:
         self._is_processing = False
         self._turn_index = 0
         self._last_assistant_message: AssistantMessage | None = None
+        self._usage_invalid_anchor_ids: set[int] = set()
         self._background_tasks: set = set()
 
         # ── Plan state + effective tools ─────────────────────────────────
@@ -674,9 +677,16 @@ class AgentSession:
         return prompt
 
     def _refresh_collaboration_runtime(self) -> None:
+        old_prompt = getattr(self, "_system_prompt", "")
+        old_tools = repr([(tool.name, tool.description, tool.parameters) for tool in self._tools])
         self._tools = self._effective_tools()
         self._system_prompt = self._build_effective_system_prompt()
         if hasattr(self, "_agent"):
+            new_tools = repr([(tool.name, tool.description, tool.parameters) for tool in self._tools])
+            if old_prompt != self._system_prompt or old_tools != new_tools:
+                # A past provider count does not measure a newly shaped request.
+                # Keep this display-only invalidation out of persisted history.
+                self._usage_invalid_anchor_ids = {id(message) for message in self.state.messages}
             self._agent.state.tools = list(self._tools)
             self._agent.state.system_prompt = self._system_prompt
 
@@ -1504,12 +1514,12 @@ class AgentSession:
     def set_model(self, model: Model, thinking_level: ThinkingLevel | None = None) -> None:
         """Switch the active model.
 
-        Updates both the Agent's internal model and our cached reference.
-        Does NOT rebuild tools — callers should call _refresh_tools() if
-        the model change requires different tool schemas.
+        Updates both the Agent's internal model and our cached reference, then
+        refreshes the runtime prompt/tools and their usage measurement anchors.
         """
         self._model = model
         self._agent.state.model = model
+        self._refresh_collaboration_runtime()
         # Persist model change to session.
         self.session_manager.append_model_change(
             provider=model.provider, model_id=model.id,
@@ -1682,6 +1692,11 @@ class AgentSession:
                 stats.tool_results += 1
 
         stats.total_messages = stats.user_messages + stats.assistant_messages
+        stats.metrics = project_usage_metrics(
+            messages=self.state.messages, entries=entries, model=self.model,
+            system_prompt=self.state.system_prompt or "", tools=self._tools,
+            invalid_anchor_ids=self._usage_invalid_anchor_ids,
+        )
         return stats
 
     # ── Lifecycle ─────────────────────────────────────────────────────────

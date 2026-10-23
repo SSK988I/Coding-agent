@@ -292,6 +292,8 @@ Memories are isolated by user and project. Forget and clear operations append to
 
 ## Sessions and configuration
 
+Both desktop and terminal clients show cache hit rate, current context usage/capacity, cumulative input/output tokens and estimated cost. Text print mode writes a usage summary to stderr; JSON output stays machine-readable. Missing cache data shows `—`, and estimated context values are marked. See [usage metrics](docs/specs/usage-metrics.md) for calculation and recovery behavior.
+
 The default data directory is `~/.coding-agent`. Override it with `CODING_AGENT_HOME`:
 
 ```text

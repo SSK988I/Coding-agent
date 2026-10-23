@@ -1094,6 +1094,7 @@ class InteractiveMode:
             return self.theme.fg("dim", text)
 
         stats = self._session.get_stats()
+        metrics = stats.metrics
         name = self._session.session_manager.get_name()
 
         lines: list[str] = [bold("Session Info"), ""]
@@ -1108,13 +1109,27 @@ class InteractiveMode:
         lines.append(f"{dim('Tool Results:')} {stats.tool_results}")
         lines.append(f"{dim('Total:')} {stats.total_messages}")
         lines += ["", bold("Tokens")]
-        lines.append(f"{dim('Input:')} {stats.tokens.input:,}")
+        lines.append(f"{dim('累计输入（含缓存）:')} {metrics.input_tokens:,}")
+        lines.append(f"{dim('未命中缓存的输入:')} {stats.tokens.input:,}")
         lines.append(f"{dim('Output:')} {stats.tokens.output:,}")
         if stats.tokens.cache_read > 0:
             lines.append(f"{dim('Cache Read:')} {stats.tokens.cache_read:,}")
         if stats.tokens.cache_write > 0:
             lines.append(f"{dim('Cache Write:')} {stats.tokens.cache_write:,}")
         lines.append(f"{dim('Total:')} {stats.tokens.total:,}")
+        cache_rate = metrics.cache_hit_rate
+        cache_label = f"{cache_rate:.1f}%" if cache_rate is not None else "—（暂无用量或供应商未完整提供缓存统计）"
+        lines.append(f"{dim('缓存命中率（当前分支累计）:')} {cache_label}")
+        used = metrics.context_tokens
+        limit = metrics.context_window
+        context_label = f"{used:,}" if used is not None else "—"
+        if used is not None and metrics.context_estimated:
+            context_label = f"约 {context_label}"
+        context_label += f" / {limit:,}" if limit else " / —"
+        pct = metrics.context_percent
+        if pct is not None:
+            context_label += f"（{pct:.1f}%）"
+        lines.append(f"{dim('上下文容量使用:')} {context_label}")
         if stats.cost > 0:
             lines += ["", bold("Cost")]
             lines.append(f"{dim('Total:')} {stats.cost:.4f}")

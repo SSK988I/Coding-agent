@@ -88,6 +88,9 @@ class Usage:
     reasoning: int | None = None
     total_tokens: int = 0
     cost: UsageCost = field(default_factory=UsageCost)
+    # True includes an explicitly reported zero. False means the provider did
+    # not report cache usage; None preserves unknown legacy/custom usage.
+    cache_read_reported: bool | None = None
 
 
 # ─── Content block ─────────────────────────────────────────────────────

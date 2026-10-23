@@ -1,18 +1,7 @@
-"""FooterComponent — status bar showing cwd, git branch, model, thinking, tokens.
+"""Status footer using the session's shared cache/context metrics.
 
-Renders a compact single-line status bar at the bottom of the TUI with session
-statistics:
-
-    ``<cwd> (<branch>) | <model> • thinking <level> | in/out/ctx% | $cost``
-
-Layout choices (see plan):
-  - git branch is resolved via a subprocess and cached on the instance; the
-    caller calls ``refresh()`` on meaningful events (model/thinking change,
-    new message) rather than every frame.
-  - context-window usage is the *last* assistant message's ``usage.input``
-    divided by ``model.context_window`` (NOT the cumulative session total,
-    which would only ever grow past 100%). Color-coded: <70% normal,
-    <90% warning, >=90% error.
+Wide terminals retain an inline status bar. Narrow terminals give metrics
+additional rows so neither Plan recovery nor permission indicators disappear.
 """
 from __future__ import annotations
 
@@ -22,10 +11,11 @@ from typing import Any
 
 from agent_tui import Component
 from agent_tui.theme import Theme
+from agent_tui.utils import truncate_to_width, visible_width, wrap_text_with_ansi
 
 
 class FooterComponent(Component):
-    """One-line status bar at the bottom of the TUI."""
+    """Responsive status bar at the bottom of the TUI."""
 
     def __init__(self, session: Any, theme: Theme) -> None:
         self._session = session
@@ -66,7 +56,10 @@ class FooterComponent(Component):
     # ── render ──────────────────────────────────────────────────────────
 
     def render(self, width: int) -> list[str]:
+        if width <= 0:
+            return [""]
         stats = self._session.get_stats()
+        metrics = stats.metrics
         model = self._session.model
 
         cwd = self._format_cwd(getattr(self._session, "cwd", "."))
@@ -92,55 +85,49 @@ class FooterComponent(Component):
             else "permissions ask" if permission_mode == "ask" else ""
         )
 
-        # Token stats + context usage.
-        token_part = ""
-        if stats.tokens.total > 0:
-            token_part = (
-                f"in={_fmt_num(stats.tokens.input)} "
-                f"out={_fmt_num(stats.tokens.output)}"
-            )
-            ctx = self._context_percent(model, stats)
-            if ctx is not None:
-                token_part += f" · ctx {ctx:.0f}%"
-
+        # Ratios and current context are projected centrally. In particular,
+        # cumulative input includes cache reads/writes; context is not a sum.
+        cache_rate = metrics.cache_hit_rate
+        cache_part = f"cache {cache_rate:.1f}%" if cache_rate is not None else "cache —"
+        context_part = _context_label(metrics)
+        token_part = (
+            f"in={_fmt_num(metrics.input_tokens)} "
+            f"out={_fmt_num(stats.tokens.output)}"
+        )
         cost_part = f"${stats.cost:.4f}" if stats.cost > 0 else ""
-        if len(" | ".join(p for p in (mode_part, permission_part) if p)) > width:
+        if visible_width(" | ".join(p for p in (mode_part, permission_part) if p)) > width:
             permission_part = "bypass on" if permission_mode == "full_access" else permission_part
-        extra_status = ""
-        if mode_part and permission_part and len(mode_part) + len(permission_part) + 3 > width:
-            extra_status = permission_part[:width]
-            permission_part = ""
-
-        # Join with separators.  Wide terminals retain the existing inline
-        # order.  On narrow terminals, keep the Plan recovery/lifecycle label
-        # visible even when a long cwd would otherwise consume the whole row.
-        parts = [p for p in (left, mode_part, permission_part, model_part, token_part, cost_part) if p]
-        line = " | ".join(parts)
-
-        status_part = " | ".join(p for p in (mode_part, permission_part) if p)
-        if len(line) > width and status_part:
-            suffix = f" | {status_part}"
-            if len(suffix) < width:
-                line = left[: width - len(suffix)] + suffix
-            else:
-                line = status_part[:width]
-
-        # Colorize the context marker if present.
-        line = self._colorize_context(line, model, stats)
-
-        if len(line) > width:
-            # Plain truncation (post-color is messy; truncate the joined text
-            # before colorize instead — but ctx coloring is applied above on
-            # the full line, so fall back to a simple width cut).
-            line = line[:width]
+        header_parts = [p for p in (left, mode_part, permission_part, model_part) if p]
+        metric_parts = [p for p in (cache_part, context_part, token_part, cost_part) if p]
+        full_line = " | ".join(header_parts + metric_parts)
+        if visible_width(full_line) <= width:
+            rows = [full_line]
         else:
-            line = line.ljust(width)
-        if permission_mode == "full_access" and permission_part:
-            line = line.replace(permission_part, self._theme.fg("warning", permission_part))
-        rows = [self._theme.fg("dim", line)]
-        if extra_status:
-            rows.append(self._theme.fg("warning", extra_status.ljust(width)))
-        return rows
+            header = " | ".join(header_parts)
+            status = " | ".join(p for p in (mode_part, permission_part) if p)
+            if visible_width(header) <= width:
+                rows = [header]
+            elif status and visible_width(status) <= width:
+                available = width - visible_width(status) - 3
+                rows = [
+                    f"{truncate_to_width(left, available)} | {status}"
+                    if available > 0 else status
+                ]
+            elif status:
+                rows = _pack_parts([p for p in (mode_part, permission_part) if p], width)
+            else:
+                rows = [truncate_to_width(header, width)]
+            rows.extend(_pack_parts(metric_parts, width))
+
+        rendered = []
+        for row in rows:
+            # Color only after layout; ANSI escape sequences are never sliced
+            # as text and CJK project paths occupy their real terminal width.
+            row = self._colorize_context(row, metrics, context_part)
+            if permission_mode == "full_access" and permission_part:
+                row = row.replace(permission_part, self._theme.fg("warning", permission_part))
+            rendered.append(self._theme.fg("dim", truncate_to_width(row, width, pad=True)))
+        return rendered
 
     # ── helpers ─────────────────────────────────────────────────────────
 
@@ -165,46 +152,11 @@ class FooterComponent(Component):
             return "plan"
         return ""
 
-    def _context_percent(self, model: Any, stats: Any) -> "float | None":
-        """Current context-window occupancy as a percentage.
-
-        Uses the *last* assistant message's input token count as the
-        numerator (that reflects the context size at the most recent call),
-        NOT the cumulative session total. Falls back to None when unknown.
-        """
-        cw = getattr(model, "context_window", 0) if model else 0
-        if not cw:
-            return None
-        last_input = self._last_input_tokens()
-        if last_input is None:
-            return None
-        return (last_input / cw) * 100.0
-
-    def _last_input_tokens(self) -> "int | None":
-        """Input tokens of the most recent assistant message, or None."""
-        try:
-            entries = self._session.session_manager.get_branch()
-        except Exception:
-            return None
-
-        for entry in reversed(entries):
-            message = getattr(entry, "message", None)
-            if message is None:
-                continue
-            if getattr(message, "role", None) != "assistant":
-                continue
-            usage = getattr(message, "usage", None)
-            if usage is not None:
-                return int(getattr(usage, "input", 0) or 0)
-        return None
-
-    def _colorize_context(self, line: str, model: Any, stats: Any) -> str:
-        """Wrap the ``ctx NN%`` token in warning/error color by threshold."""
-        pct = self._context_percent(model, stats)
+    def _colorize_context(self, line: str, metrics: Any, raw: str) -> str:
+        """Highlight context capacity at 70% (warning) / 90% (error)."""
+        pct = metrics.context_percent
         if pct is None:
             return line
-        # Build the raw token (matches what render() wrote) and recolor.
-        raw = f"ctx {pct:.0f}%"
         if raw not in line:
             return line
         if pct >= 90:
@@ -235,3 +187,34 @@ def _fmt_num(n: int) -> str:
     if n >= 1_000:
         return f"{n / 1_000:.0f}k"
     return str(n)
+
+
+def _context_label(metrics: Any) -> str:
+    """Format, without recomputing, the shared context occupancy snapshot."""
+    used = metrics.context_tokens
+    limit = metrics.context_window
+    pct = metrics.context_percent
+    estimated = "~" if metrics.context_estimated and used is not None else ""
+    capacity = f"{_fmt_num(used) if used is not None else '—'}/{_fmt_num(limit) if limit else '—'}"
+    percentage = f" ({pct:.1f}%)" if pct is not None else ""
+    return f"ctx {estimated}{capacity}{percentage}"
+
+
+def _pack_parts(parts: list[str], width: int) -> list[str]:
+    """Wrap complete status groups where possible, without dropping metrics."""
+    rows: list[str] = []
+    current = ""
+    for part in parts:
+        candidate = f"{current} | {part}" if current else part
+        if visible_width(candidate) <= width:
+            current = candidate
+            continue
+        if current:
+            rows.append(current)
+            current = ""
+        wrapped = wrap_text_with_ansi(part, width)
+        rows.extend(wrapped[:-1])
+        current = wrapped[-1]
+    if current:
+        rows.append(current)
+    return rows

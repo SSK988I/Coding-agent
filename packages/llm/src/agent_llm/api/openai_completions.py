@@ -210,6 +210,10 @@ def parse_chunk_usage(raw: Any, model: Model) -> Usage:
 
     cache_read = 0
     ptd = getattr(raw, "prompt_tokens_details", None)
+    cache_read_reported = (
+        getattr(ptd, "cached_tokens", None) is not None
+        or getattr(raw, "prompt_cache_hit_tokens", None) is not None
+    )
     if ptd is not None:
         cache_read = getattr(ptd, "cached_tokens", 0) or 0
     if not cache_read:
@@ -230,6 +234,7 @@ def parse_chunk_usage(raw: Any, model: Model) -> Usage:
         cache_write=0,
         reasoning=reasoning_tokens,
         total_tokens=total,
+        cache_read_reported=cache_read_reported,
     )
     usage.cost = _calculate_cost(model, usage)
     return usage
