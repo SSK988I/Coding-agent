@@ -80,7 +80,8 @@ def test_committed_messages_and_turn_results_refresh_but_streaming_does_not(usag
         stats = _render(controller, snapshots)
         assert stats.assistant_messages == 1 and stats.tool_calls == 1
         assert stats.metrics.cache_hit_rate == 90
-        assert stats.metrics.context_tokens == 1100
+        # Directly restored/committed messages have no verified request binding.
+        assert stats.metrics.context_estimated is True
         committed_calls = len(snapshots)
 
         partial = AssistantMessage(content=[TextContent(text="new reply")], usage=Usage(input=99_999))
@@ -100,7 +101,7 @@ def test_committed_messages_and_turn_results_refresh_but_streaming_does_not(usag
         await session.agent._process_events({"type": "turn_end", "message": assistant, "tool_results": [result]})
         updated = _render(controller, snapshots)
         assert updated.tool_results == 1
-        assert updated.metrics.context_tokens == 1200
+        assert updated.metrics.context_tokens == stats.metrics.context_tokens + 100
         assert updated.metrics.context_estimated is True
         assert len(snapshots) == committed_calls + 1
 

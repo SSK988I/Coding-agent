@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import json
 import sys
 import time
 import uuid
@@ -325,7 +327,6 @@ class AgentSession:
         self._is_processing = False
         self._turn_index = 0
         self._last_assistant_message: AssistantMessage | None = None
-        self._usage_invalid_anchor_ids: set[int] = set()
         self._background_tasks: set = set()
 
         # ── Plan state + effective tools ─────────────────────────────────
@@ -677,16 +678,9 @@ class AgentSession:
         return prompt
 
     def _refresh_collaboration_runtime(self) -> None:
-        old_prompt = getattr(self, "_system_prompt", "")
-        old_tools = repr([(tool.name, tool.description, tool.parameters) for tool in self._tools])
         self._tools = self._effective_tools()
         self._system_prompt = self._build_effective_system_prompt()
         if hasattr(self, "_agent"):
-            new_tools = repr([(tool.name, tool.description, tool.parameters) for tool in self._tools])
-            if old_prompt != self._system_prompt or old_tools != new_tools:
-                # A past provider count does not measure a newly shaped request.
-                # Keep this display-only invalidation out of persisted history.
-                self._usage_invalid_anchor_ids = {id(message) for message in self.state.messages}
             self._agent.state.tools = list(self._tools)
             self._agent.state.system_prompt = self._system_prompt
 
@@ -1651,6 +1645,32 @@ class AgentSession:
 
     # ── Statistics ────────────────────────────────────────────────────────
 
+    def _usage_context_fingerprint(self, model: Model, prompt: str | None, tools: list | None, reasoning: Any) -> str | None:
+        """Identify the request's input configuration without storing credentials.
+
+        Provider-native adapters may rewrite this input, so compare the same
+        pre-adapter configuration and policy for both requests and live stats.
+        The digest stays on the live response only, never in JSONL history.
+        """
+        payload = {
+            "model": {key: getattr(model, key, None) for key in ("provider", "id", "api", "base_url", "compat")},
+            "prompt": prompt or "",
+            "tools": [
+                {"name": tool.name, "description": tool.description, "parameters": tool.parameters}
+                for tool in (tools or [])
+            ],
+            "reasoning": reasoning or None,
+            "mode": self.collaboration_mode,
+            "phase": self.plan_state.phase,
+            "webSearch": self.web_search_enabled,
+            "permission": self.permission_mode,
+        }
+        try:
+            encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        except (TypeError, ValueError):
+            return None
+        return hashlib.sha256(encoded.encode("ascii")).hexdigest()
+
     def get_stats(self) -> SessionStats:
         """Compute session statistics from session entries.
 
@@ -1692,10 +1712,16 @@ class AgentSession:
                 stats.tool_results += 1
 
         stats.total_messages = stats.user_messages + stats.assistant_messages
+        fingerprint = self._usage_context_fingerprint(
+            self.model, self.state.system_prompt, self.state.tools, self.agent.reasoning,
+        )
         stats.metrics = project_usage_metrics(
             messages=self.state.messages, entries=entries, model=self.model,
-            system_prompt=self.state.system_prompt or "", tools=self._tools,
-            invalid_anchor_ids=self._usage_invalid_anchor_ids,
+            system_prompt=self.state.system_prompt or "", tools=self.state.tools,
+            valid_anchor_ids={
+                id(message) for message in self.state.messages
+                if fingerprint is not None and getattr(message, "_usage_context_fingerprint", None) == fingerprint
+            },
         )
         return stats
 
@@ -1871,11 +1897,27 @@ class AgentSession:
                         messages=context.messages,
                         tools=effective_context.tools,
                     )
-                return stream_simple(
+                # Freeze before starting the producer: tool schemas and policy
+                # may change while this response (or another memory task) runs.
+                fingerprint = self._usage_context_fingerprint(
+                    model, context.system_prompt, context.tools, effective_options.get("reasoning"),
+                )
+                inner = stream_simple(
                     model,
                     effective_context,
                     cast(Any, effective_options or None),
                 )
+                if not isolated and fingerprint is not None:
+                    def bind_usage(result: asyncio.Future[AssistantMessage]) -> None:
+                        if not result.cancelled():
+                            setattr(result.result(), "_usage_context_fingerprint", fingerprint)
+
+                    result = inner.result()
+                    if result.done():
+                        bind_usage(result)
+                    else:
+                        result.add_done_callback(bind_usage)
+                return inner
 
             def attempt():
                 # Authorization belongs inside the retry factory: the host can

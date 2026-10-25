@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import Future
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
@@ -274,7 +275,7 @@ def test_deepseek_uses_native_search_without_exposing_duplicate_function(monkeyp
 
     def fake_stream(stream_model, stream_context, options):
         captured.update(model=stream_model, context=stream_context, options=options)
-        return object()
+        return SimpleNamespace(result=lambda: Future())
 
     monkeypatch.setattr("agent_llm.compat.stream_simple", fake_stream)
     monkeypatch.setattr(
@@ -413,7 +414,7 @@ def test_native_search_cannot_bypass_plan_or_background_context_tool_policy(monk
     captured = {}
     def fake_stream(_model, context, options):
         captured.update(context=context, options=options)
-        return object()
+        return SimpleNamespace(result=lambda: Future())
     monkeypatch.setattr("agent_llm.compat.stream_simple", fake_stream)
     monkeypatch.setattr("coding_agent.core.agent_session.retrying_stream", lambda factory, *_a, **_kw: factory())
     if phase != "memory":

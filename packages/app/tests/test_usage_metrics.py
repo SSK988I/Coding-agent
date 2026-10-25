@@ -8,7 +8,10 @@ from unittest.mock import patch
 import pytest
 from agent_core import SessionManager
 from agent_core.session.messages import CompactionSummaryMessage
-from agent_llm import AssistantMessage, ImageContent, Model, ModelCost, TextContent, ToolResultMessage, Usage, UserMessage
+from agent_llm import (
+    AssistantMessage, AssistantMessageEventStream, ImageContent, Model, ModelCost,
+    TextContent, ToolResultMessage, Usage, UserMessage,
+)
 
 from coding_agent.core.agent_session import AgentSession, AgentSessionConfig
 from coding_agent.core.messages import BashExecutionMessage, BranchSummaryMessage, CustomMessage
@@ -119,21 +122,29 @@ def test_excluded_shell_output_and_control_commands_do_not_consume_context():
     assert project([UserMessage(content="/session")]).context_tokens == 0
 
 
-def test_prompt_changes_invalidate_old_measurements_until_next_request(tmp_path):
+def test_prompt_changes_invalidate_old_measurements_until_next_request(tmp_path, monkeypatch):
+    responses = iter([assistant(), assistant(inp=500, cached=0)])
+
+    def stream(*_args):
+        result = AssistantMessageEventStream()
+        result.push({"type": "done", "reason": "stop", "message": next(responses)})
+        return result
+
+    monkeypatch.setattr("agent_llm.compat.stream_simple", stream)
     session = AgentSession(AgentSessionConfig(cwd=str(tmp_path), model=model(), tools=[], system_prompt="old prompt"))
-    old = assistant()
-    session.session_manager.append_message(old)
-    session.agent.load_messages([old])
-    try:
+
+    async def exercise():
+        await session.prompt("first request")
         assert session.get_stats().metrics.context_estimated is False
         session._config.system_prompt = "different prompt" * 100
         session._refresh_collaboration_runtime()
         assert session.get_stats().metrics.context_estimated is True
-        new = assistant(inp=500, cached=0)
-        session.session_manager.append_message(new)
-        session.agent.load_messages([old, new])
+        await session.prompt("new request")
         assert session.get_stats().metrics.context_estimated is False
         assert session.get_stats().metrics.context_tokens == 600
+
+    try:
+        asyncio.run(exercise())
     finally:
         session.dispose()
 
@@ -147,7 +158,7 @@ def test_session_stats_restore_and_branch_switch_follow_active_history(tmp_path)
     session = AgentSession(AgentSessionConfig(cwd=str(tmp_path), model=model(), tools=[], session_manager=restored))
     try:
         assert session.get_stats().metrics.cache_hit_rate == 90
-        assert session.get_stats().metrics.context_tokens == 1100
+        assert session.get_stats().metrics.context_estimated is True
         restored.leaf_id = root.id
         session.agent.load_messages(restored.build_session_context().messages)
         assert session.get_stats().metrics.cache_hit_rate is None

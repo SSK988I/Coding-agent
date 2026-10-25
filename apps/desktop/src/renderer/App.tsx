@@ -277,6 +277,7 @@ export function App() {
   const activeCompactionId = useRef<string | null>(null);
   const compactingRef = useRef(false);
   const workspaceSessionIdRef = useRef<string | null>(null);
+  const workspaceGenerationRef = useRef(0);
 
   const refreshSessions = async () => {
     try {
@@ -295,6 +296,7 @@ export function App() {
   };
 
   const applyWorkspace = (payload: WorkspacePayload, restoreTimeline = true) => {
+    workspaceGenerationRef.current += 1;
     if (restoreTimeline) {
       // RPC results are already authoritative. A snapshot queued for the old
       // session must not undo a successful switch in the next animation frame.
@@ -715,8 +717,21 @@ export function App() {
         return;
       }
       if (name === "session") {
-        const snapshot = await window.agent.request<SessionSnapshotPayload>("session.snapshot");
-        applySessionSnapshot(snapshot);
+        const owner = workspaceSessionIdRef.current;
+        const generation = workspaceGenerationRef.current;
+        if (!owner) return;
+        let snapshot: SessionSnapshotPayload;
+        try {
+          snapshot = await window.agent.request<SessionSnapshotPayload>("session.snapshot");
+        } catch (reason) {
+          if (sessionNavigationRef.current || workspaceSessionIdRef.current !== owner
+            || workspaceGenerationRef.current !== generation) return;
+          throw reason;
+        }
+        if (sessionNavigationRef.current || workspaceSessionIdRef.current !== owner
+          || workspaceGenerationRef.current !== generation || snapshot.sessionId !== owner) return;
+        // A read-only usage query must not replace renderer-local timeline items.
+        setWorkspace((current) => current?.sessionId === owner ? { ...current, stats: snapshot.stats } : current);
         addNotice(`### 当前会话\n\n\`\`\`json\n${JSON.stringify(snapshot.stats ?? {}, null, 2)}\n\`\`\``);
         return;
       }
@@ -1262,6 +1277,7 @@ export function App() {
     if (running || compacting || !workspace || sessionNavigationRef.current
       || (sessionId && sessionId === workspaceSessionIdRef.current)) return;
     sessionNavigationRef.current = true;
+    workspaceGenerationRef.current += 1;
     setPendingSessionNavigation(sessionId ?? "new");
     setError(null);
     try {

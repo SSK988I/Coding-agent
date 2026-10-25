@@ -40,7 +40,7 @@ def _message_tokens(message: Any) -> int:
 
 def project_usage_metrics(
     *, messages: list, entries: list, model: Any, system_prompt: str, tools: list,
-    invalid_anchor_ids: set[int] | None = None,
+    valid_anchor_ids: set[int] | None = None,
 ) -> UsageMetrics:
     result = UsageMetrics()
     cached = 0
@@ -55,8 +55,11 @@ def project_usage_metrics(
         if getattr(message, "role", None) != "assistant":
             continue
         anchor_ids.add(id(message))
+        completed = getattr(message, "stop_reason", "stop") not in {"error", "aborted"}
         usage = getattr(message, "usage", None)
         if usage is None:
+            if completed:
+                cache_complete = False
             continue
         inp = max(0, int(getattr(usage, "input", 0) or 0))
         read = max(0, int(getattr(usage, "cache_read", 0) or 0))
@@ -65,7 +68,7 @@ def project_usage_metrics(
         result.input_tokens += total_input
         cached += read
         reported = getattr(usage, "cache_read_reported", None)
-        if total_input and not (reported is True or (reported is None and read > 0)):
+        if (total_input or completed) and not (reported is True or (reported is None and read > 0)):
             cache_complete = False
     if result.input_tokens and cache_complete:
         result.cache_hit_rate = cached / result.input_tokens * 100
@@ -76,7 +79,7 @@ def project_usage_metrics(
     used = 0
     for index in range(len(messages) - 1, -1, -1):
         message = messages[index]
-        if (id(message) not in anchor_ids or id(message) in (invalid_anchor_ids or ())
+        if (id(message) not in anchor_ids or (valid_anchor_ids is not None and id(message) not in valid_anchor_ids)
                 or getattr(message, "stop_reason", "stop") in {"error", "aborted"}):
             continue
         if (getattr(message, "model", None), getattr(message, "provider", None)) != (

@@ -43,7 +43,11 @@ describe("desktop authoritative session usage", () => {
       if (method === "session.new") return workspace("session-3");
       if (method === "session.snapshot") return workspace("session-1", stats(35));
       if (method === "session.list") return [{ id: "session-2", name: "Other session", message_count: 0 }];
-      if (method === "command.list") return [{ name: "plan", label: "Plan", description: "Plan" }];
+      if (method === "command.list") return [
+        { name: "plan", label: "Plan", description: "Plan" },
+        { name: "help", label: "Help", description: "Show commands" },
+        { name: "session", label: "Session", description: "Show session usage" },
+      ];
       return {};
     });
     window.agent = { request, onEvent: (cb) => { listener = cb; return () => undefined; }, onStatus: () => () => undefined };
@@ -74,6 +78,159 @@ describe("desktop authoritative session usage", () => {
     fireEvent.click(screen.getByRole("button", { name: "■ 停止" }));
     await waitFor(() => expect(request).toHaveBeenCalledWith("session.snapshot"));
     await waitFor(() => expect(screen.getByTestId("cache-hit-rate")).toHaveTextContent("35%"));
+  });
+
+  it("refreshes /session usage without removing help or previous local session output", async () => {
+    mount();
+    const composer = await screen.findByPlaceholderText("描述你想完成的任务…");
+    fireEvent.change(composer, { target: { value: "/help" } });
+    fireEvent.submit(composer.closest("form")!);
+    expect(await screen.findByRole("heading", { name: "可用命令" })).toBeInTheDocument();
+
+    fireEvent.change(composer, { target: { value: "/session" } });
+    fireEvent.submit(composer.closest("form")!);
+    await screen.findByRole("heading", { name: "当前会话" });
+    expect(screen.getByRole("heading", { name: "可用命令" })).toBeInTheDocument();
+    expect(screen.getByTestId("cache-hit-rate")).toHaveTextContent("35%");
+
+    fireEvent.change(composer, { target: { value: "/session" } });
+    fireEvent.submit(composer.closest("form")!);
+    await waitFor(() => expect(screen.getAllByRole("heading", { name: "当前会话" })).toHaveLength(2));
+    expect(screen.getByRole("heading", { name: "可用命令" })).toBeInTheDocument();
+  });
+
+  it.each(["resolve", "reject"])("ignores a delayed /session %s after switching sessions", async (outcome) => {
+    let resolveSnapshot: ((value: WorkspacePayload) => void) | undefined;
+    let rejectSnapshot: ((reason: Error) => void) | undefined;
+    const fallback = request.getMockImplementation()!;
+    request.mockImplementation((method: string) => method === "session.snapshot"
+      ? new Promise<WorkspacePayload>((resolve, reject) => { resolveSnapshot = resolve; rejectSnapshot = reject; })
+      : fallback(method));
+    mount();
+    const composer = await screen.findByPlaceholderText("描述你想完成的任务…");
+    fireEvent.change(composer, { target: { value: "/session" } });
+    fireEvent.submit(composer.closest("form")!);
+    await waitFor(() => expect(request).toHaveBeenCalledWith("session.snapshot"));
+    fireEvent.click(await screen.findByRole("button", { name: /Other session/ }));
+    await waitFor(() => expect(screen.getByTestId("cache-hit-rate")).toHaveTextContent("75%"));
+
+    await act(async () => {
+      if (outcome === "resolve") resolveSnapshot?.(workspace("session-1", stats(99)));
+      else rejectSnapshot?.(new Error("old session request failed"));
+    });
+
+    expect(screen.getByTestId("cache-hit-rate")).toHaveTextContent("75%");
+    expect(screen.queryByRole("heading", { name: "当前会话" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it.each(["resolve", "reject"])("ignores an old /session %s after navigating away and back", async (outcome) => {
+    let resolveSnapshot: ((value: WorkspacePayload) => void) | undefined;
+    let rejectSnapshot: ((reason: Error) => void) | undefined;
+    const fallback = request.getMockImplementation()!;
+    request.mockImplementation((method: string, params?: { sessionId?: string }) => {
+      if (method === "session.snapshot") return new Promise<WorkspacePayload>((resolve, reject) => {
+        resolveSnapshot = resolve;
+        rejectSnapshot = reject;
+      });
+      if (method === "session.list") return [
+        { id: "session-1", name: "Original session", message_count: 0 },
+        { id: "session-2", name: "Other session", message_count: 0 },
+      ];
+      if (method === "session.open") return workspace(params?.sessionId, stats(75));
+      return fallback(method);
+    });
+    mount();
+    const composer = await screen.findByPlaceholderText("描述你想完成的任务…");
+    fireEvent.change(composer, { target: { value: "/session" } });
+    fireEvent.submit(composer.closest("form")!);
+    await waitFor(() => expect(request).toHaveBeenCalledWith("session.snapshot"));
+    fireEvent.click(await screen.findByRole("button", { name: /Other session/ }));
+    await waitFor(() => expect(screen.getByRole("button", { name: /Other session/ })).toHaveAttribute("aria-current", "true"));
+    fireEvent.click(screen.getByRole("button", { name: /Original session/ }));
+    await waitFor(() => expect(screen.getByRole("button", { name: /Original session/ })).toHaveAttribute("aria-current", "true"));
+
+    await act(async () => {
+      if (outcome === "resolve") resolveSnapshot?.(workspace("session-1", stats(99)));
+      else rejectSnapshot?.(new Error("obsolete session request failed"));
+    });
+
+    expect(screen.getByTestId("cache-hit-rate")).toHaveTextContent("75%");
+    expect(screen.queryByRole("heading", { name: "当前会话" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("ignores an old /session result after session events leave and return", async () => {
+    let resolveSnapshot: ((value: WorkspacePayload) => void) | undefined;
+    const fallback = request.getMockImplementation()!;
+    request.mockImplementation((method: string) => method === "session.snapshot"
+      ? new Promise<WorkspacePayload>((resolve) => { resolveSnapshot = resolve; }) : fallback(method));
+    mount();
+    const composer = await screen.findByPlaceholderText("描述你想完成的任务…");
+    fireEvent.change(composer, { target: { value: "/session" } });
+    fireEvent.submit(composer.closest("form")!);
+    await waitFor(() => expect(request).toHaveBeenCalledWith("session.snapshot"));
+    await emit("session.changed", workspace("session-2", stats(40)) as unknown as Record<string, unknown>, "session-2");
+    await emit("session.changed", workspace("session-1", stats(75)) as unknown as Record<string, unknown>);
+
+    await act(async () => { resolveSnapshot?.(workspace("session-1", stats(99))); });
+
+    expect(screen.getByTestId("cache-hit-rate")).toHaveTextContent("75%");
+    expect(screen.queryByRole("heading", { name: "当前会话" })).not.toBeInTheDocument();
+  });
+
+  it("ignores /session snapshots belonging to a different session", async () => {
+    const fallback = request.getMockImplementation()!;
+    request.mockImplementation((method: string) => method === "session.snapshot"
+      ? workspace("different-session", stats(99)) : fallback(method));
+    mount();
+    const composer = await screen.findByPlaceholderText("描述你想完成的任务…");
+    await act(async () => {
+      fireEvent.change(composer, { target: { value: "/session" } });
+      fireEvent.submit(composer.closest("form")!);
+    });
+
+    expect(screen.getByTestId("cache-hit-rate")).toHaveTextContent("20%");
+    expect(screen.queryByRole("heading", { name: "当前会话" })).not.toBeInTheDocument();
+  });
+
+  it("ignores /session results while session navigation is still pending", async () => {
+    let resolveSnapshot: ((value: WorkspacePayload) => void) | undefined;
+    let resolveNavigation: ((value: WorkspacePayload) => void) | undefined;
+    const fallback = request.getMockImplementation()!;
+    request.mockImplementation((method: string) => {
+      if (method === "session.snapshot") return new Promise<WorkspacePayload>((resolve) => { resolveSnapshot = resolve; });
+      if (method === "session.open") return new Promise<WorkspacePayload>((resolve) => { resolveNavigation = resolve; });
+      return fallback(method);
+    });
+    mount();
+    const composer = await screen.findByPlaceholderText("描述你想完成的任务…");
+    fireEvent.change(composer, { target: { value: "/session" } });
+    fireEvent.submit(composer.closest("form")!);
+    await waitFor(() => expect(request).toHaveBeenCalledWith("session.snapshot"));
+    fireEvent.click(await screen.findByRole("button", { name: /Other session/ }));
+    await waitFor(() => expect(request).toHaveBeenCalledWith("session.open", { sessionId: "session-2" }));
+
+    await act(async () => { resolveSnapshot?.(workspace("session-1", stats(99))); });
+
+    expect(screen.getByTestId("cache-hit-rate")).toHaveTextContent("20%");
+    expect(screen.queryByRole("heading", { name: "当前会话" })).not.toBeInTheDocument();
+    await act(async () => { resolveNavigation?.(workspace("session-2", stats(75))); });
+    expect(screen.getByTestId("cache-hit-rate")).toHaveTextContent("75%");
+  });
+
+  it("still reports a current /session request failure without changing usage", async () => {
+    const fallback = request.getMockImplementation()!;
+    request.mockImplementation((method: string) => method === "session.snapshot"
+      ? Promise.reject(new Error("current session request failed")) : fallback(method));
+    mount();
+    const composer = await screen.findByPlaceholderText("描述你想完成的任务…");
+    fireEvent.change(composer, { target: { value: "/session" } });
+    fireEvent.submit(composer.closest("form")!);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("current session request failed");
+    expect(screen.getByTestId("cache-hit-rate")).toHaveTextContent("20%");
+    expect(screen.queryByRole("heading", { name: "当前会话" })).not.toBeInTheDocument();
   });
 
   it("restores selected session metrics and ignores delayed stats from the previous session", async () => {
