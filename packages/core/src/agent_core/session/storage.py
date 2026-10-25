@@ -16,6 +16,7 @@ and occur on the session event path.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -52,6 +53,7 @@ __all__ = [
     "filename_for_session",
     "write_header_line",
     "rewrite_header_line",
+    "write_archive_state",
     "append_entry_line",
     "read_header",
     "read_entries",
@@ -382,7 +384,7 @@ def line_dict_to_entry(d: dict) -> SessionEntry:
 
 
 def header_to_dict(header: SessionHeader) -> dict:
-    return {
+    result = {
         "type": "session",
         "version": header.version,
         "id": header.id,
@@ -390,15 +392,24 @@ def header_to_dict(header: SessionHeader) -> dict:
         "cwd": header.cwd,
         "parentSession": header.parent_session,
     }
+    if header.archived:
+        # An unflushed archived session still carries its initial state when
+        # first materialized; later changes live outside the append-only log.
+        result["archived"] = True
+    return result
 
 
 def dict_to_header(d: dict) -> SessionHeader:
+    archived = d.get("archived", False)
+    if not isinstance(archived, bool):
+        raise ValueError("Session archived metadata must be a boolean")
     return SessionHeader(
         id=d.get("id", ""),
         timestamp=d.get("timestamp", ""),
         cwd=d.get("cwd", ""),
         version=int(d.get("version", 1) or 1),
         parent_session=d.get("parentSession"),
+        archived=archived,
     )
 
 
@@ -429,6 +440,33 @@ def rewrite_header_line(path: Path, header: SessionHeader) -> None:
             target.flush()
             os.fsync(target.fileno())
         os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def _archive_state_path(path: Path) -> Path:
+    # Hash the basename, never user-controlled path fragments. The sibling is
+    # short enough for Windows MAX_PATH even when the JSONL name is long.
+    identity = hashlib.sha256(os.path.normcase(path.name).encode("utf-8")).hexdigest()[:32]
+    return path.with_name(f".archive-{identity}.json")
+
+
+def write_archive_state(path: Path, archived: bool) -> None:
+    """Atomically persist visibility without rewriting a concurrent JSONL append."""
+    if not isinstance(archived, bool):
+        raise ValueError("archived must be a boolean")
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    target_path = _archive_state_path(path)
+    fd, raw_temp = tempfile.mkstemp(prefix=".archive-", suffix=".tmp", dir=path.parent)
+    temp_path = Path(raw_temp)
+    try:
+        with os.fdopen(fd, "wb") as target:
+            target.write(b"true\n" if archived else b"false\n")
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temp_path, target_path)
     finally:
         if temp_path.exists():
             temp_path.unlink()
@@ -474,7 +512,15 @@ def read_header(path: Path) -> SessionHeader | None:
             line = f.readline()
         if not line:
             return None
-        return dict_to_header(json.loads(line))
+        header = dict_to_header(json.loads(line))
+        try:
+            state = json.loads(_archive_state_path(path).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return header
+        if not isinstance(state, bool):
+            raise ValueError("Session archive metadata must be a boolean")
+        header.archived = state
+        return header
     except (OSError, ValueError):
         return None
 
@@ -595,9 +641,9 @@ def list_session_files(sessions_dir: Path) -> list[Path]:
     return files
 
 
-def build_session_info(path: Path) -> SessionInfo | None:
+def build_session_info(path: Path, *, header: SessionHeader | None = None) -> SessionInfo | None:
     """Build a SessionInfo summary by scanning a JSONL file (for /sessions)."""
-    header = read_header(path)
+    header = header if header is not None else read_header(path)
     if header is None:
         return None
     entries = read_entries(path)
@@ -650,4 +696,5 @@ def build_session_info(path: Path) -> SessionInfo | None:
         first_message=first_text,
         all_messages_text="\n".join(parts),
         name=name,
+        archived=header.archived,
     )

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,7 @@ from agent_core.session.storage import (
     session_dirs_for_cwd,
     session_file_path,
     write_header_line,
+    write_archive_state,
 )
 from agent_core.session.types import (
     CompactionEntry,
@@ -174,6 +176,7 @@ class SessionManager:
         continueRecent.
         """
         cwd = cwd or os.getcwd()
+        normalized_cwd = os.path.normcase(os.path.realpath(cwd))
         files = [
             path
             for directory in session_dirs_for_cwd(
@@ -182,11 +185,12 @@ class SessionManager:
             for path in list_session_files(directory)
         ]
         files.sort(key=lambda path: path.stat().st_mtime, reverse=True)
-        if not files:
-            return None
-        return cls.open(
-            files[0], agent_dir=agent_dir, sessions_dir=sessions_dir,
-        )
+        for path in files:
+            header = read_header(path)
+            if (header is not None and not header.archived and isinstance(header.cwd, str) and header.cwd
+                    and os.path.normcase(os.path.realpath(header.cwd)) == normalized_cwd):
+                return cls.open(path, agent_dir=agent_dir, sessions_dir=sessions_dir)
+        return None
 
     @classmethod
     def list_sessions(
@@ -195,9 +199,16 @@ class SessionManager:
         cwd: str | None = None,
         agent_dir: Path | None = None,
         sessions_dir: Path | None = None,
+        archived: bool | None = None,
     ) -> list[SessionInfo]:
-        """List sessions for this cwd, newest first."""
+        """List newest first, defaulting to all sessions for legacy callers.
+
+        Desktop lists explicitly filter active (False) or archived (True).
+        """
+        if archived is not None and not isinstance(archived, bool):
+            raise ValueError("archived must be a boolean or None")
         cwd = cwd or os.getcwd()
+        normalized_cwd = os.path.normcase(os.path.realpath(cwd))
         infos: list[SessionInfo] = []
         files = [
             path
@@ -208,7 +219,12 @@ class SessionManager:
         ]
         files.sort(key=lambda path: path.stat().st_mtime, reverse=True)
         for p in files:
-            info = build_session_info(p)
+            header = read_header(p)
+            if (header is None or not isinstance(header.cwd, str) or not header.cwd
+                    or os.path.normcase(os.path.realpath(header.cwd)) != normalized_cwd
+                    or (archived is not None and header.archived != archived)):
+                continue
+            info = build_session_info(p, header=header)
             if info is not None:
                 infos.append(info)
         return infos
@@ -333,6 +349,22 @@ class SessionManager:
         )
         self._commit(entry)
         return entry
+
+    def set_archived(self, archived: bool) -> None:
+        """Update session-wide visibility without changing history or its branch.
+
+        Persisted sessions atomically replace small sibling visibility metadata
+        before changing live state, preserving concurrent history appends.
+        Unflushed sessions retain normal first-assistant persistence semantics.
+        """
+        if not isinstance(archived, bool):
+            raise ValueError("archived must be a boolean")
+        if self.header.archived == archived:
+            return
+        header = replace(self.header, archived=archived)
+        if not self.in_memory and self.path is not None and self._flushed:
+            write_archive_state(self.path, archived)
+        self.header = header
 
     def append_collaboration_mode_change(
         self, mode: str, *, plan_id: str | None = None,

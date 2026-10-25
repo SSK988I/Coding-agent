@@ -144,6 +144,8 @@ uv run coding-agent --mode json "分析 packages/core"
 
 ### 会话恢复
 
+桌面侧栏悬停会话可点击归档图标；标题旁的归档入口可查看和恢复已归档会话。归档保留聊天记录，恢复后可继续对话；自动恢复最近会话会跳过归档记录。详见[会话归档](docs/specs/session-archive.md)。
+
 ```powershell
 # 恢复当前项目最近的会话
 uv run coding-agent --continue

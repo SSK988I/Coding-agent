@@ -119,6 +119,29 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #8e8a82; outli
 .session-item.active { background: var(--sidebar-active); box-shadow: none; }
 .session-item strong { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 12px; font-weight: 590; }
 .session-item span, .empty-sidebar { color: var(--muted); font-size: 10px; }
+.session-heading-actions { display: flex; align-items: center; gap: 3px; }
+.session-heading-actions .icon-button { display: grid; place-items: center; }
+.session-row { position: relative; }
+.session-row .session-item { padding-right: 40px; }
+.session-row .session-item strong { max-width: 100%; }
+.session-archive-action {
+  position: absolute; right: 5px; top: 10px; display: grid; place-items: center;
+  width: 28px; height: 28px; padding: 0; border: 0; border-radius: 6px;
+  color: var(--muted); background: var(--sidebar); cursor: pointer; opacity: 0;
+}
+.session-row:hover .session-archive-action, .session-row:focus-within .session-archive-action,
+.session-archive-action:focus-visible { opacity: 1; }
+.session-archive-action:hover { color: var(--text); background: var(--sidebar-hover); }
+.session-archive-action:disabled { cursor: wait; }
+.session-retry { margin-left: 8px; border: 0; background: transparent; color: inherit; text-decoration: underline; cursor: pointer; }
+.session-archive-banner {
+  display: flex; align-items: center; gap: 10px; padding: 12px 14px;
+  border: 1px solid var(--line); border-radius: 10px; background: var(--surface); color: var(--muted);
+}
+.session-archive-banner div { display: flex; flex: 1; flex-direction: column; gap: 3px; font-size: 12px; }
+.session-archive-banner strong { color: var(--text); font-weight: 550; }
+.session-plan-controls { display: contents; }
+@media (hover: none) { .session-archive-action { opacity: 1; } }
 .empty-sidebar { padding: 12px 10px; line-height: 1.6; }
 .workspace-meta {
   margin: 8px;
