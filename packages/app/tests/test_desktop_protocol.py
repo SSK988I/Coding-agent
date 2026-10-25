@@ -101,6 +101,11 @@ def test_to_jsonable_preserves_nested_types_and_container_ownership(tmp_path: Pa
     })
     expected = to_jsonable(dataclasses.asdict(payload))
     actual = to_jsonable(payload)
+    # Copying a set can change its iteration order; only ordered containers
+    # have an order-preservation contract.
+    for field in ("set", "frozen"):
+        for projection in (actual, expected):
+            projection["values"][field].sort(key=repr)
     assert actual == expected
     values = actual["values"]
     assert values["1"] == [{"items": [1, False, None]}]
