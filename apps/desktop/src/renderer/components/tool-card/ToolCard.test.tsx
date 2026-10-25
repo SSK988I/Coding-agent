@@ -58,6 +58,75 @@ describe("tool renderer registry", () => {
 });
 
 describe("ToolCard", () => {
+  it.each(["read", "grep", "custom_action"])("formats %s output again only when its result changes", (name) => {
+    const result = { toJSON: vi.fn(() => ({ summary: "original result" })) };
+    const initial = tool({ name, status: "pending", result });
+    const view = render(<ToolCard tool={initial} />);
+    expect(screen.getByText(/original result/)).toBeInTheDocument();
+    expect(result.toJSON).toHaveBeenCalledTimes(1);
+
+    view.rerender(<ToolCard tool={{ ...initial, status: "running" }} />);
+    view.rerender(<ToolCard tool={{ ...initial, status: "approval", approval: {
+      approvalId: "approval-1", toolCallId: initial.id, toolName: name, args: initial.args,
+    } }} />);
+    expect(screen.getByText("等待审批")).toBeInTheDocument();
+    expect(result.toJSON).toHaveBeenCalledTimes(1);
+
+    const replacement = { toJSON: vi.fn(() => ({ summary: "replacement result" })) };
+    view.rerender(<ToolCard tool={{ ...initial, status: "done", result: replacement }} />);
+    expect(screen.getByText(/replacement result/)).toBeInTheDocument();
+    expect(screen.queryByText(/original result/)).not.toBeInTheDocument();
+    expect(result.toJSON).toHaveBeenCalledTimes(1);
+    expect(replacement.toJSON).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    [undefined, "等待文件内容…"],
+    [null, "等待文件内容…"],
+    ["", "等待文件内容…"],
+    [0, "0"],
+    [false, "false"],
+    [{ content: [{ type: "text", text: "visible text" }] }, "visible text"],
+  ])("preserves raw read output semantics for %j", (result, expected) => {
+    render(<ToolCard tool={tool({ name: "read", args: { path: "a.txt" }, result })} />);
+    expect(screen.getByText(expected as string)).toBeInTheDocument();
+  });
+
+  it("selects shallow metadata before earlier deeper matches when traversing tool data", () => {
+    const view = render(<ToolCard tool={tool({
+      name: "grep", args: { query: "needle", first: { nested: { path: "deep.txt" } }, second: { path: "near.txt" } },
+      result: "matches",
+    })} />);
+    expect(screen.getByText("near.txt")).toBeInTheDocument();
+    expect(screen.queryByText("deep.txt")).not.toBeInTheDocument();
+    view.rerender(<ToolCard tool={tool({
+      name: "grep", args: { query: "needle", nested: { path: "argument-child.txt" } },
+      result: { path: "result-root.txt", content: [{ type: "text", text: "matches" }] },
+    })} />);
+    expect(screen.getByText("result-root.txt")).toBeInTheDocument();
+    expect(screen.queryByText("argument-child.txt")).not.toBeInTheDocument();
+  });
+
+  it.each([4, 5])("keeps the metadata search depth bound at four (path depth: %s)", (depth) => {
+    let nested: Record<string, unknown> = { path: "nested.txt" };
+    for (let index = 0; index < depth; index += 1) nested = { child: nested };
+    render(<ToolCard tool={tool({ name: "grep", args: nested, result: "matches" })} />);
+    expect(screen.getByText(depth === 4 ? "nested.txt" : "当前工作区")).toBeInTheDocument();
+    if (depth === 5) expect(screen.queryByText("nested.txt")).not.toBeInTheDocument();
+  });
+
+  it("handles broad metadata arrays with cycles without mutating tool arguments", () => {
+    const children = Array.from({ length: 2000 }, () => ({ value: "unmatched" } as Record<string, unknown>));
+    children.push({ path: "last-child.txt" });
+    const args: Record<string, unknown> = { query: "needle", children };
+    args.self = args;
+    render(<ToolCard tool={tool({ name: "grep", args, result: "matches" })} />);
+    expect(screen.getByText("last-child.txt")).toBeInTheDocument();
+    expect(args.self).toBe(args);
+    expect(args.children).toBe(children);
+    expect(children).toHaveLength(2001);
+  });
+
   it("shows shell command and cwd and can collapse its output", () => {
     render(<ToolCard tool={tool()} />);
 

@@ -37,6 +37,27 @@ export interface WorkspacePayload {
   planState: PlanStatePayload;
   memory: MemoryStatePayload;
   subagents?: SubagentTaskPayload[];
+  stats?: SessionStats;
+}
+
+export interface SessionStats {
+  tokens: {
+    input: number;
+    output: number;
+    cache_read: number;
+    cache_write: number;
+    total: number;
+  };
+  cost: number;
+  // Older backends provide token totals without the derived metrics.
+  metrics?: {
+    cache_hit_rate: number | null;
+    input_tokens: number;
+    context_tokens: number | null;
+    context_window: number | null;
+    context_percent: number | null;
+    context_estimated: boolean;
+  };
 }
 
 export interface SubagentTaskPayload {
@@ -136,7 +157,7 @@ export interface SessionSnapshotPayload {
   permissionMode?: PermissionMode;
   sessionId: string;
   messages: AgentMessage[];
-  stats: Record<string, unknown>;
+  stats: SessionStats;
   collaborationMode: "default" | "plan";
   planState: PlanStatePayload;
   subagents?: SubagentTaskPayload[];

@@ -93,7 +93,6 @@ class SessionManager:
         # before the file is created we buffer entries in memory.
         self._flushed: bool = path is not None and (path.exists() if path else False)
         self._persisted_count = len(self.entries) if self._flushed else 0
-        self._buffer: list[SessionEntry] = [] if not self._flushed else list(self.entries)
 
     # ─── factories ─────────────────────────────────────────────────────
 
@@ -630,8 +629,9 @@ class SessionManager:
 
         # 没有自然根的残余节点只能来自环或损坏数据。把其中最早的节点提升
         # 为根并迭代连接，保证 /tree 仍能展示所有可恢复条目。
-        for entry in sorted(visible_entries, key=sort_key):
-            attach_from_root(entry)
+        if len(attached_ids) < len(nodes_by_id):
+            for entry in sorted(visible_entries, key=sort_key):
+                attach_from_root(entry)
 
         return roots
 

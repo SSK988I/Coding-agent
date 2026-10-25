@@ -134,11 +134,6 @@ def estimate_context_tokens(messages: list) -> ContextUsageEstimate:
             break
 
     trailing = sum(estimate_tokens(messages[i]) for i in range((last_usage_index + 1) if last_usage_index is not None else 0, len(messages)))
-    if last_usage_index is None:
-        # No real usage: estimate the whole thing.
-        total = sum(estimate_tokens(m) for m in messages)
-        return ContextUsageEstimate(tokens=total, usage_tokens=0, trailing_tokens=total, last_usage_index=None)
-
     return ContextUsageEstimate(
         tokens=usage_tokens + trailing,
         usage_tokens=usage_tokens,

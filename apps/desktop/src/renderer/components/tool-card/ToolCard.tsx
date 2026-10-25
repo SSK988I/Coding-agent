@@ -161,8 +161,8 @@ function findString(values: readonly unknown[], keys: readonly string[], maxDept
   const seen = new Set<unknown>();
   const queue = values.map((value) => ({ value, depth: 0 }));
 
-  while (queue.length > 0) {
-    const entry = queue.shift();
+  for (let index = 0; index < queue.length; index += 1) {
+    const entry = queue[index];
     if (!entry || entry.value === null || typeof entry.value !== "object") continue;
     if (seen.has(entry.value)) continue;
     seen.add(entry.value);
@@ -402,13 +402,13 @@ function OutputBlock({
   className = "",
   emptyText = "暂无输出",
 }: {
-  value: string;
+  value: unknown;
   limit: ToolOutputLimit;
   className?: string;
   emptyText?: string;
 }) {
-  const output = useMemo(() => truncateToolOutput(value, limit), [value, limit]);
-  if (!value) return <div className="tool-card-view__empty">{emptyText}</div>;
+  const output = useMemo(() => truncateToolOutput(formatToolOutput(value), limit), [value, limit]);
+  if (!output.text) return <div className="tool-card-view__empty">{emptyText}</div>;
   return (
     <pre className={`tool-card-view__output ${className}`.trim()}>{output.text}</pre>
   );
@@ -476,7 +476,7 @@ function ReadToolRenderer({ tool, outputLimit }: ToolRendererProps) {
         <code title={path}>{path ?? "未知路径"}</code>
         {(offset || limit) && <small>{offset ? `从第 ${offset} 行` : ""}{limit ? ` · ${limit} 行` : ""}</small>}
       </div>
-      <OutputBlock value={formatToolOutput(tool.result)} limit={outputLimit} emptyText="等待文件内容…" />
+      <OutputBlock value={tool.result} limit={outputLimit} emptyText="等待文件内容…" />
     </div>
   );
 }
@@ -533,7 +533,7 @@ function SearchToolRenderer({ tool, outputLimit }: ToolRendererProps) {
         <div><dt>查找</dt><dd><code>{pattern ?? "未提供模式"}</code></dd></div>
         <div><dt>范围</dt><dd>{path ?? "当前工作区"}{glob && glob !== pattern ? ` · ${glob}` : ""}</dd></div>
       </dl>
-      <OutputBlock value={formatToolOutput(tool.result)} limit={outputLimit} emptyText="等待检索结果…" />
+      <OutputBlock value={tool.result} limit={outputLimit} emptyText="等待检索结果…" />
     </div>
   );
 }
@@ -542,7 +542,7 @@ function GenericToolRenderer({ tool, outputLimit }: ToolRendererProps) {
   return (
     <div className="tool-card-view__body">
       <OutputBlock
-        value={formatToolOutput(tool.result ?? tool.args)}
+        value={tool.result ?? tool.args}
         limit={outputLimit}
         emptyText="暂无工具数据"
       />

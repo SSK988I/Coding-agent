@@ -12,8 +12,10 @@ import type {
   SubagentTaskPayload,
   PermissionMode,
   PermissionModePayload,
+  SessionStats,
 } from "../shared/types";
 import { PermissionPicker } from "./components/PermissionPicker";
+import { UsageMetrics } from "./components/UsageMetrics";
 import { SubagentPanel } from "./components/SubagentPanel";
 import { ToolCard } from "./components/tool-card";
 import { Workbench } from "./workbench/Workbench";
@@ -30,6 +32,9 @@ import {
   type TimelineState,
   type TimelineToolItem,
 } from "./timeline/timelineState";
+
+const Markdown = memo(ReactMarkdown);
+const markdownPlugins = [remarkGfm];
 
 interface ModelOption {
   id: string;
@@ -97,9 +102,9 @@ const TimelineMessageCard = memo(function TimelineMessageCard({
             <pre>{message.thinking}</pre>
           </details>
         )}
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+        <Markdown remarkPlugins={markdownPlugins}>
           {message.text || (message.status === "streaming" ? "正在思考…" : "")}
-        </ReactMarkdown>
+        </Markdown>
       </div>
     </article>
   );
@@ -126,7 +131,7 @@ const TimelineCompactionCard = memo(function TimelineCompactionCard({
         <details>
           <summary>查看压缩摘要</summary>
           <div className="compaction-summary">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>{compaction.summary}</ReactMarkdown>
+            <Markdown remarkPlugins={markdownPlugins}>{compaction.summary}</Markdown>
           </div>
         </details>
       )}
@@ -147,7 +152,7 @@ const TimelinePlanCard = memo(function TimelinePlanCard({ plan, badge }: { plan:
         <span>revision {plan.revision} · {plan.digest.slice(0, 12)}</span>
       </div>
       <div className="plan-markdown">
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>{plan.markdown}</ReactMarkdown>
+        <Markdown remarkPlugins={markdownPlugins}>{plan.markdown}</Markdown>
       </div>
     </section>
   );
@@ -234,6 +239,7 @@ function updateTimelineItem(
 export function App() {
   const [workbenchOpen, setWorkbenchOpen] = useState(false);
   const [workbenchWidth, setWorkbenchWidth] = useState(480);
+  const closeWorkbench = useCallback(() => setWorkbenchOpen(false), []);
   const [sidecarStatus, setSidecarStatus] = useState("starting");
   const [workspace, setWorkspace] = useState<WorkspacePayload | null>(null);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
@@ -271,6 +277,7 @@ export function App() {
   const activeCompactionId = useRef<string | null>(null);
   const compactingRef = useRef(false);
   const workspaceSessionIdRef = useRef<string | null>(null);
+  const workspaceGenerationRef = useRef(0);
 
   const refreshSessions = async () => {
     try {
@@ -289,6 +296,7 @@ export function App() {
   };
 
   const applyWorkspace = (payload: WorkspacePayload, restoreTimeline = true) => {
+    workspaceGenerationRef.current += 1;
     if (restoreTimeline) {
       // RPC results are already authoritative. A snapshot queued for the old
       // session must not undo a successful switch in the next animation frame.
@@ -335,6 +343,7 @@ export function App() {
         planState: snapshot.planState,
         messages: snapshot.messages,
         permissionMode: snapshot.permissionMode ?? current.permissionMode,
+        stats: snapshot.stats,
       };
     });
     setTimelineState(createTimelineStateFromMessages(snapshot.messages, snapshot.sessionId));
@@ -489,6 +498,13 @@ export function App() {
     const activeSubmission = planSubmissionRef.current;
     if (type.startsWith("run.") && activeSubmission?.runId
       && envelope.runId !== activeSubmission.runId) return;
+    if ((type === "session.statsChanged" || type === "run.completed"
+      || type === "run.cancelled" || type === "run.failed")
+      && envelope.sessionId === workspaceSessionIdRef.current
+      && payload.stats && typeof payload.stats === "object") {
+      setWorkspace((current) => current && current.sessionId === envelope.sessionId
+        ? { ...current, stats: payload.stats as SessionStats } : current);
+    }
     if (type === "run.started") {
       const submission = planSubmissionRef.current;
       if (submission && !submission.runId) submission.runId = envelope.runId;
@@ -701,7 +717,21 @@ export function App() {
         return;
       }
       if (name === "session") {
-        const snapshot = await window.agent.request<Record<string, unknown>>("session.snapshot");
+        const owner = workspaceSessionIdRef.current;
+        const generation = workspaceGenerationRef.current;
+        if (!owner) return;
+        let snapshot: SessionSnapshotPayload;
+        try {
+          snapshot = await window.agent.request<SessionSnapshotPayload>("session.snapshot");
+        } catch (reason) {
+          if (sessionNavigationRef.current || workspaceSessionIdRef.current !== owner
+            || workspaceGenerationRef.current !== generation) return;
+          throw reason;
+        }
+        if (sessionNavigationRef.current || workspaceSessionIdRef.current !== owner
+          || workspaceGenerationRef.current !== generation || snapshot.sessionId !== owner) return;
+        // A read-only usage query must not replace renderer-local timeline items.
+        setWorkspace((current) => current?.sessionId === owner ? { ...current, stats: snapshot.stats } : current);
         addNotice(`### 当前会话\n\n\`\`\`json\n${JSON.stringify(snapshot.stats ?? {}, null, 2)}\n\`\`\``);
         return;
       }
@@ -1247,6 +1277,7 @@ export function App() {
     if (running || compacting || !workspace || sessionNavigationRef.current
       || (sessionId && sessionId === workspaceSessionIdRef.current)) return;
     sessionNavigationRef.current = true;
+    workspaceGenerationRef.current += 1;
     setPendingSessionNavigation(sessionId ?? "new");
     setError(null);
     try {
@@ -1761,9 +1792,10 @@ export function App() {
                 )}
               </div>
             </form>
+            <UsageMetrics stats={workspace?.stats} />
           </div>
         </main>
-        {workspace && <Workbench key={workspace.sessionId} workspace={workspace} open={workbenchOpen} onClose={() => setWorkbenchOpen(false)} width={workbenchWidth} onWidth={setWorkbenchWidth} sidebarOpen={sidebarOpen} />}
+        {workspace && <Workbench key={workspace.sessionId} workspace={workspace} open={workbenchOpen} onClose={closeWorkbench} width={workbenchWidth} onWidth={setWorkbenchWidth} sidebarOpen={sidebarOpen} />}
       </div>
     </div>
   );

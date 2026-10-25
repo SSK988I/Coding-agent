@@ -256,3 +256,20 @@ def test_bash_raw_output_has_a_byte_cap():
     assert truncated is True
     assert output.endswith(b"efghijkl")
     assert b"truncated" in output
+
+
+@pytest.mark.parametrize("padding", ["x", "文", "😀"])
+def test_edit_large_text_disjoint_and_adjacent_replacements_keep_original_offsets(padding: str):
+    from agent_core.tools.edit import _apply_edits
+
+    background = padding * 20000
+    content = background + "unique_left" + "unique_right" + background + "unique_tail" + background
+    edits = [
+        {"oldText": "unique_tail", "newText": "完成😀"},
+        {"oldText": "unique_right", "newText": ""},
+        {"oldText": "unique_left", "newText": "unique_tail"},
+    ]
+
+    result = _apply_edits(content, edits, "large.txt")
+
+    assert result == background + "unique_tail" + background + "完成😀" + background

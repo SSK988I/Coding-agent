@@ -284,8 +284,8 @@ class DesktopRuntime:
         resume: bool,
     ) -> SessionManager:
         sessions_dir = get_sessions_dir()
-        available = SessionManager.list_sessions(cwd=str(workspace), sessions_dir=sessions_dir)
         if session_id:
+            available = SessionManager.list_sessions(cwd=str(workspace), sessions_dir=sessions_dir)
             match = next((item for item in available if item.id == session_id), None)
             if match is None:
                 raise RpcError("SESSION_NOT_FOUND", f"找不到会话：{session_id}")
@@ -402,6 +402,7 @@ class DesktopRuntime:
             "name": chosen.name or chosen.id,
             "provider": chosen.provider,
         }
+        self._publish_stats()
         self._publish("model.changed", payload)
         return payload
 
@@ -948,6 +949,7 @@ class DesktopRuntime:
         except (OSError, TypeError, ValueError, RuntimeError) as exc:
             raise RpcError("WEB_SEARCH_SETTINGS_FAILED", str(exc)) from exc
         payload = await self._web_search_status({})
+        self._publish_stats()
         self._publish("webSearch.changed", payload)
         return payload
 
@@ -1032,6 +1034,12 @@ class DesktopRuntime:
         else:
             payload = {key: value for key, value in event.items() if key != "type"}
         self._publish(event_type, payload)
+        if event_type in {"message_end", "turn_end", "agent_end", "auto_compaction_end", "compaction_end"}:
+            self._publish_stats()
+
+    def _publish_stats(self) -> None:
+        if self._session is not None:
+            self._publish("session.statsChanged", {"stats": to_jsonable(self._session.get_stats())})
 
     def _publish(self, event_type: str, payload: Any, *, run_id: str | None = None) -> None:
         self._seq += 1
@@ -1091,6 +1099,7 @@ class DesktopRuntime:
             "subagents": self._subagent_payload(session),
             "webSearch": web_search,
             "permissionMode": self._permission_mode,
+            "stats": to_jsonable(session.get_stats()),
         }
 
     async def _workspace_payload_with_memory(self) -> dict[str, Any]:

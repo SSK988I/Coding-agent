@@ -79,7 +79,7 @@ export function ChangesPanel({ scope, active, onOpenFile }: { scope: WorkbenchSc
       {current?.files.map((file, index) => <details className="changed-file" key={file.path} open={expanded[file.path] ?? index === 0} onToggle={(event) => { const open = event.currentTarget.open; setExpanded((before) => before[file.path] === open ? before : { ...before, [file.path]: open }); }}>
         <summary><span className={`file-status status-${file.status}`}>{file.status}</span><span className="changed-file-path" title={file.path}>{file.path}</span><span className="diff-add-count">+{file.additions}</span><span className="diff-remove-count">−{file.deletions}</span></summary>
         <div className="diff-file-actions"><button type="button" onClick={() => onOpenFile(file.path)} disabled={file.status === "D"}>在文件中打开 ↗</button><button type="button" onClick={() => void navigator.clipboard.writeText(file.path).catch((reason) => setError(String(reason)))}>复制路径</button></div>
-        {file.binary ? <p className="workbench-notice">二进制文件发生变更</p> : <DiffView diff={file.diff} wrap={wrap} />}
+        {file.binary ? <p className="workbench-notice">二进制文件发生变更</p> : (expanded[file.path] ?? index === 0) && <DiffView diff={file.diff} wrap={wrap} />}
         {file.truncated && <p className="workbench-notice">当前文件差异已截断，内容不完整。</p>}
       </details>)}
       {current && !current.files.length && !loading && <div className="workbench-empty">当前来源没有变更</div>}
@@ -126,7 +126,7 @@ export function FilesPanel({ scope, requestedFile }: { scope: WorkbenchScope; re
     {entry.kind === "directory" && expanded[entry.path] && <ul role="group">{renderFolder(entry.path, depth + 1)}</ul>}
   </li>);
   const content = preview?.path === selected ? preview : null;
-  const lines = content?.text?.split("\n") ?? [];
+  const lines = content?.text?.split("\n", 5001) ?? [];
   return <section className="files-panel" aria-label="文件">
     <div className="workbench-toolbar"><input aria-label="筛选已展开文件" placeholder="筛选已展开文件…" value={filter} onChange={(event) => setFilter(event.target.value)} /><button type="button" title="刷新目录" aria-label="刷新目录" onClick={() => { folderGeneration.current++; setFolders({}); setExpanded({ "": true }); void loadFolder(""); }}>↻</button><label className="compact-check"><input type="checkbox" checked={showHidden} onChange={(event) => setShowHidden(event.target.checked)} />隐藏文件</label></div>
     <div className="file-browser">

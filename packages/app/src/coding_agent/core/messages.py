@@ -161,7 +161,7 @@ def convert_to_llm(messages: list[AgentAppMessage]) -> list[Message]:
         role = getattr(m, "role", None)
         if role in ("user", "assistant", "toolResult"):
             if role == "user" and isinstance(getattr(m, "content", None), str):
-                if m.content.strip().startswith("/"):
+                if m.content.lstrip().startswith("/"):
                     # Slash commands are application control messages. Early
                     # desktop builds accidentally persisted them as prompts.
                     continue

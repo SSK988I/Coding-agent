@@ -709,3 +709,137 @@ def test_project_conflict_blocks_global_fallback_for_same_key(tmp_path: Path) ->
     assert _run(store.apply(identity, direct_choice, session_id="s")).action == "conflict_resolved"
     resolved = _run(MemoryRetriever(store).retrieve(identity, "language"))
     assert next(record for record in resolved.records if record.key == "response.language").value == "fr-FR"
+
+
+@pytest.mark.parametrize("line_count", [0, 100_000])
+def test_repair_complete_event_tail_reads_at_most_one_byte(tmp_path: Path, monkeypatch, line_count: int) -> None:
+    path = tmp_path / "events.jsonl"
+    content = b'{"safe":true}\n' * line_count
+    path.write_bytes(content)
+    reads = []
+    original_open = Path.open
+
+    class ReadProbe:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return self.stream.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self.stream, name)
+
+        def read(self, size=-1):
+            data = self.stream.read(size)
+            reads.append((size, len(data)))
+            return data
+
+    def probe_open(file, *args, **kwargs):
+        stream = original_open(file, *args, **kwargs)
+        return ReadProbe(stream) if file == path and args == ("r+b",) else stream
+
+    monkeypatch.setattr(Path, "open", probe_open)
+    FileMemoryStore._repair_event_tail(path)
+
+    assert reads == ([(1, 1)] if line_count else [])
+    assert path.read_bytes() == content
+
+
+def test_repair_missing_event_tail_does_not_open_file(tmp_path: Path, monkeypatch) -> None:
+    def unexpected_open(*args, **kwargs):
+        pytest.fail("Missing event logs must not be opened")
+
+    monkeypatch.setattr(Path, "open", unexpected_open)
+    FileMemoryStore._repair_event_tail(tmp_path / "missing.jsonl")
+
+
+def _event_bytes(revision: int = 1) -> bytes:
+    return json.dumps({
+        "schema_version": 2, "revision": revision, "type": "candidate_rejected",
+        "timestamp": "2026-10-24T12:00:00Z", "source_hash": f"source-{revision}",
+        "key": "response.language", "reason": "test rejection",
+    }).encode("utf-8")
+
+
+@pytest.mark.parametrize("tail", [b" \t\r", b'{"schema_version":2,', b"\xff", b'{"text":"\xe4'])
+def test_repair_partial_or_whitespace_event_tail_preserves_prefix(tmp_path: Path, tail: bytes) -> None:
+    path = tmp_path / "events.jsonl"
+    prefix = _event_bytes() + b"\n\n"
+    path.write_bytes(prefix + tail)
+
+    FileMemoryStore._repair_event_tail(path)
+
+    assert path.read_bytes() == prefix
+    assert [event["revision"] for event in FileMemoryStore._read_events(path)] == [1]
+
+
+def test_repair_valid_event_tail_without_newline_keeps_all_bytes(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    content = _event_bytes() + b"\n\n" + _event_bytes(2)
+    path.write_bytes(content)
+
+    FileMemoryStore._repair_event_tail(path)
+
+    assert path.read_bytes() == content + b"\n"
+    assert [event["revision"] for event in FileMemoryStore._read_events(path)] == [1, 2]
+
+
+@pytest.mark.parametrize("tail,error", [
+    (b'{"schema_version":99}', "unsupported memory event schema"),
+    (b"[]", "memory event must be an object"),
+])
+def test_repair_invalid_complete_event_tail_preserves_error_and_line_number(tmp_path: Path, tail, error) -> None:
+    path = tmp_path / "events.jsonl"
+    content = _event_bytes() + b"\n\n" + tail
+    path.write_bytes(content)
+
+    with pytest.raises(MemoryStoreError, match=error) as raised:
+        FileMemoryStore._repair_event_tail(path)
+
+    assert f"{path}:3" in str(raised.value)
+    assert path.read_bytes() == content
+
+
+def test_complete_tail_does_not_skip_invalid_earlier_event_validation(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    content = b'{"schema_version":99}\n' + _event_bytes(2) + b"\n"
+    path.write_bytes(content)
+
+    FileMemoryStore._repair_event_tail(path)
+
+    with pytest.raises(MemoryStoreError, match="unsupported memory event schema") as raised:
+        list(FileMemoryStore._read_events(path))
+    assert f"{path}:1" in str(raised.value)
+    assert path.read_bytes() == content
+
+
+def test_repair_event_tail_propagates_read_errors(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "events.jsonl"
+    path.write_bytes(_event_bytes() + b"\n")
+    original_open = Path.open
+
+    class FailedRead:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return self.stream.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self.stream, name)
+
+        def read(self, *args):
+            raise OSError("read failed")
+
+    def failed_open(file, *args, **kwargs):
+        return FailedRead(original_open(file, *args, **kwargs))
+
+    monkeypatch.setattr(Path, "open", failed_open)
+    with pytest.raises(OSError, match="read failed"):
+        FileMemoryStore._repair_event_tail(path)

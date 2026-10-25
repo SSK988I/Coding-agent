@@ -34,6 +34,12 @@ def segment_graphemes(text: str) -> List[str]:
     return _GRAPHEME_RE.findall(text)
 
 
+def first_grapheme(text: str) -> str:
+    """Return the first grapheme without segmenting the remaining text."""
+    match = _GRAPHEME_RE.match(text)
+    return match.group() if match else ""
+
+
 #: Shared Unicode-aware word segmenter used by word navigation.
 _WORD_BOUNDARY_RE = regex.compile(r"(?:\w+|\W)")
 
@@ -216,11 +222,7 @@ _WIDTH_CACHE_SIZE = 512
 
 def _is_printable_ascii(s: str) -> bool:
     """All chars in [0x20, 0x7e]?."""
-    for ch in s:
-        c = ord(ch)
-        if c < 0x20 or c > 0x7E:
-            return False
-    return True
+    return s.isascii() and s.isprintable()
 
 
 def visible_width(s: str) -> int:

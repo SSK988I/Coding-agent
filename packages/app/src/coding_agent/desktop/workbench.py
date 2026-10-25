@@ -64,15 +64,21 @@ class WorkspaceWorkbench:
         show_hidden = bool(params.get("showHidden", False))
         entries = []
         try:
-            for child in sorted(directory.iterdir(), key=lambda item: (not item.is_dir(), item.name.casefold())):
-                if not show_hidden and (child.name.startswith(".") or child.name in HIDDEN_DIRECTORIES):
+            with os.scandir(directory) as scanner:
+                children = sorted(scanner, key=lambda item: (not item.is_dir(), item.name.casefold()))
+            # Preserve sorted order while releasing each entry's cached metadata.
+            children.reverse()
+            while children:
+                entry = children.pop()
+                if not show_hidden and (entry.name.startswith(".") or entry.name in HIDDEN_DIRECTORIES):
                     continue
+                child = Path(entry.path)
                 outside = not child.resolve().is_relative_to(self.workspace)
-                stat = child.lstat()
+                stat = entry.stat(follow_symlinks=False)
                 entries.append({
-                    "name": child.name, "path": child.relative_to(self.workspace).as_posix(),
-                    "kind": "directory" if child.is_dir() and not outside else "file",
-                    "size": stat.st_size, "symlink": child.is_symlink(), "blocked": outside,
+                    "name": entry.name, "path": child.relative_to(self.workspace).as_posix(),
+                    "kind": "directory" if entry.is_dir() and not outside else "file",
+                    "size": stat.st_size, "symlink": entry.is_symlink(), "blocked": outside,
                 })
                 if len(entries) >= 500:
                     break
@@ -155,12 +161,13 @@ class WorkspaceWorkbench:
     def _capture(self) -> None:
         snapshot = self._snapshot()
         self.storage.mkdir(parents=True, exist_ok=True)
+        serialized = json.dumps(snapshot, ensure_ascii=False)
         for name in ("session", "turn"):
             target = self.storage / f"{name}.json"
             if name == "session" and target.exists():
                 continue
             temporary = target.with_suffix(".tmp")
-            temporary.write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
+            temporary.write_text(serialized, encoding="utf-8")
             temporary.replace(target)
 
     def _baseline_changes(self, source: str) -> dict[str, Any]:
@@ -197,6 +204,8 @@ class WorkspaceWorkbench:
     def _bounded_diff(diff: str, remaining: int) -> tuple[str, bool, int]:
         encoded = diff.encode("utf-8")
         limit = min(MAX_PREVIEW_BYTES, remaining)
+        if len(encoded) <= limit:
+            return diff, False, remaining - len(encoded)
         preview = encoded[:limit].decode("utf-8", errors="ignore")
         return preview, len(encoded) > limit, remaining - len(preview.encode("utf-8"))
 
@@ -247,14 +256,16 @@ class WorkspaceWorkbench:
             diff_args = ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames", "--relative", *revision]
             raw_names = self.git(*diff_args, "--name-only", "-z", "--", ".")
             names = [part.decode("utf-8", errors="replace") for part in raw_names.split(b"\0") if part]
+            untracked: set[str] = set()
             if source == "unstaged":
-                names.extend(part.decode("utf-8", errors="replace") for part in self.git("ls-files", "--others", "--exclude-standard", "-z", "--", ".").split(b"\0") if part)
+                untracked = {part.decode("utf-8", errors="replace") for part in self.git("ls-files", "--others", "--exclude-standard", "-z", "--", ".").split(b"\0") if part}
+                names.extend(untracked)
             files = []
             remaining = MAX_DIFF_BYTES
             truncated = len(set(names)) > 500
             for name in sorted(set(names))[:500]:
                 self.path(name)
-                diff = self.git(*diff_args, "--", name).decode("utf-8", errors="replace")
+                diff = "" if name in untracked else self.git(*diff_args, "--", name).decode("utf-8", errors="replace")
                 status = "M"
                 if not diff and source == "unstaged":
                     file = self.path(name)

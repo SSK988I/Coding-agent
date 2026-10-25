@@ -4,6 +4,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from agent_llm import AssistantMessage, TextContent, ThinkingContent, ToolCall
@@ -179,3 +181,44 @@ def test_set_hide_thinking_block_rebuilds():
     joined = "\n".join(comp.render(40))
     assert "Thinking..." in joined
     assert "trace" not in joined
+
+
+@pytest.mark.parametrize("hide_thinking", [False, True])
+def test_whitespace_and_tools_do_not_change_visible_block_spacing(hide_thinking):
+    tool = ToolCall(id="t1", name="read")
+    compact = _msg(
+        ThinkingContent(thinking="first"), ThinkingContent(thinking="second"),
+        TextContent(text="answer"), tool,
+    )
+    padded = _msg(
+        TextContent(text=" \t"), ThinkingContent(thinking=" first "), tool,
+        ThinkingContent(thinking=" \n"), ThinkingContent(thinking=" second "),
+        TextContent(text=" \n"), TextContent(text=" answer "), TextContent(text=" \t"),
+    )
+    expected = AssistantMessageComponent(compact, hide_thinking_block=hide_thinking).render(60)
+    assert AssistantMessageComponent(padded, hide_thinking_block=hide_thinking).render(60) == expected
+
+    thinking = _msg(ThinkingContent(thinking="last"))
+    trailing_empty = _msg(ThinkingContent(thinking=" last "), TextContent(text=" \n"))
+    expected = AssistantMessageComponent(thinking, hide_thinking_block=hide_thinking).render(60)
+    assert AssistantMessageComponent(trailing_empty, hide_thinking_block=hide_thinking).render(60) == expected
+
+
+def test_update_content_strips_each_text_payload_only_once():
+    stripped = []
+
+    class TrackedText(str):
+        def strip(self, chars=None):
+            stripped.append(str(self))
+            return super().strip(chars)
+
+    message = _msg(
+        ThinkingContent(thinking=TrackedText(" first ")),
+        TextContent(text=TrackedText(" \n")), ToolCall(id="t1", name="read"),
+        ThinkingContent(thinking=TrackedText(" second ")),
+        TextContent(text=TrackedText(" answer ")),
+    )
+    component = AssistantMessageComponent(message)
+
+    assert stripped == [" first ", " \n", " second ", " answer "]
+    assert "answer" in "\n".join(component.render(60))

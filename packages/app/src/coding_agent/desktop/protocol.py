@@ -25,7 +25,9 @@ class RpcError(Exception):
 def to_jsonable(value: Any) -> Any:
     """Convert runtime dataclasses and typed objects to JSON-safe values."""
     if dataclasses.is_dataclass(value):
-        return to_jsonable(dataclasses.asdict(value))
+        if isinstance(value, type):
+            raise TypeError("asdict() should be called on dataclass instances")
+        return {field.name: to_jsonable(getattr(value, field.name)) for field in dataclasses.fields(value)}
     if isinstance(value, dict):
         return {str(key): to_jsonable(item) for key, item in value.items()}
     if isinstance(value, (list, tuple, set, frozenset)):

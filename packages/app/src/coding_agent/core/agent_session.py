@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import json
 import sys
 import time
 import uuid
@@ -53,6 +55,7 @@ from agent_core import (
 )
 from agent_core.prompts import build_system_prompt
 from coding_agent.core.retry import RetryPolicy, retrying_stream
+from coding_agent.core.usage_metrics import UsageMetrics, project_usage_metrics
 from coding_agent.core.permissions import PERMISSION_MODES, PermissionMode, requires_approval, is_approval_safe_shell_command
 from coding_agent.core.subagents import SubagentError, SubagentManager, SubagentTool
 from coding_agent.memory.types import MemoryScope
@@ -168,6 +171,7 @@ class SessionStats:
     total_messages: int = 0
     tokens: _TokenStats = field(default_factory=lambda: _TokenStats())
     cost: float = 0.0
+    metrics: UsageMetrics = field(default_factory=UsageMetrics)
 
 
 @dataclass
@@ -1504,12 +1508,12 @@ class AgentSession:
     def set_model(self, model: Model, thinking_level: ThinkingLevel | None = None) -> None:
         """Switch the active model.
 
-        Updates both the Agent's internal model and our cached reference.
-        Does NOT rebuild tools — callers should call _refresh_tools() if
-        the model change requires different tool schemas.
+        Updates both the Agent's internal model and our cached reference, then
+        refreshes the runtime prompt/tools and their usage measurement anchors.
         """
         self._model = model
         self._agent.state.model = model
+        self._refresh_collaboration_runtime()
         # Persist model change to session.
         self.session_manager.append_model_change(
             provider=model.provider, model_id=model.id,
@@ -1641,6 +1645,32 @@ class AgentSession:
 
     # ── Statistics ────────────────────────────────────────────────────────
 
+    def _usage_context_fingerprint(self, model: Model, prompt: str | None, tools: list | None, reasoning: Any) -> str | None:
+        """Identify the request's input configuration without storing credentials.
+
+        Provider-native adapters may rewrite this input, so compare the same
+        pre-adapter configuration and policy for both requests and live stats.
+        The digest stays on the live response only, never in JSONL history.
+        """
+        payload = {
+            "model": {key: getattr(model, key, None) for key in ("provider", "id", "api", "base_url", "compat")},
+            "prompt": prompt or "",
+            "tools": [
+                {"name": tool.name, "description": tool.description, "parameters": tool.parameters}
+                for tool in (tools or [])
+            ],
+            "reasoning": reasoning or None,
+            "mode": self.collaboration_mode,
+            "phase": self.plan_state.phase,
+            "webSearch": self.web_search_enabled,
+            "permission": self.permission_mode,
+        }
+        try:
+            encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        except (TypeError, ValueError):
+            return None
+        return hashlib.sha256(encoded.encode("ascii")).hexdigest()
+
     def get_stats(self) -> SessionStats:
         """Compute session statistics from session entries.
 
@@ -1652,8 +1682,8 @@ class AgentSession:
         )
 
         entries = self.session_manager.get_branch()
+        from agent_core.session.types import SessionMessageEntry
         for entry in entries:
-            from agent_core.session.types import SessionMessageEntry
             if not isinstance(entry, SessionMessageEntry) or entry.message is None:
                 continue
             msg = entry.message
@@ -1682,6 +1712,17 @@ class AgentSession:
                 stats.tool_results += 1
 
         stats.total_messages = stats.user_messages + stats.assistant_messages
+        fingerprint = self._usage_context_fingerprint(
+            self.model, self.state.system_prompt, self.state.tools, self.agent.reasoning,
+        )
+        stats.metrics = project_usage_metrics(
+            messages=self.state.messages, entries=entries, model=self.model,
+            system_prompt=self.state.system_prompt or "", tools=self.state.tools,
+            valid_anchor_ids={
+                id(message) for message in self.state.messages
+                if fingerprint is not None and getattr(message, "_usage_context_fingerprint", None) == fingerprint
+            },
+        )
         return stats
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
@@ -1856,11 +1897,27 @@ class AgentSession:
                         messages=context.messages,
                         tools=effective_context.tools,
                     )
-                return stream_simple(
+                # Freeze before starting the producer: tool schemas and policy
+                # may change while this response (or another memory task) runs.
+                fingerprint = self._usage_context_fingerprint(
+                    model, context.system_prompt, context.tools, effective_options.get("reasoning"),
+                )
+                inner = stream_simple(
                     model,
                     effective_context,
                     cast(Any, effective_options or None),
                 )
+                if not isolated and fingerprint is not None:
+                    def bind_usage(result: asyncio.Future[AssistantMessage]) -> None:
+                        if not result.cancelled():
+                            setattr(result.result(), "_usage_context_fingerprint", fingerprint)
+
+                    result = inner.result()
+                    if result.done():
+                        bind_usage(result)
+                    else:
+                        result.add_done_callback(bind_usage)
+                return inner
 
             def attempt():
                 # Authorization belongs inside the retry factory: the host can

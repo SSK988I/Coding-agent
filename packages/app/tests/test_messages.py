@@ -4,6 +4,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 # Make src importable when run directly.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -87,6 +89,44 @@ def test_convert_to_llm_passes_through_standard_roles():
     user = UserMessage(content="hi")
     out = convert_to_llm([user])
     assert out == [user]
+
+
+@pytest.mark.parametrize("content", [
+    "/", "/plan", " \t/plan \n", "\u3000/session\u00a0", "\x1c/cancel-plan\r\n", "/plan\r\n",
+])
+def test_convert_to_llm_drops_control_commands_without_changing_the_source(content: str):
+    user = UserMessage(content=content)
+
+    assert convert_to_llm([user]) == []
+    assert user.content is content
+
+
+@pytest.mark.parametrize("content", [
+    "", " \t\n", "ordinary message\n", " x /plan \t", "\u3000你好\n", "hello\n/plan\n",
+    "\u200b/plan", "\ufeff/plan",
+])
+def test_convert_to_llm_preserves_normal_user_identity_and_all_whitespace(content: str):
+    user = UserMessage(content=content)
+
+    converted = convert_to_llm([user])
+
+    assert len(converted) == 1 and converted[0] is user
+    assert user.content is content
+
+
+@pytest.mark.parametrize(("content", "is_control"), [("large message\n", False), (" \t/session\n", True)])
+def test_control_prefix_check_does_not_strip_the_entire_message(content: str, is_control: bool):
+    class PrefixOnlyText(str):
+        def strip(self, chars=None):
+            raise AssertionError("A prefix check must not trim and copy the message tail")
+
+    original = PrefixOnlyText(content)
+    user = UserMessage(content=original)
+
+    converted = convert_to_llm([user])
+
+    assert converted == ([] if is_control else [user])
+    assert user.content is original
 
 
 def test_convert_to_llm_drops_bash_execution_with_exclude_from_context():

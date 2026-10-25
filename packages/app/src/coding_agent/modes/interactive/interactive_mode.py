@@ -164,7 +164,7 @@ class InteractiveMode:
         self._displayed_plan_key: tuple[Any, ...] | None = None
         self._is_submitting_plan = False
         self._subagent_cards: dict[str, Any] = {}
-        self._subagent_unsubscribe = self._session.on_event(self._on_subagent_event)
+        self._session_unsubscribe = self._session.on_event(self._on_session_event)
         self._permission_lock = asyncio.Lock()
         self._permission_native_decision: tuple[asyncio.Event, bool] | None = None
         self._prior_tool_hook = session._config.before_tool_call
@@ -256,7 +256,15 @@ class InteractiveMode:
                                  else "bypass permissions off · " + ("帮我批准" if mode == "auto" else "请求批准"))
         self._refresh_footer()
 
-    def _on_subagent_event(self, event: dict) -> None:
+    def _on_session_event(self, event: dict) -> None:
+        """Refresh display facts at session boundaries, not on every delta."""
+        if event.get("type") in {
+            "agent_start", "agent_end", "message_end", "turn_end",
+            "compaction_start", "compaction_end", "auto_compaction_start", "auto_compaction_end",
+            "bash_execution", "collaboration_mode_changed", "plan_state_changed", "plan.stateChanged",
+        }:
+            self._footer.invalidate()
+            self.tui.request_render()
         if event.get("type") == "subagent.stateChanged":
             self._render_subagents(event.get("tasks", []))
 
@@ -528,6 +536,8 @@ class InteractiveMode:
                 self._streaming_component = None
             self._pending_tools.clear()
             self._clear_status_indicator()
+            # prompt() removes temporary memory context after agent_end.
+            self._footer.invalidate()
             self.tui.request_render()
 
     # ── Agent event -> UI mapping ─────────────────────────────────────────
@@ -980,6 +990,7 @@ class InteractiveMode:
 
     def _cmd_clear(self) -> None:
         self._session.agent.reset()
+        self._footer.invalidate()
         self.chat_container.clear()
         self._displayed_plan_key = None
         self._tool_cards.clear()
@@ -1094,6 +1105,7 @@ class InteractiveMode:
             return self.theme.fg("dim", text)
 
         stats = self._session.get_stats()
+        metrics = stats.metrics
         name = self._session.session_manager.get_name()
 
         lines: list[str] = [bold("Session Info"), ""]
@@ -1108,13 +1120,27 @@ class InteractiveMode:
         lines.append(f"{dim('Tool Results:')} {stats.tool_results}")
         lines.append(f"{dim('Total:')} {stats.total_messages}")
         lines += ["", bold("Tokens")]
-        lines.append(f"{dim('Input:')} {stats.tokens.input:,}")
+        lines.append(f"{dim('累计输入（含缓存）:')} {metrics.input_tokens:,}")
+        lines.append(f"{dim('未命中缓存的输入:')} {stats.tokens.input:,}")
         lines.append(f"{dim('Output:')} {stats.tokens.output:,}")
         if stats.tokens.cache_read > 0:
             lines.append(f"{dim('Cache Read:')} {stats.tokens.cache_read:,}")
         if stats.tokens.cache_write > 0:
             lines.append(f"{dim('Cache Write:')} {stats.tokens.cache_write:,}")
         lines.append(f"{dim('Total:')} {stats.tokens.total:,}")
+        cache_rate = metrics.cache_hit_rate
+        cache_label = f"{cache_rate:.1f}%" if cache_rate is not None else "—（暂无用量或供应商未完整提供缓存统计）"
+        lines.append(f"{dim('缓存命中率（当前分支累计）:')} {cache_label}")
+        used = metrics.context_tokens
+        limit = metrics.context_window
+        context_label = f"{used:,}" if used is not None else "—"
+        if used is not None and metrics.context_estimated:
+            context_label = f"约 {context_label}"
+        context_label += f" / {limit:,}" if limit else " / —"
+        pct = metrics.context_percent
+        if pct is not None:
+            context_label += f"（{pct:.1f}%）"
+        lines.append(f"{dim('上下文容量使用:')} {context_label}")
         if stats.cost > 0:
             lines += ["", bold("Cost")]
             lines.append(f"{dim('Total:')} {stats.cost:.4f}")
@@ -2323,6 +2349,7 @@ class InteractiveMode:
 
     def _refresh_footer(self) -> None:
         """Called after model/thinking/turn changes to keep footer current."""
+        self._footer.invalidate()
         self._footer.refresh_git_branch()
         self.tui.request_render()
 
@@ -2407,7 +2434,7 @@ class InteractiveMode:
         while self._running:
             await asyncio.sleep(0.05)
 
-        self._subagent_unsubscribe()
+        self._session_unsubscribe()
         self.tui.stop()
 
     def _register_input_listeners(self) -> None:

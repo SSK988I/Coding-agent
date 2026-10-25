@@ -709,6 +709,7 @@ def _run_print(
         sys.stdout.write("\n")
         sys.stdout.flush()
         _print_plan_resume_hint(session)
+        _print_usage_summary(session)
         return 1 if had_error else 0
 
     async def _entry() -> int:
@@ -778,6 +779,7 @@ def _run_plan_control(
         if mode == "text":
             sys.stdout.write("\n")
             _print_plan_resume_hint(session)
+            _print_usage_summary(session)
         return 1 if session.plan_state.phase in {
             "failed", "aborted", "uncertain", "recovery_error",
         } else 0
@@ -792,6 +794,31 @@ def _run_plan_control(
         return asyncio.run(_entry())
     except KeyboardInterrupt:
         return 130
+
+
+def _print_usage_summary(session: AgentSession) -> None:
+    """Show human-readable metrics on stderr without changing stdout/JSONL."""
+    if not callable(getattr(session, "get_stats", None)):
+        return
+    stats = session.get_stats()
+    metrics = stats.metrics
+    rate = metrics.cache_hit_rate
+    cache = f"{rate:.1f}%" if rate is not None else "—"
+    used = metrics.context_tokens
+    limit = metrics.context_window
+    context = f"{used:,}" if used is not None else "—"
+    if used is not None and metrics.context_estimated:
+        context = f"约 {context}"
+    context += f"/{limit:,}" if limit else "/—"
+    pct = metrics.context_percent
+    if pct is not None:
+        context += f"（{pct:.1f}%）"
+    print(
+        f"[用量] 缓存命中率 {cache} | 上下文 {context} | "
+        f"累计输入（含缓存） {metrics.input_tokens:,} / 输出 {stats.tokens.output:,} | "
+        f"估算费用 ${stats.cost:.4f}",
+        file=sys.stderr,
+    )
 
 
 def _print_plan_resume_hint(session: AgentSession) -> None:

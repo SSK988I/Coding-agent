@@ -33,6 +33,59 @@ const assistant = (
 ): AgentMessage => ({ role: "assistant", content, ...extra });
 
 describe("timeline state", () => {
+  it("projects ids in order, skips missing entities and preserves duplicate identities without mutation", () => {
+    const initial = createTimelineStateFromMessages([
+      { role: "user", content: "first", timestamp: 1 },
+      { role: "user", content: "second", timestamp: 2 },
+    ]);
+    const first = initial.entities[initial.orderedIds[0]];
+    const second = initial.entities[initial.orderedIds[1]];
+    const ids = Object.freeze([second.id, "missing", first.id, second.id]);
+    const entities = Object.freeze({ ...initial.entities });
+    const state = Object.freeze({ ...initial, orderedIds: ids, entities });
+    const projected = selectTimelineItems(state);
+
+    expect(projected).toEqual([second, first, second]);
+    expect(projected[0]).toBe(second);
+    expect(projected[1]).toBe(first);
+    expect(projected[2]).toBe(second);
+    expect(state.orderedIds).toBe(ids);
+    expect(state.orderedIds).toEqual([second.id, "missing", first.id, second.id]);
+    expect(state.entities).toBe(entities);
+    expect(state.entities).toEqual(initial.entities);
+  });
+
+  it("copies timeline order only when adding or removing items in a batch", () => {
+    const initial = createTimelineStateFromMessages([
+      { role: "user", content: "preserved", timestamp: 1 },
+    ], "session-1");
+    const initialIds = [...initial.orderedIds];
+    const inserted = reduceRuntimeEventBatch(initial, [
+      runtimeEvent(1, "message_start", { messageId: "empty", message: assistant("") }),
+      runtimeEvent(2, "message_start", { messageId: "kept", message: assistant("") }),
+      runtimeEvent(3, "message_end", { messageId: "empty", message: assistant("") }),
+      runtimeEvent(4, "tool_execution_start", { tool_call_id: "t", tool_name: "read" }),
+      runtimeEvent(5, "message_end", { messageId: "kept", message: assistant("answer") }),
+      runtimeEvent(6, "message_start", { messageId: "removed-later", message: assistant("") }),
+    ]);
+
+    expect(inserted.orderedIds).not.toBe(initial.orderedIds);
+    expect(initial.orderedIds).toEqual(initialIds);
+    expect(selectTimelineItems(initial)).toMatchObject([{ text: "preserved" }]);
+    expect(selectTimelineItems(inserted)).toMatchObject([
+      { text: "preserved" }, { text: "answer" }, { toolCallId: "t" }, { text: "" },
+    ]);
+    expect(new Set(inserted.orderedIds).size).toBe(inserted.orderedIds.length);
+
+    const insertedIds = [...inserted.orderedIds];
+    const removed = reduceRuntimeEventBatch(inserted, [
+      runtimeEvent(7, "message_end", { messageId: "removed-later", message: assistant("") }),
+    ]);
+    expect(removed.orderedIds).not.toBe(inserted.orderedIds);
+    expect(inserted.orderedIds).toEqual(insertedIds);
+    expect(removed.orderedIds).toEqual(insertedIds.slice(0, -1));
+  });
+
   it("does not show execution until Core admits the tool", () => {
     let state = reduceRuntimeEventBatch(createTimelineState(), [
       runtimeEvent(1, "tool_execution_start", { tool_call_id: "t", tool_name: "bash", status: "pending" }),
@@ -130,6 +183,7 @@ describe("timeline state", () => {
     expect(item.revision).toBe(startItem.revision + 1);
     expect(item.lastSeq).toBe(5);
     expect(started.entities[messageId]).toBe(startItem);
+    expect(reduced.orderedIds).toBe(started.orderedIds);
   });
 
   it("keeps interleaved streams isolated by run id and preserves start order", () => {
@@ -293,6 +347,7 @@ describe("timeline state", () => {
       result: { content: [{ text: "almost done" }] },
       lastSeq: 3,
     });
+    expect(updated.orderedIds).toBe(started.orderedIds);
 
     const completed = reduceRuntimeEventBatch(updated, [
       runtimeEvent(4, "tool_execution_update", {

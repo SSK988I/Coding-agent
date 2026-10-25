@@ -55,16 +55,15 @@ def _decode_output(data: bytes) -> str:
     (CP936/GBK on Chinese Windows). Try UTF-8 first, then the Windows OEM
     code page, then a lossy pass — never raising.
     """
-    candidates = ["utf-8"]
+    try:
+        return data.decode("utf-8")
+    except (UnicodeDecodeError, LookupError):
+        pass
     if sys.platform == "win32":
-        candidates.append(_windows_oem_encoding())
-    for enc in candidates:
-        if not enc:
-            continue
         try:
-            return data.decode(enc)
+            return data.decode(_windows_oem_encoding())
         except (UnicodeDecodeError, LookupError):
-            continue
+            pass
     return data.decode("utf-8", errors="replace")
 
 

@@ -31,11 +31,6 @@ def _block_text(block: Any) -> str:
     return ""
 
 
-def _is_visible(block: Any) -> bool:
-    """True if a text/thinking block has non-whitespace content."""
-    return bool(_block_text(block).strip())
-
-
 class AssistantMessageComponent(Container):
     """Renders a complete (or streaming) assistant message.
 
@@ -110,21 +105,23 @@ class AssistantMessageComponent(Container):
         self._content_container.clear()
 
         content = list(getattr(message, "content", []) or [])
-        has_visible_content = any(_is_visible(c) for c in content)
+        visible_content = [
+            (getattr(block, "type", None), text)
+            for block in content if (text := _block_text(block).strip())
+        ]
 
-        if has_visible_content:
+        if visible_content:
             self._content_container.add_child(Spacer(1))
 
         # Render content blocks in order.
-        for i, block in enumerate(content):
-            btype = getattr(block, "type", None)
-            if btype == "text" and _is_visible(block):
+        for i, (btype, text) in enumerate(visible_content):
+            if btype == "text":
                 self._content_container.add_child(
-                    Markdown(_block_text(block).strip(), self._output_pad, 0, self._markdown_theme)
+                    Markdown(text, self._output_pad, 0, self._markdown_theme)
                 )
-            elif btype == "thinking" and _is_visible(block):
+            elif btype == "thinking":
                 # Spacing only when another visible block follows.
-                has_visible_after = any(_is_visible(c) for c in content[i + 1:])
+                has_visible_after = i + 1 < len(visible_content)
                 if self._hide_thinking_block:
                     label = self._hidden_thinking_label
                     if self._theme is not None:
@@ -141,7 +138,7 @@ class AssistantMessageComponent(Container):
                         )
                     self._content_container.add_child(
                         Markdown(
-                            _block_text(block).strip(), self._output_pad, 0,
+                            text, self._output_pad, 0,
                             self._markdown_theme, default_style=style,
                         )
                     )

@@ -122,10 +122,12 @@ export function createTimelineState(items: readonly TimelineItem[] = []): Timeli
 }
 
 export function selectTimelineItems(state: TimelineState): TimelineItem[] {
-  return state.orderedIds.flatMap((id) => {
+  const items: TimelineItem[] = [];
+  for (const id of state.orderedIds) {
     const item = state.entities[id];
-    return item ? [item] : [];
-  });
+    if (item) items.push(item);
+  }
+  return items;
 }
 
 export function readAgentMessageContent(message: AgentMessage): { text: string; thinking: string } {
@@ -242,7 +244,7 @@ export function reduceRuntimeEventBatch(
   if (events.length === 0) return state;
 
   const entities: Record<string, TimelineItem> = { ...state.entities };
-  let orderedIds = [...state.orderedIds];
+  let orderedIds: string[] | undefined;
   const activeMessageIdsByRun: Record<string, string> = { ...state.activeMessageIdsByRun };
   const messageIdsByRoute: Record<string, string> = { ...state.messageIdsByRoute };
   let activeCompactionId = state.activeCompactionId;
@@ -260,7 +262,7 @@ export function reduceRuntimeEventBatch(
   };
 
   const insert = (item: TimelineItem): void => {
-    if (!(item.id in entities)) orderedIds.push(item.id);
+    if (!(item.id in entities)) (orderedIds ??= [...state.orderedIds]).push(item.id);
     entities[item.id] = item;
     changed = true;
   };
@@ -268,7 +270,7 @@ export function reduceRuntimeEventBatch(
   const remove = (id: string): void => {
     if (!(id in entities)) return;
     delete entities[id];
-    orderedIds = orderedIds.filter((candidate) => candidate !== id);
+    orderedIds = (orderedIds ?? state.orderedIds).filter((candidate) => candidate !== id);
     pendingDeltas.delete(id);
     pendingToolUpdates.delete(id);
     changed = true;
@@ -633,7 +635,7 @@ export function reduceRuntimeEventBatch(
   if (!changed) return state;
   return {
     entities,
-    orderedIds,
+    orderedIds: orderedIds ?? state.orderedIds,
     activeMessageIdsByRun,
     messageIdsByRoute,
     activeCompactionId,

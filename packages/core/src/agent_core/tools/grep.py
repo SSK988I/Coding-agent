@@ -281,6 +281,8 @@ class GrepTool:
                     _scan_file(abs_f, rel)
                     if limit_reached:
                         break
+                if limit_reached:
+                    break
 
         return self._format_matches(matches, search_path, limit_reached, limit)
 

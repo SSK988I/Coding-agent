@@ -6,6 +6,10 @@ extraction, and prepare_compaction's iterative (previousSummary) path.
 """
 from __future__ import annotations
 
+from unittest.mock import patch
+
+import pytest
+
 from agent_llm import AssistantMessage, TextContent, ToolCall, ToolResultMessage, Usage, UserMessage
 
 from agent_core.session.compaction import (
@@ -78,6 +82,34 @@ def test_estimate_context_tokens_no_usage_fully_estimates():
     assert est.last_usage_index is None
     assert est.usage_tokens == 0
     assert est.tokens == est.trailing_tokens
+
+
+@pytest.mark.parametrize("anchor", [None, "error", "aborted", "stop"])
+def test_estimate_context_tokens_only_estimates_needed_messages_once(anchor):
+    messages = [_u("question"), _a("answer"), _u("next")]
+    if anchor is not None:
+        messages[1].usage = Usage(total_tokens=150)
+        messages[1].stop_reason = anchor
+    estimated = messages[2:] if anchor == "stop" else messages
+    trailing = sum(estimate_tokens(message) for message in estimated)
+
+    with patch("agent_core.session.compaction.estimate_tokens", wraps=estimate_tokens) as estimate:
+        result = estimate_context_tokens(messages)
+
+    assert [call.args[0] for call in estimate.call_args_list] == estimated
+    assert result.trailing_tokens == trailing
+    assert result.usage_tokens == (150 if anchor == "stop" else 0)
+    assert result.tokens == result.usage_tokens + trailing
+    assert result.last_usage_index == (1 if anchor == "stop" else None)
+
+
+def test_estimate_context_tokens_empty_history_needs_no_estimates():
+    with patch("agent_core.session.compaction.estimate_tokens", wraps=estimate_tokens) as estimate:
+        result = estimate_context_tokens([])
+
+    estimate.assert_not_called()
+    assert result.tokens == result.usage_tokens == result.trailing_tokens == 0
+    assert result.last_usage_index is None
 
 
 def test_estimate_context_tokens_skips_error_aborted_usage():

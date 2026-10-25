@@ -149,9 +149,6 @@ class FindTool:
                 rel = os.path.relpath(entry, search_path).replace(os.sep, "/")
             except ValueError:
                 rel = entry
-            # Re-add trailing slash for directories (fd omits it).
-            if os.path.isdir(os.path.join(search_path, *entry.split("/")) if os.path.isabs(entry) else entry):
-                pass  # fd already tells us; we keep as-is
             results.append(rel)
             if len(results) >= limit:
                 limit_reached = True

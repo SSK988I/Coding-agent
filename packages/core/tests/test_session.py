@@ -7,13 +7,14 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from agent_llm import AssistantMessage, TextContent, ToolResultMessage, UserMessage
 
 from agent_core.session.session_manager import SessionManager
-from agent_core.session.types import CompactionResult
+from agent_core.session.types import CompactionResult, SessionMessageEntry
 
 
 def _msg_user(t: str) -> UserMessage:
@@ -119,6 +120,22 @@ def test_open_resumes_entries_and_context(tmp_path: Path):
     assert len(ctx.messages) == 3
     assert ctx.messages[0].role == "user"
     assert ctx.messages[2].role == "toolResult"
+
+
+def test_open_keeps_only_one_list_of_entry_references(tmp_path: Path):
+    sm = SessionManager.create(cwd="/test/proj", agent_dir=tmp_path)
+    sm.append_message(_msg_user("question"))
+    sm.append_message(_msg_asst("answer"))
+    assert sm.path is not None
+
+    resumed = SessionManager.open(sm.path)
+    entry_objects = {id(entry) for entry in resumed.entries}
+    retained_lists = [
+        name for name, value in vars(resumed).items()
+        if isinstance(value, list) and any(id(item) in entry_objects for item in value)
+    ]
+    assert len(resumed.entries) == 2
+    assert retained_lists == ["entries"]
 
 
 def test_list_sessions_returns_infos(tmp_path: Path):
@@ -358,3 +375,79 @@ def test_get_tree_skips_leaf_entries():
     for root in tree:
         collect(root, types)
     assert "leaf" not in types
+
+
+@pytest.mark.parametrize(
+    "specification,expected,recovery_sort",
+    [
+        pytest.param([], [], False, id="empty"),
+        pytest.param(
+            [("late-root", None, "20"), ("late-child", "early-root", "31"),
+             ("early-root", None, "10"), ("early-child", "early-root", "30"),
+             ("grandchild", "early-child", "40"), ("tied-child", "early-root", "30")],
+            [("early-root", ["early-child", "tied-child", "late-child"]), ("early-child", ["grandchild"]),
+             ("grandchild", []), ("tied-child", []), ("late-child", []), ("late-root", [])],
+            False, id="multiple-roots-and-branches",
+        ),
+        pytest.param(
+            [("orphan", "missing", "10"), ("root", None, "05"), ("child", "orphan", "20")],
+            [("root", []), ("orphan", ["child"]), ("child", [])],
+            False, id="orphan",
+        ),
+        pytest.param(
+            [("self", "self", "20"), ("child", "self", "10")],
+            [("self", ["child"]), ("child", [])],
+            False, id="self-parent",
+        ),
+        pytest.param(
+            [("cycle-b", "cycle-a", "20"), ("cycle-a", "cycle-b", "10")],
+            [("cycle-a", ["cycle-b"]), ("cycle-b", [])],
+            True, id="rootless-cycle",
+        ),
+        pytest.param(
+            [("healthy", None, "30"), ("cycle-b", "cycle-a", "20"),
+             ("healthy-child", "healthy", "40"), ("cycle-a", "cycle-b", "10")],
+            [("healthy", ["healthy-child"]), ("healthy-child", []), ("cycle-a", ["cycle-b"]), ("cycle-b", [])],
+            True, id="healthy-and-cycle",
+        ),
+    ],
+)
+def test_get_tree_preserves_order_and_only_sorts_unreachable_recovery(specification, expected, recovery_sort):
+    sm = SessionManager.create(in_memory=True)
+    sm.entries = [
+        SessionMessageEntry(id=entry_id, parent_id=parent, timestamp=timestamp, message=_msg_user(entry_id))
+        for entry_id, parent, timestamp in specification
+    ]
+
+    with patch("agent_core.session.session_manager.sorted", wraps=sorted, create=True) as sort_entries:
+        tree = sm.get_tree()
+
+    actual = []
+    stack = list(reversed(tree))
+    while stack:
+        node = stack.pop()
+        actual.append((node.entry.id, [child.entry.id for child in node.children]))
+        stack.extend(reversed(node.children))
+    assert actual == expected
+    assert sort_entries.call_count == int(recovery_sort)
+
+
+def test_get_tree_deep_healthy_chain_does_not_sort_all_entries_again():
+    count = 1500
+    sm = SessionManager.create(in_memory=True)
+    sm.entries = [
+        SessionMessageEntry(id=str(index), parent_id=str(index - 1) if index else None, timestamp=f"{index:04d}")
+        for index in range(count)
+    ]
+
+    with patch("agent_core.session.session_manager.sorted", wraps=sorted, create=True) as sort_entries:
+        tree = sm.get_tree()
+
+    assert len(tree) == 1
+    node = tree[0]
+    for index in range(count):
+        assert node.entry.id == str(index)
+        assert len(node.children) == (1 if index < count - 1 else 0)
+        if node.children:
+            node = node.children[0]
+    assert sort_entries.call_count == 0

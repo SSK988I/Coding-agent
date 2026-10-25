@@ -1,13 +1,22 @@
 from __future__ import annotations
 
+import copy
+import dataclasses
 from dataclasses import dataclass
+import datetime as dt
+import enum
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
+from unittest.mock import Mock
 
 import pytest
 from agent_core import SessionManager
 from agent_core import AgentContext, BeforeToolCallContext
-from agent_llm import AssistantMessage, Model, ModelCost, TextContent, ToolCall, UserMessage
+from agent_llm import (
+    AssistantMessage, ImageContent, Model, ModelCost, TextContent, ToolCall,
+    ToolResultMessage, Usage, UsageCost, UserMessage,
+)
 
 from coding_agent.core.agent_session import AgentSession, AgentSessionConfig
 from coding_agent.core.messages import convert_to_llm
@@ -26,6 +35,122 @@ def test_to_jsonable_handles_runtime_values(tmp_path: Path) -> None:
     value = to_jsonable(_Payload(path=tmp_path, values={"read", "write"}))
     assert value["path"] == str(tmp_path)
     assert sorted(value["values"]) == ["read", "write"]
+
+
+def test_to_jsonable_preserves_real_message_payloads_without_aliasing() -> None:
+    image = ImageContent(data="aW1hZ2U=", mime_type="image/png")
+    arguments = {"path": "image.png", "options": {"formats": ["png"]}}
+    messages = [
+        UserMessage(content=[TextContent(text="look at this"), image], timestamp=1),
+        AssistantMessage(
+            content=[TextContent(text="opening image"), ToolCall(id="call-1", name="view_image", arguments=arguments)],
+            usage=Usage(input=7, output=4, cache_read=3, cache_write=1, total_tokens=15,
+                        cache_read_reported=True, cost=UsageCost(input=0.1, total=0.1)),
+            provider_data={"items": [{"type": "reasoning", "summary": ["public summary"]}]},
+            timestamp=2,
+        ),
+        ToolResultMessage(tool_call_id="call-1", tool_name="view_image",
+                          content=[TextContent(text="image result"), image],
+                          details={"sizes": [10, 20]}, status="completed", timestamp=3),
+    ]
+    before = copy.deepcopy(messages)
+    expected = [to_jsonable(dataclasses.asdict(message)) for message in messages]
+    actual = to_jsonable(messages)
+    assert actual == expected
+    assert [message["role"] for message in actual] == ["user", "assistant", "toolResult"]
+    assert actual[0]["content"][1] == {"type": "image", "data": "aW1hZ2U=", "mime_type": "image/png"}
+    assert actual[1]["usage"]["cache_read_reported"] is True
+    assert actual[1]["content"][1]["arguments"] is not arguments
+    assert actual[1]["content"][1]["arguments"]["options"]["formats"] is not arguments["options"]["formats"]
+    actual[0]["content"][1]["data"] = "changed"
+    actual[1]["content"][1]["arguments"]["options"]["formats"].append("changed")
+    actual[1]["usage"]["cost"]["input"] = 999
+    actual[1]["provider_data"]["items"][0]["summary"].append("changed")
+    actual[2]["details"]["sizes"].append(999)
+    assert messages == before
+
+
+def test_to_jsonable_preserves_nested_types_and_container_ownership(tmp_path: Path) -> None:
+    @dataclass(frozen=True, slots=True)
+    class FrozenRecord:
+        label: str
+        coordinates: tuple[int, int]
+
+    class State(enum.Enum):
+        READY = "ready"
+        RAW_PATH = Path("opaque-enum-value")
+
+    class Opaque:
+        __slots__ = ()
+
+        def __str__(self) -> str:
+            return "opaque value"
+
+    @dataclass
+    class Envelope:
+        values: dict[Any, Any]
+
+    namespace = SimpleNamespace(items=[b"hello", b"\xff"])
+    nested = {"items": [1, False, None]}
+    payload = Envelope({
+        1: [nested], "tuple": (FrozenRecord("point", (2, 3)),),
+        "set": {"a", "b"}, "frozen": frozenset({FrozenRecord("fixed", (4, 5))}),
+        "path": tmp_path, "bytes": b"hello\xff", "date": dt.date(2026, 10, 24),
+        "datetime": dt.datetime(2026, 10, 24, 12, 30, tzinfo=dt.timezone.utc),
+        "state": State.READY, "raw_enum": State.RAW_PATH, "typed": namespace, "opaque": Opaque(),
+    })
+    expected = to_jsonable(dataclasses.asdict(payload))
+    actual = to_jsonable(payload)
+    # Copying a set can change its iteration order; only ordered containers
+    # have an order-preservation contract.
+    for field in ("set", "frozen"):
+        for projection in (actual, expected):
+            projection["values"][field].sort(key=repr)
+    assert actual == expected
+    values = actual["values"]
+    assert values["1"] == [{"items": [1, False, None]}]
+    assert values["tuple"] == [{"label": "point", "coordinates": [2, 3]}]
+    assert sorted(values["set"]) == ["a", "b"]
+    assert values["frozen"] == [{"label": "fixed", "coordinates": [4, 5]}]
+    assert values["path"] == str(tmp_path)
+    assert values["bytes"] == "hello\ufffd"
+    assert values["date"] == "2026-10-24"
+    assert values["datetime"] == "2026-10-24T12:30:00+00:00"
+    assert values["state"] == "ready"
+    # Enum values are deliberately returned as-is, not recursively normalized.
+    assert values["raw_enum"] is State.RAW_PATH.value
+    assert values["typed"] == {"items": ["hello", "\ufffd"]}
+    assert values["opaque"] == "opaque value"
+    assert values is not payload.values
+    assert values["1"][0] is not nested
+    assert values["1"][0]["items"] is not nested["items"]
+    assert values["typed"]["items"] is not namespace.items
+    values["1"][0]["items"].append("changed")
+    values["typed"]["items"].append("changed")
+    values["tuple"][0]["coordinates"].append(999)
+    assert nested == {"items": [1, False, None]}
+    assert namespace.items == [b"hello", b"\xff"]
+    assert payload.values["tuple"][0].coordinates == (2, 3)
+
+
+@pytest.mark.parametrize("value", [_Payload, Usage])
+def test_to_jsonable_rejects_dataclass_classes(value: type) -> None:
+    with pytest.raises(TypeError, match=r"asdict\(\) should be called on dataclass instances"):
+        to_jsonable(value)
+
+
+def test_to_jsonable_traverses_dataclasses_without_asdict_or_deepcopy(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = AssistantMessage(content=[TextContent(text="hello"), ImageContent(data="aW1hZ2U=", mime_type="image/png")],
+                               usage=Usage(input=10, output=5), timestamp=1)
+    asdict = Mock(side_effect=AssertionError("unexpected asdict traversal"))
+    deepcopy = Mock(side_effect=AssertionError("unexpected deepcopy traversal"))
+    monkeypatch.setattr(dataclasses, "asdict", asdict)
+    monkeypatch.setattr(copy, "deepcopy", deepcopy)
+    actual = to_jsonable(payload)
+    assert actual["content"][1]["data"] == "aW1hZ2U="
+    assert actual["usage"]["input"] == 10
+    asdict.assert_not_called()
+    deepcopy.assert_not_called()
 
 
 @pytest.mark.parametrize("outcome", ["completed", "failed", "cancelled"])
@@ -125,6 +250,9 @@ def test_memory_rpc_requires_confirmation_and_publishes_updated_status() -> None
     import asyncio
 
     class MemorySession:
+        def get_stats(self):
+            return {}
+
         memory_enabled = True
         memory_identity = MemoryIdentity("local-user", "project-a")
         settings_manager = None
@@ -171,6 +299,9 @@ def test_memory_v2_status_auto_extract_remember_and_queue_event() -> None:
     import asyncio
 
     class MemorySession:
+        def get_stats(self):
+            return {}
+
         memory_enabled = True
         memory_identity = MemoryIdentity("local-user", "project-a")
         memory_service = SimpleNamespace(auto_extract=True)
@@ -280,6 +411,7 @@ def test_manual_compaction_rehydrates_desktop_with_persisted_summary(tmp_path: P
     runtime._workspace = tmp_path
     runtime._session = SimpleNamespace(
         compact=compact,
+        get_stats=lambda: {},
         session_manager=SimpleNamespace(header=SimpleNamespace(id="session-compact")),
         model=SimpleNamespace(id="m", name="Model", provider="test"),
         thinking_level=None,
@@ -358,6 +490,7 @@ def test_plan_handoff_opens_fresh_review_session_after_core_persists(
     }
     target_session = SimpleNamespace(
         session_manager=target_manager,
+        get_stats=lambda: {},
         state=SimpleNamespace(messages=[]),
         model=SimpleNamespace(id="model", name="Model", provider="test"),
         thinking_level=None,
