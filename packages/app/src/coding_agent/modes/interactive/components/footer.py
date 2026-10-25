@@ -21,6 +21,7 @@ class FooterComponent(Component):
         self._session = session
         self._theme = theme
         self._git_branch: "str | None" = None
+        self._stats_snapshot: Any | None = None
         # Refresh once at construction so the first render has a branch.
         self.refresh_git_branch()
 
@@ -51,14 +52,17 @@ class FooterComponent(Component):
             self._git_branch = None
 
     def invalidate(self) -> None:
-        pass  # Stateless render (reads session fresh each frame).
+        self._stats_snapshot = None
 
     # ── render ──────────────────────────────────────────────────────────
 
     def render(self, width: int) -> list[str]:
         if width <= 0:
             return [""]
-        stats = self._session.get_stats()
+        stats = self._stats_snapshot
+        if stats is None:
+            stats = self._session.get_stats()
+            self._stats_snapshot = stats
         metrics = stats.metrics
         model = self._session.model
 

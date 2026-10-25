@@ -7,6 +7,8 @@ Reads a file's contents. Errors (file not found, permission) are raised
 from __future__ import annotations
 
 import os
+from itertools import islice
+import sys
 from typing import Any
 
 from agent_llm import TextContent
@@ -75,20 +77,20 @@ class ReadTool:
         if not os.path.isfile(full_path):
             raise FileNotFoundError(f"File not found: {path}")
 
+        # Apply offset (1-indexed) and retain one extra line for truncation.
+        start = int(offset) - 1 if offset is not None and offset > 0 else 0
+        cap = int(limit) if limit is not None else self.max_lines
         try:
             with open(full_path, "r", encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
+                if start >= 0 and cap >= 0:
+                    lines = list(islice(f, min(start, sys.maxsize), min(start + cap + 1, sys.maxsize)))
+                else:
+                    # Preserve legacy negative slicing without constraining input.
+                    lines = f.readlines()[start:]
         except OSError as e:
             raise RuntimeError(f"Failed to read {path}: {e}") from e
 
-        # Apply offset (1-indexed).
-        start = 0
-        if offset is not None and offset > 0:
-            start = int(offset) - 1
-        lines = lines[start:]
-
         # Apply limit.
-        cap = int(limit) if limit is not None else self.max_lines
         truncated = len(lines) > cap
         lines = lines[:cap]
 

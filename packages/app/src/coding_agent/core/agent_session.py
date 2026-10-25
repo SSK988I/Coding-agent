@@ -1662,8 +1662,8 @@ class AgentSession:
         )
 
         entries = self.session_manager.get_branch()
+        from agent_core.session.types import SessionMessageEntry
         for entry in entries:
-            from agent_core.session.types import SessionMessageEntry
             if not isinstance(entry, SessionMessageEntry) or entry.message is None:
                 continue
             msg = entry.message

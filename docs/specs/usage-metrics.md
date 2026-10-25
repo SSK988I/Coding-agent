@@ -24,4 +24,6 @@
 
 `AgentSession.get_stats().metrics` 是双端唯一计算来源。桌面工作区和 `session.snapshot` 返回完整 stats；消息结束、工具回合结束、压缩、模型或联网开关变化时通过 `session.statsChanged {stats}` 更新，不逐 token 重算。会话切换应用新快照，旧会话事件不能覆盖当前指标。
 
+TUI 底栏复用最近一次统计快照，普通重绘和流式增量不遍历历史。已有会话事件在消息入账、工具回合结束、压缩和 Plan 状态变化后使快照失效；切换分支、会话或模型、清空上下文、Shell 直通及回合结束后的临时提示词清理也会触发刷新。新增会改变统计的 TUI 操作时，应复用 `_refresh_footer()`，或在对应会话事件中使快照失效。
+
 新用量记录包含可选 `cache_read_reported`，区分供应商未报告缓存与明确报告零命中。旧 JSONL 仍可读取，未改动 Plan reducer、工具审批或执行策略。

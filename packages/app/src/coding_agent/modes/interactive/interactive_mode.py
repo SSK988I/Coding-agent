@@ -164,7 +164,7 @@ class InteractiveMode:
         self._displayed_plan_key: tuple[Any, ...] | None = None
         self._is_submitting_plan = False
         self._subagent_cards: dict[str, Any] = {}
-        self._subagent_unsubscribe = self._session.on_event(self._on_subagent_event)
+        self._session_unsubscribe = self._session.on_event(self._on_session_event)
         self._permission_lock = asyncio.Lock()
         self._permission_native_decision: tuple[asyncio.Event, bool] | None = None
         self._prior_tool_hook = session._config.before_tool_call
@@ -256,7 +256,15 @@ class InteractiveMode:
                                  else "bypass permissions off · " + ("帮我批准" if mode == "auto" else "请求批准"))
         self._refresh_footer()
 
-    def _on_subagent_event(self, event: dict) -> None:
+    def _on_session_event(self, event: dict) -> None:
+        """Refresh display facts at session boundaries, not on every delta."""
+        if event.get("type") in {
+            "agent_start", "agent_end", "message_end", "turn_end",
+            "compaction_start", "compaction_end", "auto_compaction_start", "auto_compaction_end",
+            "bash_execution", "collaboration_mode_changed", "plan_state_changed", "plan.stateChanged",
+        }:
+            self._footer.invalidate()
+            self.tui.request_render()
         if event.get("type") == "subagent.stateChanged":
             self._render_subagents(event.get("tasks", []))
 
@@ -528,6 +536,8 @@ class InteractiveMode:
                 self._streaming_component = None
             self._pending_tools.clear()
             self._clear_status_indicator()
+            # prompt() removes temporary memory context after agent_end.
+            self._footer.invalidate()
             self.tui.request_render()
 
     # ── Agent event -> UI mapping ─────────────────────────────────────────
@@ -980,6 +990,7 @@ class InteractiveMode:
 
     def _cmd_clear(self) -> None:
         self._session.agent.reset()
+        self._footer.invalidate()
         self.chat_container.clear()
         self._displayed_plan_key = None
         self._tool_cards.clear()
@@ -2338,6 +2349,7 @@ class InteractiveMode:
 
     def _refresh_footer(self) -> None:
         """Called after model/thinking/turn changes to keep footer current."""
+        self._footer.invalidate()
         self._footer.refresh_git_branch()
         self.tui.request_render()
 
@@ -2422,7 +2434,7 @@ class InteractiveMode:
         while self._running:
             await asyncio.sleep(0.05)
 
-        self._subagent_unsubscribe()
+        self._session_unsubscribe()
         self.tui.stop()
 
     def _register_input_listeners(self) -> None:

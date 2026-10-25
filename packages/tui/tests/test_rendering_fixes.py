@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import pytest
 
 from agent_tui.components.assistant_message import AssistantMessageComponent
 
@@ -200,3 +201,111 @@ def test_overflow_guard_pads_before_border_after_wide_grapheme():
 
     assert visible_width(guarded) == 8
     assert guarded.endswith("│")
+
+
+def test_printable_ascii_fast_path_preserves_all_ascii_boundaries():
+    from agent_tui.utils import _is_printable_ascii
+
+    assert _is_printable_ascii("") is True
+    for codepoint in range(128):
+        char = chr(codepoint)
+        expected = 0x20 <= codepoint <= 0x7E
+        assert _is_printable_ascii(char) is expected
+        assert _is_printable_ascii("prefix" + char + "suffix") is expected
+
+
+@pytest.mark.parametrize("text", ["中文", "é", "e\u0301", "👩‍💻", "😀", "\x1b[31mred\x1b[0m", "\x1b]133;A\x07"])
+def test_printable_ascii_fast_path_excludes_unicode_and_terminal_sequences(text: str):
+    from agent_tui.utils import _is_printable_ascii
+
+    assert _is_printable_ascii(text) is False
+
+
+@pytest.mark.parametrize(("text", "expected"), [
+    ("", 0), (" ASCII~", 7), ("\t", 3), ("\x00\x1f\x7f", 0), ("\n\r", 0),
+    ("中文", 4), ("e\u0301", 1), ("👩‍💻", 2),
+    ("\x1b[31m中文\x1b[0m", 4),
+    ("\x1b]8;;https://example.com/\x07link\x1b]8;;\x07", 4),
+    ("\x1b]133;A\x07hi\x1b]133;B\x1b\\", 2),
+    ("\x1b_Gi=1;payload\x1b\\X", 1),
+])
+def test_visible_width_preserves_unicode_controls_and_terminal_sequences(text: str, expected: int):
+    from agent_tui.utils import visible_width
+
+    assert visible_width(text) == expected
+
+
+@pytest.mark.parametrize(("text", "expected"), [
+    ("", ""), ("abc", "a"), ("中文", "中"), ("e\u0301suffix", "e\u0301"),
+    ("👩‍💻suffix", "👩‍💻"), ("👍🏽!", "👍🏽"), ("🇨🇳🇯🇵", "🇨🇳"),
+    ("\r\nx", "\r\n"), ("\u0301x", "\u0301"), ("\tspace", "\t"), ("\ud800rest", "\ud800"),
+])
+def test_first_grapheme_matches_existing_unicode_segmentation(text: str, expected: str):
+    from agent_tui.utils import first_grapheme, segment_graphemes
+
+    assert first_grapheme(text) == expected
+    assert first_grapheme(text) == next(iter(segment_graphemes(text)), "")
+
+
+@pytest.mark.parametrize("cluster", ["a", "中", "e\u0301", "👩‍💻", "👍🏽", "🇨🇳"])
+@pytest.mark.parametrize("delete_key", ["\x1b[3~", "\x04"])
+def test_editor_forward_delete_and_cursor_keep_complete_graphemes_and_undo(cluster: str, delete_key: str):
+    from agent_tui.components.editor import Editor
+    from agent_tui.tui import CURSOR_MARKER
+
+    editor = Editor()
+    editor.focused = True
+    prefix, suffix = "p|", " remaining 中文 e\u0301 👍🏽 "
+    original = prefix + cluster + suffix
+    editor.set_text_and_cursor(original, 0, len(prefix))
+    changes = []
+    editor.on_change = changes.append
+
+    rendered = editor.render(80)
+    assert CURSOR_MARKER + f"\x1b[7m{cluster}\x1b[0m" + suffix in "\n".join(rendered)
+    assert editor.get_text() == original
+
+    assert editor.handle_input(delete_key)
+    assert editor.get_text() == prefix + suffix
+    assert editor.get_cursor() == (0, len(prefix))
+    assert changes[-1] == prefix + suffix
+
+    assert editor.handle_input("\x1a")  # Ctrl+Z restores the entire cluster and suffix.
+    assert editor.get_text() == original
+    assert editor.get_cursor() == (0, len(prefix))
+
+
+def test_editor_forward_delete_and_cursor_do_not_segment_the_entire_suffix(monkeypatch):
+    import agent_tui.components.editor as editor_module
+
+    def unexpected_full_segmentation(_text):
+        raise AssertionError("Cursor highlighting and forward delete only need the first grapheme")
+
+    monkeypatch.setattr(editor_module, "segment_graphemes", unexpected_full_segmentation)
+    editor = editor_module.Editor()
+    suffix = " ordinary text 中文 " * 100
+    editor.set_text_and_cursor("👩‍💻" + suffix, 0, 0)
+    editor.focused = True
+
+    assert "\x1b[7m👩‍💻\x1b[0m" in "\n".join(editor.render(4000))
+    editor.handle_input("\x1b[3~")
+    assert editor.get_text() == suffix
+
+
+def test_editor_forward_delete_keeps_empty_and_line_join_behavior():
+    from agent_tui.components.editor import Editor
+    from agent_tui.tui import CURSOR_MARKER
+
+    editor = Editor()
+    editor.focused = True
+    editor.handle_input("\x1b[3~")
+    assert editor.get_text() == ""
+    assert CURSOR_MARKER + "\x1b[7m \x1b[0m" in "\n".join(editor.render(80))
+
+    editor.set_text_and_cursor("first\nsecond", 0, len("first"))
+    editor.handle_input("\x1b[3~")
+    assert editor.get_text() == "firstsecond"
+    assert editor.get_cursor() == (0, len("first"))
+    editor.handle_input("\x1a")
+    assert editor.get_text() == "first\nsecond"
+    assert editor.get_cursor() == (0, len("first"))

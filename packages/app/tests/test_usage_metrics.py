@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from agent_core import SessionManager
@@ -153,6 +154,34 @@ def test_session_stats_restore_and_branch_switch_follow_active_history(tmp_path)
         assert session.get_stats().metrics.context_estimated is True
         session.agent.reset()
         assert session.get_stats().metrics.context_estimated is True
+    finally:
+        session.dispose()
+
+
+def test_session_stats_does_not_import_message_type_per_history_entry(tmp_path):
+    session = AgentSession(AgentSessionConfig(cwd=str(tmp_path), model=model(), tools=[]))
+    messages = []
+    for _ in range(8):
+        messages.extend([UserMessage(content="question"), assistant()])
+    for message in messages:
+        session.session_manager.append_message(message)
+    session.agent.load_messages(messages)
+    original_import = __import__
+    message_type_imports = []
+
+    def tracked_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "agent_core.session.types" and "SessionMessageEntry" in fromlist:
+            message_type_imports.append(name)
+        return original_import(name, globals, locals, fromlist, level)
+
+    try:
+        with patch("builtins.__import__", side_effect=tracked_import):
+            stats = session.get_stats()
+        assert len(message_type_imports) <= 1
+        assert stats.user_messages == stats.assistant_messages == 8
+        assert stats.total_messages == 16
+        assert stats.metrics.input_tokens == 8_000
+        assert stats.metrics.cache_hit_rate == 90
     finally:
         session.dispose()
 

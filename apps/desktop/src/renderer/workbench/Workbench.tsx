@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import type { WorkspacePayload } from "../../shared/types";
 import type { WorkbenchScope, WorkbenchTool } from "../../shared/workbench";
 import { ChangesPanel, FilesPanel, SideChatPanel } from "./panels";
@@ -15,7 +15,7 @@ const TOOLS: { kind: WorkbenchTool; label: string; description: string; path: st
 interface ToolTab { id: string; kind: WorkbenchTool; title: string }
 function ToolIcon({ kind }: { kind: WorkbenchTool }) { return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={TOOLS.find((tool) => tool.kind === kind)!.path} /></svg>; }
 
-export function Workbench({ workspace, open, onClose, width, onWidth, sidebarOpen = true }: { workspace: WorkspacePayload; open: boolean; onClose: () => void; width: number; onWidth: (width: number) => void; sidebarOpen?: boolean }) {
+export const Workbench = memo(function Workbench({ workspace, open, onClose, width, onWidth, sidebarOpen = true }: { workspace: WorkspacePayload; open: boolean; onClose: () => void; width: number; onWidth: (width: number) => void; sidebarOpen?: boolean }) {
   const scope = useMemo<WorkbenchScope>(() => ({ workspacePath: workspace.path, sessionId: workspace.sessionId }), [workspace.path, workspace.sessionId]);
   const [tabs, setTabs] = useState<ToolTab[]>([]);
   const [active, setActive] = useState<string | null>(null);
@@ -87,4 +87,4 @@ export function Workbench({ workspace, open, onClose, width, onWidth, sidebarOpe
       </div>;
     })}
   </aside>;
-}
+});

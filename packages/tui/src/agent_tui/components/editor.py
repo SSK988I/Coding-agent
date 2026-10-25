@@ -16,7 +16,7 @@ from agent_tui.keys import matches_key
 from agent_tui.kill_ring import KillRing
 from agent_tui.tui import CURSOR_MARKER, Component
 from agent_tui.undo_stack import UndoStack
-from agent_tui.utils import segment_graphemes, truncate_to_width, visible_width, wrap_text_with_ansi
+from agent_tui.utils import first_grapheme, segment_graphemes, truncate_to_width, visible_width, wrap_text_with_ansi
 
 if TYPE_CHECKING:
     from agent_tui.tui import TUI
@@ -209,8 +209,7 @@ class Editor(Component):
                 marker = CURSOR_MARKER if emit_marker else ""
                 if after:
                     # Cursor on a character: reverse-video it (grapheme-aware).
-                    after_graphemes = segment_graphemes(after)
-                    first = after_graphemes[0] if after_graphemes else " "
+                    first = first_grapheme(after) or " "
                     rest = after[len(first):]
                     cursor = f"\x1b[7m{first}\x1b[0m"
                     display = before + marker + cursor + rest
@@ -487,9 +486,7 @@ class Editor(Component):
         if self._state.cursor_col < len(line):
             self._push_undo()
             after = line[self._state.cursor_col:]
-            graphemes = segment_graphemes(after)
-            first = graphemes[0] if graphemes else ""
-            glen = len(first)
+            glen = len(first_grapheme(after))
             self._state.lines[self._state.cursor_line] = line[: self._state.cursor_col] + line[self._state.cursor_col + glen:]
         elif self._state.cursor_line < len(self._state.lines) - 1:
             self._push_undo()

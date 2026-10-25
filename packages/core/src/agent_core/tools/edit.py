@@ -284,7 +284,7 @@ def _apply_edits(
     # length-preserving case).
     result = content_lf
     for m in sorted(matched, key=lambda m: m["index"], reverse=True):
-        result = result[: m["index"]] + m["new_text"] + result[m["index"] + m["length"] :]
+        result = "".join((result[: m["index"]], m["new_text"], result[m["index"] + m["length"] :]))
 
     if result == content_lf:
         raise ValueError(

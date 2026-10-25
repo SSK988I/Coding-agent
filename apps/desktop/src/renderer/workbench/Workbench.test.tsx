@@ -127,6 +127,52 @@ it("keeps header-like source lines inside hunks and advances context line number
   expect(context?.querySelectorAll(".diff-line-number")[1]).toHaveTextContent("2");
 });
 
+it("mounts only expanded diffs, preserves expansion on refresh and resets it for a new source", async () => {
+  let addedLine = "second before refresh";
+  request.mockImplementation(async (_method: string, params: { source: string }) => ({
+    ...changes, source: params.source,
+    files: [changes.files[0], {
+      ...changes.files[0], path: "second.py",
+      diff: `--- a/second.py\n+++ b/second.py\n@@ -1 +1 @@\n-old second\n+${addedLine}\n`,
+    }],
+  }));
+  render(<ChangesPanel scope={scope} active onOpenFile={vi.fn()} />);
+  const first = (await screen.findByText("sample.py")).closest("details")!;
+  const second = screen.getByText("second.py").closest("details")!;
+
+  expect(first).toHaveAttribute("open");
+  expect(first.querySelector("table")).not.toBeNull();
+  expect(second).not.toHaveAttribute("open");
+  expect(second.querySelector("table")).toBeNull();
+
+  fireEvent.click(second.querySelector("summary")!);
+  await screen.findByText("second before refresh");
+  expect(second).toHaveAttribute("open");
+  fireEvent.click(second.querySelector("summary")!);
+  await waitFor(() => expect(second.querySelector("table")).toBeNull());
+  expect(second).not.toHaveAttribute("open");
+
+  fireEvent.click(second.querySelector("summary")!);
+  await screen.findByText("second before refresh");
+  addedLine = "second after refresh";
+  fireEvent.click(screen.getByRole("button", { name: "刷新变更" }));
+  await screen.findByText("second after refresh");
+  expect(second).toHaveAttribute("open");
+  expect(screen.queryByText("second before refresh")).not.toBeInTheDocument();
+
+  fireEvent.click(first.querySelector("summary")!);
+  await waitFor(() => expect(first.querySelector("table")).toBeNull());
+  fireEvent.change(screen.getByLabelText("变更来源"), { target: { value: "staged" } });
+  await waitFor(() => {
+    const nextFirst = screen.getByText("sample.py").closest("details")!;
+    const nextSecond = screen.getByText("second.py").closest("details")!;
+    expect(nextFirst).toHaveAttribute("open");
+    expect(nextFirst.querySelector("table")).not.toBeNull();
+    expect(nextSecond).not.toHaveAttribute("open");
+    expect(nextSecond.querySelector("table")).toBeNull();
+  });
+});
+
 it("ignores an older diff response after changing the selected source", async () => {
   let resolveOld!: (value: unknown) => void;
   request.mockImplementation(async (_method: string, params: { source: string }) => params.source === "unstaged" ? new Promise((resolve) => { resolveOld = resolve; }) : { ...changes, source: "staged", files: [] });
@@ -146,6 +192,31 @@ it("does not replace a current file preview with an older read", async () => {
   await screen.findByText("CURRENT");
   await act(async () => { resolveOld({ path: "old.py", text: "STALE" }); });
   expect(screen.queryByText("STALE")).not.toBeInTheDocument();
+});
+
+it.each([
+  { lines: 5000, trailingNewline: false, truncated: false },
+  { lines: 5000, trailingNewline: true, truncated: true },
+  { lines: 6500, trailingNewline: false, truncated: true },
+])("bounds preview splitting at 5001 entries ($lines lines, trailing newline: $trailingNewline)", async ({ lines, trailingNewline, truncated }) => {
+  const text = Array.from({ length: lines }, (_, index) => index === 4999
+    ? "last visible line" : `preview line ${index + 1}`).join("\n") + (trailingNewline ? "\n" : "");
+  request.mockImplementation(async (method: string) => method === "workbench.files.list"
+    ? { entries: [], truncated: false }
+    : { path: "large.py", text, size: text.length, truncated: false, binary: false, image: null });
+  const split = vi.spyOn(String.prototype, "split");
+  try {
+    const view = render(<FilesPanel scope={scope} requestedFile={{ path: "large.py", serial: 1 }} />);
+    await screen.findByText("last visible line");
+    expect(view.container.querySelectorAll(".file-code-line")).toHaveLength(5000);
+    expect(screen.queryByText("preview line 5001")).not.toBeInTheDocument();
+    expect(Boolean(screen.queryByText("仅显示前 5000 行。"))).toBe(truncated);
+    const previewSplits = split.mock.calls.filter((_, index) => split.mock.contexts[index] === text);
+    expect(previewSplits.length).toBeGreaterThan(0);
+    for (const args of previewSplits) expect(args).toEqual(["\n", 5001]);
+  } finally {
+    split.mockRestore();
+  }
 });
 
 it("sends, approves and stops only the side conversation; unrelated session events are ignored", async () => {

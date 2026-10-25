@@ -50,13 +50,11 @@ def _close_trailing(s: str) -> str:
     跟踪字符串状态,避免字符串内部的引号干扰深度计数。会去掉末尾的逗号或
     冒号 —— 否则它们会让修复后的 JSON 不合法。
     """
-    out: list[str] = []
     stack: list[str] = []  # 存放 '{' 或 '['
     in_string = False
     escape = False
 
     for ch in s:
-        out.append(ch)
         if in_string:
             if escape:
                 escape = False
@@ -78,10 +76,8 @@ def _close_trailing(s: str) -> str:
             if stack and stack[-1] == "[":
                 stack.pop()
 
-    repaired = "".join(out)
-
     # 削掉末尾悬空的逗号或冒号(model 在 key 或 value 之后暂停时常见)。
-    stripped = repaired.rstrip()
+    stripped = s.rstrip()
     while stripped and stripped[-1] in ",:":
         stripped = stripped[:-1].rstrip()
 

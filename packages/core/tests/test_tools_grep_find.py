@@ -8,6 +8,7 @@ subprocess path produces the same shape of output.
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 import pytest
@@ -64,6 +65,40 @@ def test_grep_limit_truncates(tmp_path: Path):
     assert "Use limit=10" in text
 
 
+@pytest.mark.parametrize("limit, expected_directories", [(1, 1), (2, 2), (3, 3)])
+def test_grep_python_stops_walking_at_match_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limit: int, expected_directories: int,
+):
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    remaining = tmp_path / "remaining"
+    remaining.mkdir()
+    (tmp_path / "first.txt").write_text("match\n", encoding="utf-8")
+    (nested / "second.txt").write_text("match\n", encoding="utf-8")
+    (remaining / "other.txt").write_text("unrelated\n", encoding="utf-8")
+    walked: list[str] = []
+
+    def fake_walk(search_path):
+        assert search_path == str(tmp_path)
+        for directory, directories, files in (
+            (tmp_path, ["nested", "remaining"], ["first.txt"]),
+            (nested, [], ["second.txt"]),
+            (remaining, [], ["other.txt"]),
+        ):
+            walked.append(str(directory))
+            yield str(directory), directories, files
+
+    monkeypatch.setattr("agent_core.tools.grep.os.walk", fake_walk)
+    monkeypatch.setattr("agent_core.tools.grep.is_ignored", lambda *args, **kwargs: False)
+    tool = GrepTool(cwd=str(tmp_path), prefer_external=False)
+    text = _run(tool.execute("id", {"pattern": "match", "limit": limit})).content[0].text
+
+    assert len(walked) == expected_directories
+    assert "first.txt:1: match" in text
+    assert ("nested/second.txt:1: match" in text) is (limit > 1)
+    assert ("matches limit reached" in text) is (limit <= 2)
+
+
 def test_grep_glob_filter(tmp_path: Path):
     (tmp_path / "a.py").write_text("target\n", encoding="utf-8")
     (tmp_path / "b.txt").write_text("target\n", encoding="utf-8")
@@ -93,6 +128,21 @@ def test_grep_single_file(tmp_path: Path):
     # Only a.py should be searched.
     assert "a.py:1: x" in text
     assert "b.py" not in text
+
+
+def test_grep_python_single_file_does_not_walk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    (tmp_path / "a.txt").write_text("match\nother\nmatch\n", encoding="utf-8")
+
+    def fail_walk(*args, **kwargs):
+        pytest.fail("A single-file search must not walk directories")
+
+    monkeypatch.setattr("agent_core.tools.grep.os.walk", fail_walk)
+    tool = GrepTool(cwd=str(tmp_path), prefer_external=False)
+    text = _run(tool.execute("id", {"pattern": "match", "path": "a.txt", "limit": 1})).content[0].text
+
+    assert "a.txt:1: match" in text
+    assert "a.txt:3:" not in text
+    assert "1 matches limit reached" in text
 
 
 def test_grep_missing_path_raises(tmp_path: Path):
@@ -158,6 +208,40 @@ def test_find_returns_relative_paths(tmp_path: Path):
     # Should be relative (no absolute path), POSIX separators.
     assert "pkg/mod.py" in text
     assert str(tmp_path) not in text
+
+
+@pytest.mark.parametrize("limit", [1, 3, 10])
+@pytest.mark.parametrize("exit_code", [0, 1])
+def test_find_fd_does_not_recheck_each_result_on_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limit: int, exit_code: int,
+):
+    lines = [str(tmp_path / "src" / "a.py"), str(tmp_path / "folder") + "/", "  ", str(tmp_path / "文件.txt")]
+    checked_paths: list[str] = []
+    isdir = os.path.isdir
+
+    def tracked_isdir(path):
+        checked_paths.append(str(path))
+        return isdir(path)
+
+    async def fake_fd(args, *, timeout):
+        assert args == [
+            "fd-placeholder", "--glob", "--color=never", "--hidden",
+            "--max-results", str(limit), "--", "*", str(tmp_path),
+        ]
+        assert timeout == 30.0
+        return lines, exit_code, "partial output" if exit_code else ""
+
+    monkeypatch.setattr("agent_core.tools.find.find_in_path", lambda name: "fd-placeholder")
+    monkeypatch.setattr(FindTool, "_inside_git_repo", staticmethod(lambda path: True))
+    monkeypatch.setattr("agent_core.tools._subprocess.run_subprocess_lines", fake_fd)
+    monkeypatch.setattr("agent_core.tools.find.os.path.isdir", tracked_isdir)
+
+    text = _run(FindTool(cwd=str(tmp_path)).execute("id", {"pattern": "*", "limit": limit})).content[0].text
+
+    assert text.split("\n\n")[0].splitlines() == ["src/a.py", "folder", "文件.txt"][:limit]
+    assert ("results limit reached" in text) is (limit <= 3)
+    # Only validate the search root; fd results need formatting, not another stat.
+    assert checked_paths == [str(tmp_path)]
 
 
 # ─── rg/fd subprocess path sanity (only if binaries present) ──────────

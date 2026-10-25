@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 import hashlib
+import json
+import os
+from pathlib import Path
 import subprocess
 
 import pytest
@@ -14,7 +18,7 @@ from coding_agent.core.retry import RetryPolicy
 from coding_agent.desktop.protocol import RpcError
 from coding_agent.desktop.runtime import DesktopRuntime
 from coding_agent.desktop.side_conversations import SideConversations
-from coding_agent.desktop.workbench import MAX_PREVIEW_BYTES, WorkspaceWorkbench
+from coding_agent.desktop.workbench import HIDDEN_DIRECTORIES, MAX_PREVIEW_BYTES, WorkspaceWorkbench
 
 
 def git(root, *args):
@@ -32,6 +36,213 @@ def repository(tmp_path):
     git(root, "add", ".")
     git(root, "commit", "-m", "initial")
     return root
+
+
+def legacy_file_listing(workbench, params):
+    directory = workbench.path(params.get("path", ""))
+    show_hidden = bool(params.get("showHidden", False))
+    entries = []
+    for child in sorted(directory.iterdir(), key=lambda item: (not item.is_dir(), item.name.casefold())):
+        if not show_hidden and (child.name.startswith(".") or child.name in HIDDEN_DIRECTORIES):
+            continue
+        outside = not child.resolve().is_relative_to(workbench.workspace)
+        metadata = child.lstat()
+        entries.append({
+            "name": child.name, "path": child.relative_to(workbench.workspace).as_posix(),
+            "kind": "directory" if child.is_dir() and not outside else "file",
+            "size": metadata.st_size, "symlink": child.is_symlink(), "blocked": outside,
+        })
+        if len(entries) >= 500:
+            break
+    return {"path": directory.relative_to(workbench.workspace).as_posix(), "entries": entries, "truncated": len(entries) == 500}
+
+
+@pytest.mark.parametrize("show_hidden", [False, True])
+def test_file_listing_preserves_directory_first_casefold_order_and_hidden_rules(tmp_path, show_hidden):
+    root = tmp_path / "workspace"
+    root.mkdir()
+    for name in ("z-dir", "A-dir", ".hidden-dir", "node_modules"):
+        (root / name).mkdir()
+    for name in ("Zulu.txt", "alpha.txt", "Beta.txt", ".hidden-file", "ß.txt", "ss.txt"):
+        (root / name).write_text(name, encoding="utf-8")
+    workbench = WorkspaceWorkbench(root, "session", tmp_path / "cache")
+    params = {"showHidden": show_hidden}
+    actual = workbench.list_files(params)
+    assert actual == legacy_file_listing(workbench, params)
+    tied = [child.name for child in root.iterdir() if child.name.casefold() == "ss.txt"]
+    expected = ([".hidden-dir", "A-dir", "node_modules", "z-dir", ".hidden-file"] if show_hidden else ["A-dir", "z-dir"]) + ["alpha.txt", "Beta.txt", *tied, "Zulu.txt"]
+    assert [entry["name"] for entry in actual["entries"]] == expected
+
+
+@pytest.mark.parametrize("count", [499, 500, 501])
+def test_file_listing_keeps_the_visible_500_entry_cap(tmp_path, count):
+    root = tmp_path / "workspace"
+    root.mkdir()
+    for index in range(count):
+        (root / f"file-{index:03}.txt").touch()
+    (root / ".hidden").touch()
+    workbench = WorkspaceWorkbench(root, "session", tmp_path / "cache")
+    actual = workbench.list_files({})
+    assert actual == legacy_file_listing(workbench, {})
+    assert len(actual["entries"]) == min(count, 500)
+    assert actual["truncated"] is (count >= 500)
+
+
+def test_file_listing_preserves_internal_external_and_broken_symlinks(tmp_path):
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "inside.txt").write_text("internal", encoding="utf-8")
+    (root / "inside-dir").mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("external", encoding="utf-8")
+    outside_dir = tmp_path / "outside-dir"
+    outside_dir.mkdir()
+    targets = {
+        "inside-link": (root / "inside.txt", False, False, "file"),
+        "inside-dir-link": (root / "inside-dir", True, False, "directory"),
+        "outside-link": (outside, False, True, "file"),
+        "outside-dir-link": (outside_dir, True, True, "file"),
+        "broken-inside": (root / "missing.txt", False, False, "file"),
+        "broken-outside": (tmp_path / "missing.txt", False, True, "file"),
+    }
+    for name, (target, directory, _, _) in targets.items():
+        try:
+            (root / name).symlink_to(target, target_is_directory=directory)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"Symlink creation is unavailable: {exc}")
+    workbench = WorkspaceWorkbench(root, "session", tmp_path / "cache")
+    actual = workbench.list_files({})
+    assert actual == legacy_file_listing(workbench, {})
+    entries = {entry["name"]: entry for entry in actual["entries"]}
+    for name, (_, _, blocked, kind) in targets.items():
+        assert entries[name]["symlink"] is True
+        assert entries[name]["blocked"] is blocked
+        assert entries[name]["kind"] == kind
+        assert entries[name]["size"] == (root / name).lstat().st_size
+
+
+def test_file_listing_closes_the_scanner_and_maps_scan_errors(tmp_path, monkeypatch):
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "sample.txt").write_text("sample", encoding="utf-8")
+    workbench = WorkspaceWorkbench(root, "session", tmp_path / "cache")
+    original_scandir = os.scandir
+    closed = []
+
+    @contextmanager
+    def tracked_scandir(path):
+        with original_scandir(path) as scanner:
+            try:
+                yield scanner
+            finally:
+                closed.append(Path(path))
+
+    monkeypatch.setattr(os, "scandir", tracked_scandir)
+    assert workbench.list_files({})["entries"][0]["name"] == "sample.txt"
+    assert closed == [root]
+
+    def denied(_path):
+        raise PermissionError("listing denied")
+
+    monkeypatch.setattr(os, "scandir", denied)
+    with pytest.raises(RpcError, match="listing denied") as error:
+        workbench.list_files({})
+    assert error.value.code == "FILE_READ_ERROR"
+
+
+def test_file_listing_maps_entry_metadata_errors_after_closing_scanner(tmp_path, monkeypatch):
+    root = tmp_path / "workspace"
+    root.mkdir()
+    file = root / "sample.txt"
+    file.touch()
+    workbench = WorkspaceWorkbench(root, "session", tmp_path / "cache")
+    closed = []
+
+    class UnreadableEntry:
+        name = "sample.txt"
+        path = str(file)
+
+        def is_dir(self):
+            return False
+
+        def stat(self, *, follow_symlinks=True):
+            raise PermissionError("metadata denied")
+
+    @contextmanager
+    def failing_scandir(_path):
+        try:
+            yield iter([UnreadableEntry()])
+        finally:
+            closed.append(True)
+
+    def denied_lstat(_path, *args, **kwargs):
+        raise PermissionError("metadata denied")
+
+    monkeypatch.setattr(os, "scandir", failing_scandir)
+    monkeypatch.setattr(Path, "lstat", denied_lstat)
+    with pytest.raises(RpcError, match="metadata denied") as error:
+        workbench.list_files({})
+    assert error.value.code == "FILE_READ_ERROR"
+    assert closed == [True]
+
+
+def test_file_listing_reuses_scanned_metadata_instead_of_restatting_each_path(tmp_path, monkeypatch):
+    root = tmp_path / "workspace"
+    root.mkdir()
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (root / name).write_text(name, encoding="utf-8")
+    (root / "folder").mkdir()
+    workbench = WorkspaceWorkbench(root, "session", tmp_path / "cache")
+    expected = legacy_file_listing(workbench, {})
+    original_stat = Path.stat
+    entry_stats = []
+
+    def counted_stat(path, *args, **kwargs):
+        if path.parent == root:
+            entry_stats.append(path)
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", counted_stat)
+    assert workbench.list_files({}) == expected
+    assert entry_stats == []
+
+
+def test_file_listing_releases_processed_entries_and_their_metadata(tmp_path, monkeypatch):
+    import gc
+    import weakref
+
+    root = tmp_path / "workspace"
+    root.mkdir()
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (root / name).touch()
+    workbench = WorkspaceWorkbench(root, "session", tmp_path / "cache")
+    expected = legacy_file_listing(workbench, {})
+    original_scandir = os.scandir
+    processed = []
+
+    class ObservedEntry:
+        def __init__(self, entry):
+            self.entry = entry
+
+        def __getattr__(self, name):
+            return getattr(self.entry, name)
+
+        def stat(self, **kwargs):
+            gc.collect()
+            assert all(reference() is None for reference in processed)
+            processed.append(weakref.ref(self))
+            return self.entry.stat(**kwargs)
+
+    @contextmanager
+    def observed_scandir(path):
+        with original_scandir(path) as scanner:
+            yield (ObservedEntry(entry) for entry in scanner)
+
+    monkeypatch.setattr(os, "scandir", observed_scandir)
+    assert workbench.list_files({}) == expected
+    assert len(processed) == 3
+    gc.collect()
+    assert all(reference() is None for reference in processed)
 
 
 def test_changes_sources_leave_index_and_external_helpers_untouched(tmp_path, monkeypatch):
@@ -83,6 +294,35 @@ def test_session_and_last_turn_baselines_survive_reopen(tmp_path):
     assert (root / ".git" / "index").read_bytes() == index
 
 
+def test_capture_serializes_once_and_preserves_original_session_baseline(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    workbench = WorkspaceWorkbench(workspace, "session", tmp_path / "cache")
+    snapshot = {"files": {"示例.txt": {"text": "first\n"}}}
+    monkeypatch.setattr(workbench, "_snapshot", lambda: snapshot)
+    original_dumps = json.dumps
+    serialized_snapshots = []
+
+    def counted_dumps(value, **kwargs):
+        serialized_snapshots.append(value)
+        return original_dumps(value, **kwargs)
+
+    monkeypatch.setattr("coding_agent.desktop.workbench.json.dumps", counted_dumps)
+    workbench._capture()
+    session_file = workbench.storage / "session.json"
+    turn_file = workbench.storage / "turn.json"
+    original_session = session_file.read_text(encoding="utf-8")
+    assert original_session == turn_file.read_text(encoding="utf-8")
+    assert json.loads(original_session) == snapshot
+    assert len(serialized_snapshots) == 1
+
+    snapshot = {"files": {"示例.txt": {"text": "second\n"}}}
+    workbench._capture()
+    assert len(serialized_snapshots) == 2
+    assert session_file.read_text(encoding="utf-8") == original_session
+    assert json.loads(turn_file.read_text(encoding="utf-8")) == snapshot
+
+
 def test_file_preview_and_scope_reject_escape(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -96,6 +336,34 @@ def test_file_preview_and_scope_reject_escape(tmp_path):
         workbench.read_file({"path": "../outside"})
     with pytest.raises(RpcError):
         workbench.path("bad\x00path")
+
+
+@pytest.mark.parametrize("remaining", [0, 1, 2, 3, 6, 50])
+def test_bounded_diff_preserves_utf8_preview_and_remaining_budget(remaining, monkeypatch):
+    monkeypatch.setattr("coding_agent.desktop.workbench.MAX_PREVIEW_BYTES", 7)
+    for diff in ("", "ASCII\n", "中文\n", "😀尾\n", "a\r\nb\n"):
+        encoded = diff.encode("utf-8")
+        limit = min(7, remaining)
+        preview = encoded[:limit].decode("utf-8", errors="ignore")
+        expected = preview, len(encoded) > limit, remaining - len(preview.encode("utf-8"))
+        assert WorkspaceWorkbench._bounded_diff(diff, remaining) == expected, diff
+
+
+def test_untruncated_diff_does_not_copy_or_decode_its_encoded_bytes():
+    class NoSliceBytes(bytes):
+        def __getitem__(self, key):
+            pytest.fail("An untruncated diff must not slice and decode its encoded bytes")
+
+        def decode(self, encoding="utf-8", errors="strict"):
+            pytest.fail("An untruncated diff must reuse its original text")
+
+    class DiffText(str):
+        def encode(self, encoding="utf-8", errors="strict"):
+            return NoSliceBytes(super().encode(encoding, errors))
+
+    diff = DiffText("diff 内容 😀\n")
+    budget = len(diff.encode("utf-8"))
+    assert WorkspaceWorkbench._bounded_diff(diff, budget) == (diff, False, 0)
 
 
 def test_non_git_and_missing_baseline_are_explicit(tmp_path):
@@ -349,6 +617,81 @@ def test_side_rechecks_parent_after_approval_before_real_write(tmp_path, monkeyp
             await side.close()
             await parent.aclose()
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("extra_files", [0, 8])
+def test_untracked_previews_do_not_launch_per_file_git_diff(tmp_path, monkeypatch, extra_files):
+    root = repository(tmp_path)
+    (root / "示例 file.py").write_text("tracked change\n", encoding="utf-8", newline="\n")
+    (root / "new.txt").write_text("new\nline\n", encoding="utf-8", newline="\n")
+    (root / "角色 图.txt").write_text("图文\n", encoding="utf-8", newline="\n")
+    (root / "empty.txt").touch()
+    (root / "binary.bin").write_bytes(b"\0\xff")
+    (root / "large.txt").write_bytes(b"x" * (MAX_PREVIEW_BYTES + 1))
+    for index in range(extra_files):
+        (root / f"extra-{index}.txt").write_text("extra\n", encoding="utf-8", newline="\n")
+    workbench = WorkspaceWorkbench(root, "session", tmp_path / "cache")
+    original_index = (root / ".git" / "index").read_bytes()
+    seen = []
+    run = subprocess.run
+
+    def inspect(argv, **kwargs):
+        seen.append((argv, kwargs))
+        return run(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", inspect)
+    result = workbench.changes({"source": "unstaged"})
+
+    assert len(seen) == 5, "Untracked files must not each start an empty git diff process"
+    per_file = [argv for argv, _options in seen if "diff" in argv and "--name-only" not in argv]
+    assert len(per_file) == 1 and per_file[0][-1] == "示例 file.py"
+    for argv, options in seen:
+        assert options["stdin"] == subprocess.DEVNULL
+        assert options["env"]["GIT_OPTIONAL_LOCKS"] == "0"
+        assert "core.fsmonitor=false" in argv and "--no-pager" in argv
+        if "diff" in argv:
+            assert {"--no-ext-diff", "--no-textconv", "--no-color"} <= set(argv)
+    assert (root / ".git" / "index").read_bytes() == original_index
+    names = [file["path"] for file in result["files"]]
+    assert names == sorted(names) and len(names) == 6 + extra_files
+    assert result["additions"] == 4 + extra_files and result["deletions"] == 1
+    assert not result["truncated"]
+    files = {file["path"]: file for file in result["files"]}
+    tracked = files.pop("示例 file.py")
+    assert tracked["status"] == "M" and tracked["additions"] == tracked["deletions"] == 1
+    assert "-original\n+tracked change\n" in tracked["diff"].replace("\r\n", "\n")
+    assert all(file["status"] == "A" and file["deletions"] == 0 for file in files.values())
+    assert files["new.txt"]["additions"] == 2 and "+new\n+line\n" in files["new.txt"]["diff"]
+    assert files["角色 图.txt"]["additions"] == 1 and "+图文\n" in files["角色 图.txt"]["diff"]
+    assert files["empty.txt"]["diff"] == "" and files["empty.txt"]["additions"] == 0
+    assert files["binary.bin"]["binary"] and files["binary.bin"]["diff"] == "Binary files differ"
+    assert not files["large.txt"]["binary"] and files["large.txt"]["diff"] == "File too large to preview"
+
+
+@pytest.mark.parametrize("source,expected_calls", [("staged", 4), ("branch", 5)])
+def test_tracked_change_sources_keep_per_file_git_diff(tmp_path, monkeypatch, source, expected_calls):
+    root = repository(tmp_path)
+    (root / "示例 file.py").write_text("staged change\n", encoding="utf-8", newline="\n")
+    git(root, "add", "示例 file.py")
+    (root / "untracked.txt").write_text("untracked\n", encoding="utf-8")
+    workbench = WorkspaceWorkbench(root, "session", tmp_path / "cache")
+    seen = []
+    run = subprocess.run
+
+    def inspect(argv, **kwargs):
+        seen.append(argv)
+        return run(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", inspect)
+    result = workbench.changes({"source": source, "baseRef": "main"})
+
+    assert len(seen) == expected_calls
+    per_file = [argv for argv in seen if "diff" in argv and "--name-only" not in argv]
+    assert len(per_file) == 1 and per_file[0][-1] == "示例 file.py"
+    assert not any("ls-files" in argv for argv in seen)
+    assert [file["path"] for file in result["files"]] == ["示例 file.py"]
+    assert result["files"][0]["status"] == "M"
+    assert "+staged change\n" in result["files"][0]["diff"]
 
 
 @pytest.mark.parametrize("scenario_name", ["allow", "deny", "plan_before", "plan_during", "stop"])

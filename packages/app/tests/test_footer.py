@@ -75,8 +75,10 @@ class FakeSession:
         self.collaboration_mode = collaboration_mode
         self.plan_state = SimpleNamespace(phase=plan_phase)
         self.permission_mode = permission_mode
+        self.stats_calls = 0
 
     def get_stats(self):
+        self.stats_calls += 1
         u = _Usage(input=self._tokens_in, output=self._tokens_out,
                    total=self._tokens_in + self._tokens_out)
         return _Stats(tokens=u, metrics=self._metrics, cost=self._cost)
@@ -89,7 +91,78 @@ def _make(**kw) -> "tuple[FooterComponent, FakeSession]":
     footer._session = sess
     footer._theme = _theme()
     footer._git_branch = None
+    footer.invalidate()
     return footer, sess
+
+
+def test_stats_snapshot_starts_empty_and_is_loaded_lazily(monkeypatch):
+    session = FakeSession(cwd=".")
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="main\n"))
+    footer = FooterComponent(session, _theme())
+
+    assert footer._stats_snapshot is None
+    assert session.stats_calls == 0
+    footer.render(180)
+    assert session.stats_calls == 1
+
+
+def test_stats_snapshot_is_reused_across_renders_and_width_changes(monkeypatch):
+    footer, session = _make(metrics=_Metrics(cache_hit_rate=20), tokens_out=10)
+
+    def unexpected_git(*args, **kwargs):
+        pytest.fail("Rendering or invalidating the footer must not start Git")
+
+    monkeypatch.setattr(subprocess, "run", unexpected_git)
+    for width in (180, 24, 80, 180):
+        assert "cache 20.0%" in _strip("\n".join(footer.render(width)))
+    assert session.stats_calls == 1
+
+    session._metrics = _Metrics(cache_hit_rate=95, input_tokens=120_000)
+    session._tokens_out = 2000
+    assert "cache 20.0%" in _strip("\n".join(footer.render(180)))
+    assert session.stats_calls == 1
+    footer.invalidate()
+    assert session.stats_calls == 1
+    text = _strip("\n".join(footer.render(180)))
+    assert "cache 95.0%" in text and "in=120k out=2k" in text
+    assert session.stats_calls == 2
+
+
+def test_nonpositive_width_does_not_request_stats():
+    footer, session = _make()
+    assert footer.render(0) == [""]
+    assert footer.render(-1) == [""]
+    assert session.stats_calls == 0
+    footer.render(80)
+    assert session.stats_calls == 1
+
+
+@pytest.mark.parametrize("phase,label", [("ready", "plan ready"), ("uncertain", "plan uncertain"), ("recovery_error", "plan recovery")])
+@pytest.mark.parametrize("width", [24, 180])
+def test_plan_and_permission_labels_remain_live_with_stats_snapshot(phase, label, width):
+    footer, session = _make()
+    footer.render(width)
+    session.plan_state = SimpleNamespace(phase=phase)
+    session.permission_mode = "full_access"
+
+    text = _strip("\n".join(footer.render(width)))
+
+    assert label in text
+    assert "bypass on" in text or "bypass permissions on" in text
+    assert session.stats_calls == 1
+
+
+def test_model_thinking_and_cwd_remain_live_with_stats_snapshot():
+    footer, session = _make()
+    footer.render(180)
+    session.model = _FakeModel(id="next-model")
+    session.thinking_level = "low"
+    session.cwd = "G:/next-workspace"
+
+    text = _strip("\n".join(footer.render(180)))
+
+    assert "next-model" in text and "thinking low" in text and "G:/next-workspace" in text
+    assert session.stats_calls == 1
 
 
 # ── model + thinking ───────────────────────────────────────────────────

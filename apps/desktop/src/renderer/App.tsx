@@ -33,6 +33,9 @@ import {
   type TimelineToolItem,
 } from "./timeline/timelineState";
 
+const Markdown = memo(ReactMarkdown);
+const markdownPlugins = [remarkGfm];
+
 interface ModelOption {
   id: string;
   name: string;
@@ -99,9 +102,9 @@ const TimelineMessageCard = memo(function TimelineMessageCard({
             <pre>{message.thinking}</pre>
           </details>
         )}
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+        <Markdown remarkPlugins={markdownPlugins}>
           {message.text || (message.status === "streaming" ? "正在思考…" : "")}
-        </ReactMarkdown>
+        </Markdown>
       </div>
     </article>
   );
@@ -128,7 +131,7 @@ const TimelineCompactionCard = memo(function TimelineCompactionCard({
         <details>
           <summary>查看压缩摘要</summary>
           <div className="compaction-summary">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>{compaction.summary}</ReactMarkdown>
+            <Markdown remarkPlugins={markdownPlugins}>{compaction.summary}</Markdown>
           </div>
         </details>
       )}
@@ -149,7 +152,7 @@ const TimelinePlanCard = memo(function TimelinePlanCard({ plan, badge }: { plan:
         <span>revision {plan.revision} · {plan.digest.slice(0, 12)}</span>
       </div>
       <div className="plan-markdown">
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>{plan.markdown}</ReactMarkdown>
+        <Markdown remarkPlugins={markdownPlugins}>{plan.markdown}</Markdown>
       </div>
     </section>
   );
@@ -236,6 +239,7 @@ function updateTimelineItem(
 export function App() {
   const [workbenchOpen, setWorkbenchOpen] = useState(false);
   const [workbenchWidth, setWorkbenchWidth] = useState(480);
+  const closeWorkbench = useCallback(() => setWorkbenchOpen(false), []);
   const [sidecarStatus, setSidecarStatus] = useState("starting");
   const [workspace, setWorkspace] = useState<WorkspacePayload | null>(null);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
@@ -1775,7 +1779,7 @@ export function App() {
             <UsageMetrics stats={workspace?.stats} />
           </div>
         </main>
-        {workspace && <Workbench key={workspace.sessionId} workspace={workspace} open={workbenchOpen} onClose={() => setWorkbenchOpen(false)} width={workbenchWidth} onWidth={setWorkbenchWidth} sidebarOpen={sidebarOpen} />}
+        {workspace && <Workbench key={workspace.sessionId} workspace={workspace} open={workbenchOpen} onClose={closeWorkbench} width={workbenchWidth} onWidth={setWorkbenchWidth} sidebarOpen={sidebarOpen} />}
       </div>
     </div>
   );

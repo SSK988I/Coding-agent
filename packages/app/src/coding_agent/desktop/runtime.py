@@ -284,8 +284,8 @@ class DesktopRuntime:
         resume: bool,
     ) -> SessionManager:
         sessions_dir = get_sessions_dir()
-        available = SessionManager.list_sessions(cwd=str(workspace), sessions_dir=sessions_dir)
         if session_id:
+            available = SessionManager.list_sessions(cwd=str(workspace), sessions_dir=sessions_dir)
             match = next((item for item in available if item.id == session_id), None)
             if match is None:
                 raise RpcError("SESSION_NOT_FOUND", f"找不到会话：{session_id}")

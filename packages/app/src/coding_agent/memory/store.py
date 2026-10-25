@@ -511,6 +511,13 @@ class FileMemoryStore:
         if not path.exists():
             return
         with path.open("r+b") as handle:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                return
+            handle.seek(-1, os.SEEK_END)
+            if handle.read(1) == b"\n":
+                return
+            handle.seek(0)
             data = handle.read()
             if not data or data.endswith(b"\n"):
                 return
