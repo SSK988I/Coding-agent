@@ -350,6 +350,16 @@ class SessionManager:
         self._commit(entry)
         return entry
 
+    def refresh_archived(self) -> bool:
+        """Refresh only visibility, preserving live history and branch state."""
+        if not self.in_memory and self.path is not None and self._flushed:
+            persisted = read_header(self.path)
+            if persisted is None or persisted.id != self.header.id:
+                raise ValueError("Unable to read session archive state")
+            if persisted.archived != self.header.archived:
+                self.header = replace(self.header, archived=persisted.archived)
+        return self.header.archived
+
     def set_archived(self, archived: bool) -> None:
         """Update session-wide visibility without changing history or its branch.
 
@@ -359,7 +369,7 @@ class SessionManager:
         """
         if not isinstance(archived, bool):
             raise ValueError("archived must be a boolean")
-        if self.header.archived == archived:
+        if self.refresh_archived() == archived:
             return
         header = replace(self.header, archived=archived)
         if not self.in_memory and self.path is not None and self._flushed:

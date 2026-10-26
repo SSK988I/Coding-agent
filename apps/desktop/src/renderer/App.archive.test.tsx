@@ -22,7 +22,7 @@ describe("desktop session archive", () => {
 
   const payload = (id = selected, path = project): WorkspacePayload => ({
     path, sessionId: id, archived: records.get(id)?.archived ?? false,
-    model: { id: "offline", name: "Offline", provider: "offline", input: ["text"] },
+    model: { id: "offline", name: "Offline", provider: "offline" },
     thinkingLevel: null, tools: [], collaborationMode: "default",
     messages: [
       { role: "user", content: `Question in ${id}` },

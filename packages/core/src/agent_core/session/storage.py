@@ -445,10 +445,12 @@ def rewrite_header_line(path: Path, header: SessionHeader) -> None:
             temp_path.unlink()
 
 
-def _archive_state_path(path: Path) -> Path:
+def _archive_state_path(path: Path, *, legacy_case: bool = False) -> Path:
     # Hash the basename, never user-controlled path fragments. The sibling is
-    # short enough for Windows MAX_PATH even when the JSONL name is long.
-    identity = hashlib.sha256(os.path.normcase(path.name).encode("utf-8")).hexdigest()[:32]
+    # short enough for Windows MAX_PATH even when the JSONL name is long. Use
+    # the same normalization on every OS, retaining the original Windows name.
+    basename = path.name if legacy_case else path.name.lower()
+    identity = hashlib.sha256(basename.encode("utf-8")).hexdigest()[:32]
     return path.with_name(f".archive-{identity}.json")
 
 
@@ -513,13 +515,29 @@ def read_header(path: Path) -> SessionHeader | None:
         if not line:
             return None
         header = dict_to_header(json.loads(line))
-        try:
-            state = json.loads(_archive_state_path(path).read_text(encoding="utf-8"))
-        except FileNotFoundError:
+        for legacy_case in (False, True):
+            metadata_source = path
+            if legacy_case:
+                if os.name == "nt":
+                    actual = path.resolve(strict=True)
+                    # Legacy POSIX markers retain the filename's actual case.
+                    # Only correct casing, without borrowing a symlink target's
+                    # basename or looking for metadata in another directory.
+                    if (actual.parent == path.parent.resolve(strict=True)
+                            and actual.name.lower() == path.name.lower()):
+                        metadata_source = path.with_name(actual.name)
+                if metadata_source.name == path.name.lower():
+                    break
+            try:
+                state = json.loads(_archive_state_path(metadata_source, legacy_case=legacy_case).read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                continue
+            if not isinstance(state, bool):
+                raise ValueError("Session archive metadata must be a boolean")
+            # Canonical metadata wins even when false; invalid canonical data
+            # must not fall back to an older marker or silently unarchive.
+            header.archived = state
             return header
-        if not isinstance(state, bool):
-            raise ValueError("Session archive metadata must be a boolean")
-        header.archived = state
         return header
     except (OSError, ValueError):
         return None

@@ -149,7 +149,7 @@ function messageText(message: AgentMessage): string {
   return typeof message.content === "string" ? message.content : message.content.map((block) => block.text ?? "").join("");
 }
 
-export function SideChatPanel({ scope }: { scope: WorkbenchScope }) {
+export function SideChatPanel({ scope, readOnly = false }: { scope: WorkbenchScope; readOnly?: boolean }) {
   const [conversations, setConversations] = useState<{ conversationId: string; title: string }[]>([]);
   const [snapshot, setSnapshot] = useState<SideConversationSnapshot | null>(null);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
@@ -171,6 +171,7 @@ export function SideChatPanel({ scope }: { scope: WorkbenchScope }) {
   }, [scope, refreshList]);
   useEffect(() => { bottom.current?.scrollIntoView?.({ block: "nearest" }); }, [snapshot?.streaming, snapshot?.messages.length]);
   const open = async (conversationId?: string) => {
+    if (readOnly && !conversationId) return;
     const generation = ++navigation.current;
     const seq = eventSeq.current;
     selected.current = conversationId ?? null;
@@ -185,7 +186,8 @@ export function SideChatPanel({ scope }: { scope: WorkbenchScope }) {
     finally { if (generation === navigation.current) setBusy(false); }
   };
   const request = async (method: string, extra: Record<string, unknown> = {}) => {
-    if (!snapshot || busy) return;
+    if (!snapshot || busy || (readOnly && (method === "workbench.chat.send"
+      || (method === "workbench.chat.approve" && extra.allowed === true)))) return;
     const id = snapshot.conversationId, generation = navigation.current, seq = eventSeq.current;
     setBusy(true); setError(null);
     try {
@@ -197,10 +199,10 @@ export function SideChatPanel({ scope }: { scope: WorkbenchScope }) {
   };
   const draft = drafts[snapshot?.conversationId ?? ""] ?? "";
   return <section className="side-chat-panel" aria-label="侧边对话">
-    <div className="workbench-toolbar"><select aria-label="选择侧边对话" value={snapshot?.conversationId ?? ""} onChange={(event) => void open(event.target.value || undefined)} disabled={busy}><option value="">选择对话</option>{conversations.map((item) => <option key={item.conversationId} value={item.conversationId}>{item.title}</option>)}</select><button type="button" title="新建侧边对话" aria-label="新建侧边对话" onClick={() => void open()} disabled={busy}>＋</button></div>
+    <div className="workbench-toolbar"><select aria-label="选择侧边对话" value={snapshot?.conversationId ?? ""} onChange={(event) => void open(event.target.value || undefined)} disabled={busy}><option value="" disabled={readOnly}>选择对话</option>{conversations.map((item) => <option key={item.conversationId} value={item.conversationId}>{item.title}</option>)}</select><button type="button" title="新建侧边对话" aria-label="新建侧边对话" onClick={() => void open()} disabled={busy || readOnly}>＋</button></div>
     <p className="workbench-caption">独立上下文 · 使用当前会话可用的开发工具 · 不会向主对话注入消息</p>
     <div className="side-chat-messages">
-      {!snapshot && <div className="workbench-empty"><p>在独立对话中追问，不打断当前任务。</p><button type="button" onClick={() => void open()} disabled={busy}>开始侧边对话</button></div>}
+      {!snapshot && <div className="workbench-empty"><p>在独立对话中追问，不打断当前任务。</p><button type="button" onClick={() => void open()} disabled={busy || readOnly}>开始侧边对话</button></div>}
       {snapshot?.messages.map((message, index) => message.role === "toolResult" ? <details className="side-chat-tool" key={index}><summary>{message.tool_name || "工具结果"}{message.is_error ? " · 失败" : ""}</summary><pre>{messageText(message)}</pre></details> : <article key={index} className={`side-chat-message ${message.role}`}><strong>{message.role === "user" ? "你" : "AI"}</strong><ReactMarkdown remarkPlugins={[remarkGfm]}>{messageText(message)}</ReactMarkdown></article>)}
       {snapshot?.streaming && <article className="side-chat-message assistant"><strong>AI</strong><ReactMarkdown remarkPlugins={[remarkGfm]}>{snapshot.streaming}</ReactMarkdown></article>}
       {snapshot?.status === "running" && !snapshot.streaming && <p className="workbench-caption" role="status">侧边对话正在处理…</p>}
@@ -208,10 +210,10 @@ export function SideChatPanel({ scope }: { scope: WorkbenchScope }) {
       {error && <p className="workbench-error" role="alert">{error}</p>}
       <div ref={bottom} />
     </div>
-    {snapshot?.approval && <section className="side-chat-approval" aria-label="侧边对话审批"><strong>批准 {snapshot.approval.toolName}？</strong><pre>{JSON.stringify(snapshot.approval.args, null, 2)}</pre><button type="button" disabled={busy} onClick={() => void request("workbench.chat.approve", { approvalId: snapshot.approval!.approvalId, allowed: false })}>拒绝</button><button type="button" disabled={busy} onClick={() => void request("workbench.chat.approve", { approvalId: snapshot.approval!.approvalId, allowed: true })}>允许本次</button></section>}
-    {snapshot && <form className="side-chat-composer" onSubmit={(event) => { event.preventDefault(); if (draft.trim() && snapshot.status !== "running") void request("workbench.chat.send", { text: draft }); }}>
-      <textarea aria-label="侧边对话消息" placeholder="继续侧边对话…" value={draft} disabled={busy || snapshot.status === "running"} onChange={(event) => setDrafts((current) => ({ ...current, [snapshot.conversationId]: event.target.value }))} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); if (draft.trim() && snapshot.status !== "running") void request("workbench.chat.send", { text: draft }); } }} rows={3} />
-      <div><span>Enter 发送 · Shift+Enter 换行</span>{snapshot.status === "running" ? <button type="button" disabled={busy} onClick={() => void request("workbench.chat.stop")}>■ 停止侧边对话</button> : <button type="submit" disabled={busy || !draft.trim()}>发送 ↑</button>}</div>
+    {snapshot?.approval && <section className="side-chat-approval" aria-label="侧边对话审批"><strong>批准 {snapshot.approval.toolName}？</strong><pre>{JSON.stringify(snapshot.approval.args, null, 2)}</pre><button type="button" disabled={busy} onClick={() => void request("workbench.chat.approve", { approvalId: snapshot.approval!.approvalId, allowed: false })}>拒绝</button><button type="button" disabled={busy || readOnly} onClick={() => void request("workbench.chat.approve", { approvalId: snapshot.approval!.approvalId, allowed: true })}>允许本次</button></section>}
+    {snapshot && <form className="side-chat-composer" onSubmit={(event) => { event.preventDefault(); if (!readOnly && draft.trim() && snapshot.status !== "running") void request("workbench.chat.send", { text: draft }); }}>
+      <textarea aria-label="侧边对话消息" placeholder="继续侧边对话…" value={draft} disabled={readOnly || busy || snapshot.status === "running"} onChange={(event) => setDrafts((current) => ({ ...current, [snapshot.conversationId]: event.target.value }))} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); if (!readOnly && draft.trim() && snapshot.status !== "running") void request("workbench.chat.send", { text: draft }); } }} rows={3} />
+      <div><span>Enter 发送 · Shift+Enter 换行</span>{snapshot.status === "running" ? <button type="button" disabled={busy} onClick={() => void request("workbench.chat.stop")}>■ 停止侧边对话</button> : <button type="submit" disabled={readOnly || busy || !draft.trim()}>发送 ↑</button>}</div>
     </form>}
   </section>;
 }

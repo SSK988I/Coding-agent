@@ -71,7 +71,9 @@ class DesktopRuntime:
             "run.start", "run.steer", "run.followUp", "mode.enterPlan", "plan.answer",
             "plan.cancel", "plan.execute", "plan.handoff", "session.clear", "session.compact",
             "model.select", "subagent.spawn", "workbench.chat.send",
-        }:
+        } or (method == "workbench.chat.open" and not params.get("conversationId")) or (
+            method == "workbench.chat.approve" and params.get("allowed") is True
+        ):
             self._ensure_session_not_archived()
         if method.startswith("workbench."):
             return await self._workbench_request(method, params)
@@ -295,7 +297,7 @@ class DesktopRuntime:
         sessions_dir = get_sessions_dir()
         if session_id:
             available = SessionManager.list_sessions(
-                cwd=str(workspace), sessions_dir=sessions_dir, archived=None,
+                cwd=str(workspace), sessions_dir=sessions_dir,
             )
             match = next((item for item in available if item.id == session_id), None)
             if match is None:
@@ -377,7 +379,7 @@ class DesktopRuntime:
         session = self._require_session()
         return {
             "sessionId": session.session_manager.header.id,
-            "archived": getattr(session.session_manager.header, "archived", False),
+            "archived": self._current_session_archived(),
             "messages": to_jsonable(session.state.messages),
             "stats": to_jsonable(session.get_stats()),
             "collaborationMode": session.collaboration_mode,
@@ -1142,7 +1144,7 @@ class DesktopRuntime:
         return {
             "path": str(self._require_workspace()),
             "sessionId": session.session_manager.header.id,
-            "archived": getattr(session.session_manager.header, "archived", False),
+            "archived": self._current_session_archived(),
             "model": to_jsonable(session.model),
             "thinkingLevel": session.thinking_level,
             "tools": [tool.name for tool in session.tools],
@@ -1177,9 +1179,17 @@ class DesktopRuntime:
         if self._run_task is not None and not self._run_task.done():
             raise RpcError("RUN_IN_PROGRESS", message)
 
-    def _ensure_session_not_archived(self) -> None:
+    def _current_session_archived(self) -> bool:
         manager = getattr(self._session, "session_manager", None)
-        if getattr(getattr(manager, "header", None), "archived", False) is True:
+        refresh = getattr(manager, "refresh_archived", None)
+        try:
+            archived = refresh() if callable(refresh) else getattr(getattr(manager, "header", None), "archived", False)
+        except (OSError, ValueError) as exc:
+            raise RpcError("SESSION_ARCHIVE_FAILED", "无法读取会话归档状态，请检查会话记录") from exc
+        return archived is True
+
+    def _ensure_session_not_archived(self) -> None:
+        if self._current_session_archived():
             raise RpcError("SESSION_ARCHIVED", "此会话已归档，请先恢复会话后继续")
 
     def _require_workspace(self) -> Path:

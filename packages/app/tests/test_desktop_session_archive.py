@@ -16,6 +16,8 @@ from coding_agent.cli.args import Args
 from coding_agent.cli.main import _create_session_manager
 from coding_agent.desktop.protocol import RpcError
 from coding_agent.desktop.runtime import DesktopRuntime
+from coding_agent.desktop.side_conversations import SideConversations
+from coding_agent.desktop.workbench import WorkspaceWorkbench
 
 
 def _saved(workspace: Path) -> SessionManager:
@@ -282,6 +284,132 @@ def test_failed_archive_leaves_snapshot_and_list_unchanged(tmp_path, monkeypatch
             assert (await runtime.dispatch("session.snapshot", {}))["archived"] is not archived
             assert (await runtime.dispatch("session.list", {"archived": not archived}))[0]["id"] == manager.header.id
             assert events == []
+        finally:
+            await runtime.dispose()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("archived", [True, False])
+def test_external_archive_change_is_checked_before_starting_a_run(tmp_path, monkeypatch, archived):
+    async def scenario():
+        manager = _saved(tmp_path)
+        manager.set_archived(not archived)
+        runtime = _runtime(tmp_path, manager, [])
+        drive = AsyncMock()
+        monkeypatch.setattr(runtime, "_drive_run", drive)
+        assert manager.path is not None
+        external = SessionManager.open(manager.path)
+        external.set_archived(archived)
+        assert manager.header.archived is not archived
+        try:
+            if archived:
+                with pytest.raises(RpcError) as error:
+                    await runtime.dispatch("run.start", {"text": "continue"})
+                assert error.value.code == "SESSION_ARCHIVED"
+                assert runtime._run_task is None
+                drive.assert_not_awaited()
+            else:
+                result = await runtime.dispatch("run.start", {"text": "continue"})
+                assert result["accepted"] is True
+                task = runtime._run_task
+                assert task is not None
+                await task
+                drive.assert_awaited_once()
+        finally:
+            await runtime.dispose()
+    asyncio.run(scenario())
+
+
+def test_second_runtime_restores_the_selected_session_on_disk(tmp_path):
+    async def scenario():
+        manager = _saved(tmp_path)
+        assert manager.path is not None
+        other_manager = SessionManager.open(manager.path)
+        first = _runtime(tmp_path, manager, [])
+        second = _runtime(tmp_path, other_manager, [])
+        try:
+            await first.dispatch("session.archive", {"sessionId": manager.header.id})
+            assert other_manager.header.archived is False
+            result = await second.dispatch("session.unarchive", {"sessionId": manager.header.id})
+            assert result["archived"] is False
+            assert SessionManager.open(manager.path).header.archived is False
+            assert (await first.dispatch("session.snapshot", {}))["archived"] is False
+            assert (await second.dispatch("session.snapshot", {}))["archived"] is False
+        finally:
+            await first.dispose()
+            await second.dispose()
+    asyncio.run(scenario())
+
+
+def test_snapshots_refresh_external_archive_changes_without_reloading_messages(tmp_path):
+    async def scenario():
+        manager = _saved(tmp_path)
+        assert manager.path is not None
+        external = SessionManager.open(manager.path)
+        runtime = _runtime(tmp_path, manager, [])
+        assert runtime._session is not None
+        messages = runtime._session.state.messages
+        try:
+            for archived in (True, False):
+                external.set_archived(archived)
+                assert (await runtime.dispatch("session.snapshot", {}))["archived"] is archived
+                assert runtime._workspace_payload()["archived"] is archived
+                assert runtime._session.state.messages is messages
+        finally:
+            await runtime.dispose()
+    asyncio.run(scenario())
+
+
+def test_unreadable_archive_metadata_cannot_start_a_run(tmp_path, monkeypatch):
+    from agent_core.session.storage import _archive_state_path
+
+    async def scenario():
+        manager = _saved(tmp_path)
+        assert manager.path is not None
+        runtime = _runtime(tmp_path, manager, [])
+        drive = AsyncMock()
+        monkeypatch.setattr(runtime, "_drive_run", drive)
+        _archive_state_path(manager.path).write_text("null", encoding="utf-8")
+        try:
+            for method, params in (("run.start", {"text": "continue"}), ("session.snapshot", {})):
+                with pytest.raises(RpcError) as error:
+                    await runtime.dispatch(method, params)
+                assert error.value.code == "SESSION_ARCHIVE_FAILED"
+            assert runtime._run_task is None
+            drive.assert_not_awaited()
+        finally:
+            await runtime.dispose()
+    asyncio.run(scenario())
+
+
+def test_archived_session_allows_reading_side_chats_but_not_creating_them(tmp_path):
+    async def scenario():
+        manager = _saved(tmp_path)
+        runtime = _runtime(tmp_path, manager, [])
+        assert runtime._session is not None
+        workbench = WorkspaceWorkbench(tmp_path, manager.header.id, tmp_path / "workbench")
+        runtime._workbench = workbench
+        runtime._side_conversations = SideConversations(
+            runtime._session, workbench.storage, runtime._publish, lambda: runtime._permission_mode,
+        )
+        scope = {"workspacePath": str(workbench.workspace), "sessionId": manager.header.id}
+        try:
+            existing = await runtime.dispatch("workbench.chat.open", scope)
+            identity = existing["conversationId"]
+            await runtime.dispatch("session.archive", {"sessionId": manager.header.id})
+            opened = await runtime.dispatch("workbench.chat.open", {**scope, "conversationId": identity})
+            assert opened["conversationId"] == identity
+            assert len((await runtime.dispatch("workbench.chat.list", scope))["conversations"]) == 1
+            for params in (scope, {**scope, "conversationId": ""}):
+                with pytest.raises(RpcError) as error:
+                    await runtime.dispatch("workbench.chat.open", params)
+                assert error.value.code == "SESSION_ARCHIVED"
+            with pytest.raises(RpcError) as error:
+                await runtime.dispatch("workbench.chat.approve", {
+                    **scope, "conversationId": identity, "approvalId": "stale", "allowed": True,
+                })
+            assert error.value.code == "SESSION_ARCHIVED"
+            assert len(runtime._side_conversations.records) == 1
         finally:
             await runtime.dispose()
     asyncio.run(scenario())

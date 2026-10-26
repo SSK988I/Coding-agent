@@ -1,6 +1,7 @@
 """Archiving changes visibility while preserving the session and branch history."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -216,32 +217,142 @@ def test_repeated_archive_does_not_rewrite_the_header(tmp_path: Path, monkeypatc
     manager.set_archived(True)
 
 
-def test_archive_uses_short_sibling_temp_for_valid_long_windows_path(tmp_path: Path, monkeypatch):
+def test_stale_manager_can_restore_an_archive_written_by_another_manager(tmp_path: Path):
+    first = _saved(tmp_path)
+    assert first.path is not None
+    second = SessionManager.open(first.path)
+    first.set_archived(True)
+    assert second.header.archived is False
+
+    second.set_archived(False)
+
+    assert second.header.archived is False
+    assert SessionManager.open(first.path).header.archived is False
+
+
+def test_refresh_archive_state_does_not_reload_or_replace_live_history(tmp_path: Path, monkeypatch):
+    manager = _saved(tmp_path)
+    assert manager.path is not None
+    other = SessionManager.open(manager.path)
+    entries, leaf, header = manager.entries, manager.leaf_id, manager.header
+    other.set_archived(True)
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("Refreshing archive state must not reload history")
+
+    monkeypatch.setattr("agent_core.session.session_manager.read_entries", unexpected)
+    assert manager.refresh_archived() is True
+    assert manager.header.archived is True
+    assert manager.header.id == header.id and manager.header.version == header.version
+    assert manager.entries is entries and manager.leaf_id == leaf
+
+    other.set_archived(False)
+    assert manager.refresh_archived() is False
+    assert manager.header.archived is False
+
+
+def test_refresh_archive_state_rejects_corrupt_metadata_without_advancing_state(tmp_path: Path):
+    from agent_core.session.storage import _archive_state_path
+
+    manager = _saved(tmp_path)
+    assert manager.path is not None
+    header = manager.header
+    _archive_state_path(manager.path).write_text('"invalid"', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="archive state"):
+        manager.refresh_archived()
+    with pytest.raises(ValueError, match="archive state"):
+        manager.set_archived(False)
+    assert manager.header is header and manager.header.archived is False
+
+
+def test_archive_identity_is_independent_of_platform_case_normalization(tmp_path: Path, monkeypatch):
     from agent_core.session import storage
 
-    parent = tmp_path / ("deep-" + "x" * max(1, 185 - len(str(tmp_path)) - 6))
-    path = parent / "2026-10-25T13-18-03-696Z_01a17336-09b0-7212-97a7-c6c87396fb13.jsonl"
-    assert len(str(path)) < 260
-    header = SessionHeader(id="saved-session", timestamp="2026-10-25T13:18:03Z", cwd=CWD)
-    write_header_line(path, header)
-    with path.open("ab") as target:
-        target.write(b'{"preserved":"entry bytes"}\r\n')
-    tail = _tail(path)
-    mkstemp = storage.tempfile.mkstemp
+    path = tmp_path / "2026-10-25T13-18-03-696Z_session-AbC.jsonl"
+    identity = hashlib.sha256(path.name.lower().encode("utf-8")).hexdigest()[:32]
+    expected = path.with_name(f".archive-{identity}.json")
+    for normalize in (str.lower, lambda value: value):
+        monkeypatch.setattr(storage.os.path, "normcase", normalize)
+        assert storage._archive_state_path(path) == expected
 
-    def windows_mkstemp(*, prefix, suffix, dir):
-        # Apply the real Windows constraint on every platform, including CI.
-        if len(str(Path(dir) / f"{prefix}{'x' * 8}{suffix}")) >= 260:
-            raise FileNotFoundError("Windows MAX_PATH exceeded")
-        return mkstemp(prefix=prefix, suffix=suffix, dir=dir)
 
-    monkeypatch.setattr(storage.tempfile, "mkstemp", windows_mkstemp)
-    header.archived = True
-    rewrite_header_line(path, header)
-    archived_header = read_header(path)
-    assert archived_header is not None and archived_header.archived is True
-    assert _tail(path) == tail
-    assert list(parent.glob(".*.tmp")) == []
+@pytest.mark.parametrize("archived", [True, False])
+def test_legacy_exact_case_sidecar_remains_readable(tmp_path: Path, archived):
+    from agent_core.session.storage import _archive_state_path
+
+    manager = _saved(tmp_path)
+    assert manager.path is not None
+    manager.header.archived = not archived
+    rewrite_header_line(manager.path, manager.header)
+    original_log = manager.path.read_bytes()
+    identity = hashlib.sha256(manager.path.name.encode("utf-8")).hexdigest()[:32]
+    legacy = manager.path.with_name(f".archive-{identity}.json")
+    assert legacy != _archive_state_path(manager.path)
+    legacy.write_text(json.dumps(archived), encoding="utf-8")
+
+    restored = read_header(manager.path)
+    assert restored is not None and restored.archived is archived
+    assert manager.refresh_archived() is archived
+    assert manager.path.read_bytes() == original_log
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows filenames are case insensitive")
+@pytest.mark.parametrize("archived", [True, False])
+@pytest.mark.parametrize("case", ["upper", "lower"])
+def test_legacy_marker_supports_windows_filename_case_variants(tmp_path: Path, archived, case):
+    manager = _saved(tmp_path)
+    assert manager.path is not None
+    manager.header.archived = not archived
+    rewrite_header_line(manager.path, manager.header)
+    original_log = manager.path.read_bytes()
+    identity = hashlib.sha256(manager.path.name.encode("utf-8")).hexdigest()[:32]
+    legacy = manager.path.with_name(f".archive-{identity}.json")
+    legacy.write_text(json.dumps(archived), encoding="utf-8")
+    variant = manager.path.with_name(getattr(manager.path.name, case)())
+    assert variant.is_file()
+
+    reopened = SessionManager.open(variant)
+    assert reopened.header.archived is archived
+    reopened.header.archived = not archived
+    assert reopened.refresh_archived() is archived
+    reopened.set_archived(not archived)
+    for path in (manager.path, variant):
+        restored = read_header(path)
+        assert restored is not None and restored.archived is not archived
+        assert path.read_bytes() == original_log
+
+
+def test_canonical_archive_state_overrides_a_legacy_exact_case_marker(tmp_path: Path):
+    from agent_core.session import storage
+
+    manager = _saved(tmp_path)
+    assert manager.path is not None
+    original_log = manager.path.read_bytes()
+    identity = hashlib.sha256(manager.path.name.encode("utf-8")).hexdigest()[:32]
+    legacy = manager.path.with_name(f".archive-{identity}.json")
+    legacy.write_text("true\n", encoding="utf-8")
+
+    manager.set_archived(False)
+
+    assert json.loads(legacy.read_text(encoding="utf-8")) is True
+    assert json.loads(storage._archive_state_path(manager.path).read_text(encoding="utf-8")) is False
+    restored = read_header(manager.path)
+    assert restored is not None and restored.archived is False
+    assert manager.path.read_bytes() == original_log
+
+
+def test_corrupt_canonical_archive_state_does_not_fall_back_to_legacy_marker(tmp_path: Path):
+    from agent_core.session.storage import _archive_state_path
+
+    manager = _saved(tmp_path)
+    assert manager.path is not None
+    identity = hashlib.sha256(manager.path.name.encode("utf-8")).hexdigest()[:32]
+    legacy = manager.path.with_name(f".archive-{identity}.json")
+    legacy.write_text("false\n", encoding="utf-8")
+    _archive_state_path(manager.path).write_text('"invalid"', encoding="utf-8")
+
+    assert read_header(manager.path) is None
 
 
 @pytest.mark.parametrize("archived", [False, True, None])
