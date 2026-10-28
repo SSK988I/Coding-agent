@@ -26,6 +26,7 @@ export interface RpcErrorPayload {
 }
 
 export interface WorkspacePayload {
+  archived?: boolean;
   permissionMode?: PermissionMode;
   path: string;
   sessionId: string;
@@ -154,6 +155,7 @@ export interface PlanStatePayload {
 }
 
 export interface SessionSnapshotPayload {
+  archived?: boolean;
   permissionMode?: PermissionMode;
   sessionId: string;
   messages: AgentMessage[];
@@ -196,6 +198,7 @@ export interface ContentBlock {
 }
 
 export interface SessionInfo {
+  archived?: boolean;
   id: string;
   name: string | null;
   first_message: string;

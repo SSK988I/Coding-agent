@@ -81,7 +81,7 @@ export const Workbench = memo(function Workbench({ workspace, open, onClose, wid
       return <div className="workbench-tool-panel" role="tabpanel" id={`workbench-panel-${tab.id}`} aria-label={tab.title} key={tab.id} hidden={!visible}>
         {tab.kind === "changes" && <ChangesPanel scope={scope} active={visible} onOpenFile={(path) => { setRequestedFile((current) => ({ path, serial: (current?.serial ?? 0) + 1 })); openTool("files"); }} />}
         {tab.kind === "files" && <FilesPanel scope={scope} requestedFile={requestedFile} />}
-        {tab.kind === "chat" && <SideChatPanel scope={scope} />}
+        {tab.kind === "chat" && <SideChatPanel scope={scope} readOnly={Boolean(workspace.archived)} />}
         {tab.kind === "terminal" && <TerminalPanel scope={scope} tabKey={tab.id} active={visible} />}
         {tab.kind === "browser" && <BrowserPanel scope={scope} active={visible} />}
       </div>;

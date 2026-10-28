@@ -16,6 +16,7 @@ import type {
 } from "../shared/types";
 import { PermissionPicker } from "./components/PermissionPicker";
 import { UsageMetrics } from "./components/UsageMetrics";
+import { ArchiveIcon, SessionList } from "./components/SessionList";
 import { SubagentPanel } from "./components/SubagentPanel";
 import { ToolCard } from "./components/tool-card";
 import { Workbench } from "./workbench/Workbench";
@@ -243,6 +244,15 @@ export function App() {
   const [sidecarStatus, setSidecarStatus] = useState("starting");
   const [workspace, setWorkspace] = useState<WorkspacePayload | null>(null);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
+  const [showArchivedSessions, setShowArchivedSessions] = useState(false);
+  const archivedViewRef = useRef(false);
+  const sessionListRequestRef = useRef(0);
+  const workspacePathRef = useRef<string | null>(null);
+  const [sessionsLoading, setSessionsLoading] = useState(false);
+  const [sessionListError, setSessionListError] = useState<string | null>(null);
+  const [pendingSessionArchive, setPendingSessionArchive] = useState<string | null>(null);
+  const sessionArchiveRef = useRef<string | null>(null);
+  const restoredSessionFocusRef = useRef<string | null>(null);
   const [timelineState, setTimelineState] = useState<TimelineState>(() => createTimelineState());
   const [commandOptions, setCommandOptions] = useState<CommandOption[]>([]);
   const [commandMenuOpen, setCommandMenuOpen] = useState(false);
@@ -280,12 +290,66 @@ export function App() {
   const workspaceGenerationRef = useRef(0);
 
   const refreshSessions = async () => {
+    const requestId = ++sessionListRequestRef.current;
+    const path = workspacePathRef.current;
+    setSessionsLoading(true);
+    setSessionListError(null);
     try {
-      setSessions(await window.agent.request<SessionInfo[]>("session.list"));
-    } catch {
-      setSessions([]);
+      const result = archivedViewRef.current
+        ? await window.agent.request<SessionInfo[]>("session.list", { archived: true })
+        : await window.agent.request<SessionInfo[]>("session.list");
+      if (requestId === sessionListRequestRef.current && path === workspacePathRef.current) setSessions(result);
+    } catch (reason) {
+      if (requestId === sessionListRequestRef.current && path === workspacePathRef.current) {
+        setSessionListError(`加载会话失败：${reason instanceof Error ? reason.message : String(reason)}`);
+      }
+    } finally {
+      if (requestId === sessionListRequestRef.current) setSessionsLoading(false);
     }
   };
+
+  const toggleArchivedSessions = () => {
+    archivedViewRef.current = !archivedViewRef.current;
+    setShowArchivedSessions(archivedViewRef.current);
+    setSessions([]);
+    void refreshSessions();
+  };
+
+  const setSessionArchived = async (sessionId: string, archived: boolean) => {
+    if (sessionArchiveRef.current || sessionNavigationRef.current || running || compacting) return;
+    const path = workspacePathRef.current;
+    sessionArchiveRef.current = sessionId;
+    setPendingSessionArchive(sessionId);
+    setError(null);
+    try {
+      const result = await window.agent.request<{ sessionId: string; archived: boolean }>(
+        archived ? "session.archive" : "session.unarchive", { sessionId },
+      );
+      if (path !== workspacePathRef.current) return;
+      if (!result.archived) restoredSessionFocusRef.current = result.sessionId;
+      if (result.archived && workspaceSessionIdRef.current === result.sessionId) {
+        setCommandMenuOpen(false);
+        setModelPickerOpen(false);
+        setPlanCommandMenuOpen(false);
+      }
+      setWorkspace((current) => current?.sessionId === result.sessionId
+        ? { ...current, archived: result.archived } : current);
+      await refreshSessions();
+    } catch (reason) {
+      if (path !== workspacePathRef.current) return;
+      setError(`${archived ? "归档" : "恢复"}会话失败：${reason instanceof Error ? reason.message : String(reason)}`);
+      await refreshSessions();
+    } finally {
+      sessionArchiveRef.current = null;
+      setPendingSessionArchive(null);
+    }
+  };
+
+  useEffect(() => {
+    if (pendingSessionArchive || !restoredSessionFocusRef.current) return;
+    if (workspace?.sessionId === restoredSessionFocusRef.current && !workspace.archived) composerRef.current?.focus();
+    restoredSessionFocusRef.current = null;
+  }, [pendingSessionArchive, workspace?.sessionId, workspace?.archived]);
 
   const refreshCommands = async () => {
     try {
@@ -297,6 +361,12 @@ export function App() {
 
   const applyWorkspace = (payload: WorkspacePayload, restoreTimeline = true) => {
     workspaceGenerationRef.current += 1;
+    if (workspacePathRef.current !== payload.path) {
+      archivedViewRef.current = false;
+      setShowArchivedSessions(false);
+      setSessions([]);
+    }
+    workspacePathRef.current = payload.path;
     if (restoreTimeline) {
       // RPC results are already authoritative. A snapshot queued for the old
       // session must not undo a successful switch in the next animation frame.
@@ -339,6 +409,7 @@ export function App() {
       if (!current) return current;
       return {
         ...current,
+        archived: snapshot.archived ?? current.archived,
         collaborationMode: snapshot.collaborationMode,
         planState: snapshot.planState,
         messages: snapshot.messages,
@@ -493,6 +564,12 @@ export function App() {
 
   const handleRuntimeSideEffects = (envelope: RuntimeEvent) => {
     const { type, payload } = envelope.event;
+    if (type === "session.archived" || type === "session.unarchived") {
+      setWorkspace((current) => current && current.sessionId === payload.sessionId
+        ? { ...current, archived: payload.archived === true } : current);
+      void refreshSessions();
+      return;
+    }
     if (type !== "session.changed" && envelope.sessionId
       && envelope.sessionId !== workspaceSessionIdRef.current) return;
     const activeSubmission = planSubmissionRef.current;
@@ -910,7 +987,8 @@ export function App() {
   const submit = async (event?: FormEvent) => {
     event?.preventDefault();
     const text = input.trim();
-    if (!text || !workspace || running || compacting || planSubmissionRef.current || sessionNavigationRef.current) return;
+    if (!text || !workspace || running || compacting || planSubmissionRef.current
+      || sessionNavigationRef.current || sessionArchiveRef.current || workspace.archived) return;
     if (text.startsWith("/")) {
       const [rawName, ...rest] = text.slice(1).split(/\s+/);
       const command = commandOptions.find((item) => item.name === rawName.toLocaleLowerCase());
@@ -1274,7 +1352,7 @@ export function App() {
   }, []);
 
   const navigateSession = async (sessionId?: string) => {
-    if (running || compacting || !workspace || sessionNavigationRef.current
+    if (running || compacting || !workspace || sessionNavigationRef.current || sessionArchiveRef.current
       || (sessionId && sessionId === workspaceSessionIdRef.current)) return;
     sessionNavigationRef.current = true;
     workspaceGenerationRef.current += 1;
@@ -1284,6 +1362,10 @@ export function App() {
       const result = sessionId
         ? await window.agent.request<WorkspacePayload>("session.open", { sessionId })
         : await window.agent.request<WorkspacePayload>("session.new");
+      if (!sessionId) {
+        archivedViewRef.current = false;
+        setShowArchivedSessions(false);
+      }
       applyWorkspace(result);
       requestAnimationFrame(() => composerRef.current?.focus());
     } catch (reason) {
@@ -1325,6 +1407,9 @@ export function App() {
   const planBadgeLabel = planStatusPhase === "ready" ? "PLAN READY"
     : planStatusPhase === "uncertain" ? "PLAN UNCERTAIN"
       : planStatusPhase === "recovery_error" ? "PLAN RECOVERY" : "PLAN";
+  const conversationReadOnly = Boolean(workspace?.archived) || Boolean(pendingSessionArchive);
+  const composerBlocked = !workspace || awaitingPlanDecision || planCommandMenuOpen
+    || compacting || sessionNavigating || Boolean(planStatusMessage) || conversationReadOnly;
 
   const timelineItems = useMemo(() => selectTimelineItems(timelineState), [timelineState]);
   const renderedPlan = ["ready", "uncertain", "recovery_error"].includes(planStatusPhase ?? "")
@@ -1425,40 +1510,16 @@ export function App() {
 
       <div className={`workspace-grid ${sidebarOpen ? "" : "sidebar-closed"} ${workbenchOpen ? "with-workbench" : ""}`} style={{ "--workbench-width": `${workbenchWidth}px` } as React.CSSProperties}>
         <aside className="sidebar">
-          <div className="sidebar-heading">
-            <span>会话</span>
-            <button type="button" className="icon-button" onClick={() => void newSession()} title="新建会话"
-              aria-label="新建会话" disabled={!workspace || running || compacting || sessionNavigating}>
-              {pendingSessionNavigation === "new" ? <span className="session-navigation-spinner" aria-hidden="true" /> : "＋"}
-            </button>
-          </div>
-          {sessionNavigating && (
-            <div className="session-navigation-status" role="status" aria-live="polite">
-              <span className="session-navigation-spinner" aria-hidden="true" />
-              {pendingSessionNavigation === "new" ? "正在新建会话…" : "正在切换会话…"}
-            </div>
-          )}
-          <div className="session-list">
-            {sessions.map((session) => (
-              <button
-                key={session.id}
-                type="button"
-                className={`session-item ${session.id === workspace?.sessionId ? "active" : ""}`}
-                onClick={() => void openSession(session.id)}
-                disabled={running || compacting || sessionNavigating}
-                aria-current={session.id === workspace?.sessionId ? "true" : undefined}
-                aria-busy={pendingSessionNavigation === session.id}
-              >
-                <strong>{session.name || session.first_message || "新会话"}</strong>
-                <span>{pendingSessionNavigation === session.id ? "正在打开…" : `${session.message_count} 条消息`}</span>
-              </button>
-            ))}
-            {!sessions.length && <div className="empty-sidebar">发送第一条消息后，会话会保存到 JSONL。</div>}
-          </div>
+          <SessionList sessions={sessions} archived={showArchivedSessions} activeId={workspace?.sessionId}
+            disabled={!workspace || running || compacting || sessionNavigating || Boolean(pendingSessionArchive)}
+            loading={sessionsLoading} error={sessionListError} pendingNavigation={pendingSessionNavigation}
+            pendingArchive={pendingSessionArchive} onToggleArchive={toggleArchivedSessions}
+            onNew={() => void newSession()} onOpen={(id) => void openSession(id)}
+            onArchive={(id, archived) => void setSessionArchived(id, archived)} onRetry={() => void refreshSessions()} />
           {workspace && <SubagentPanel key={workspace.sessionId} tasks={workspace.subagents ?? []}
-            disabled={sessionNavigating}
+            disabled={sessionNavigating || Boolean(workspace.archived) || Boolean(pendingSessionArchive)}
             onCancel={(taskId) => manageSubagents("cancel", taskId)}
-            onReview={workspace.planState.phase === "ready" && workspace.planState.latestRevision && !running && !compacting
+            onReview={!workspace.archived && workspace.planState.phase === "ready" && workspace.planState.latestRevision && !running && !compacting
               ? () => manageSubagents("review", `只读复核下列计划：检查遗漏、风险和代码依据，不执行、不修改或提交计划。\n${workspace.planState.latestRevision?.markdown}`)
               : undefined}
           />}
@@ -1527,6 +1588,15 @@ export function App() {
                 ↓ 最新消息
               </button>
             )}
+            {workspace?.archived && <section className="session-archive-banner" role="status">
+              <ArchiveIcon />
+              <div><strong>此会话已归档</strong><span>恢复后可继续对话。</span></div>
+              <button type="button" className="ghost-button" disabled={Boolean(pendingSessionArchive)}
+                onClick={() => void setSessionArchived(workspace.sessionId, false)}>
+                {pendingSessionArchive ? "正在恢复…" : "恢复会话"}
+              </button>
+            </section>}
+            <fieldset className="session-plan-controls" disabled={conversationReadOnly}>
             {workspace?.planState.pendingQuestion && (
               <section className="plan-question" data-testid="plan-question">
                 <div className="plan-question-header">
@@ -1679,7 +1749,8 @@ export function App() {
                 </div>
               </section>
             )}
-            {commandMenuOpen && (
+            </fieldset>
+            {commandMenuOpen && !workspace?.archived && (
               <section className="command-palette" aria-label="斜杠命令">
                 <div className="command-palette-title">
                   <strong>命令</strong>
@@ -1754,7 +1825,7 @@ export function App() {
                     : awaitingPlanDecision
                       ? canHandoffPlan ? "请先选择执行、新会话复核或继续修改" : "请先选择执行或继续修改"
                       : "描述你想完成的任务…"}
-                disabled={!workspace || awaitingPlanDecision || planCommandMenuOpen || compacting || sessionNavigating || Boolean(planStatusMessage)}
+                disabled={composerBlocked}
                 rows={3}
               />
               <div className="composer-footer">
@@ -1764,20 +1835,20 @@ export function App() {
                     type="button"
                     className={workspace?.collaborationMode === "default" ? "active" : ""}
                     onClick={() => workspace?.collaborationMode === "plan" ? void cancelPlan() : undefined}
-                    disabled={!workspace || running || compacting}
+                    disabled={!workspace || running || compacting || conversationReadOnly}
                   >Default</button>
                   <button
                     type="button"
                     className={workspace?.collaborationMode === "plan" ? "active" : ""}
                     onClick={() => void enterPlanMode()}
-                    disabled={!workspace || running || compacting}
+                    disabled={!workspace || running || compacting || conversationReadOnly}
                   >Plan</button>
                   {(workspace?.collaborationMode === "plan" || planStatusMessage) && (
                     <span className="plan-badge">{planBadgeLabel}</span>
                   )}
                 </div>
                 <PermissionPicker key={workspace?.sessionId} mode={workspace?.permissionMode ?? "ask"}
-                  disabled={!workspace || running || compacting || (workspace.subagents ?? []).some((task) => task.status === "queued" || task.status === "running")}
+                  disabled={!workspace || running || compacting || conversationReadOnly || (workspace.subagents ?? []).some((task) => task.status === "queued" || task.status === "running")}
                   pending={pendingPermissionChange} onChange={changePermission} />
                 </div>
                 <span className="composer-hint">Enter 发送 · Shift+Enter 换行</span>
@@ -1788,7 +1859,7 @@ export function App() {
                     void window.agent.request("run.abort").catch((reason) => setError(String(reason)));
                   }}>■ 停止压缩</button>
                 ) : (
-                  <button type="submit" className="send-button" disabled={!input.trim() || !workspace}>发送 ↑</button>
+                  <button type="submit" className="send-button" disabled={composerBlocked || !input.trim()}>发送 ↑</button>
                 )}
               </div>
             </form>

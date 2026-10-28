@@ -82,6 +82,49 @@ describe("workspace workbench", () => {
     expect(screen.getByRole("button", { name: /^侧边对话/ })).toBeVisible();
   });
 
+  it("allows reading archived side conversations without creating or sending one", async () => {
+    render(<Workbench {...props} workspace={{ ...workspace, archived: true }} />);
+    fireEvent.click(screen.getByRole("button", { name: /^侧边对话/ }));
+    await screen.findByRole("option", { name: "Side question" });
+    expect(screen.getByRole("button", { name: "新建侧边对话" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "开始侧边对话" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "新建侧边对话" }));
+    fireEvent.click(screen.getByRole("button", { name: "开始侧边对话" }));
+    expect(request).not.toHaveBeenCalledWith("workbench.chat.open", scope);
+
+    fireEvent.change(screen.getByRole("combobox", { name: "选择侧边对话" }), { target: { value: "child" } });
+    const input = await screen.findByLabelText("侧边对话消息");
+    expect(request).toHaveBeenCalledWith("workbench.chat.open", { ...scope, conversationId: "child" });
+    expect(input).toBeDisabled();
+    expect(screen.getByRole("button", { name: "发送 ↑" })).toBeDisabled();
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "选择侧边对话" })).toBeEnabled());
+  });
+
+  it("updates an open side conversation to read-only on archive and preserves its draft on restore", async () => {
+    const view = render(<Workbench {...props} />);
+    fireEvent.click(screen.getByRole("button", { name: /^侧边对话/ }));
+    fireEvent.click(screen.getByRole("button", { name: "开始侧边对话" }));
+    const input = await screen.findByLabelText("侧边对话消息");
+    await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.change(input, { target: { value: "Preserved side draft" } });
+
+    view.rerender(<Workbench {...props} workspace={{ ...workspace, archived: true }} />);
+    expect(input).toBeDisabled();
+    expect(screen.getByRole("button", { name: "发送 ↑" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "新建侧边对话" })).toBeDisabled();
+    fireEvent.submit(input.closest("form")!);
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(request.mock.calls.some(([method]) => method === "workbench.chat.send")).toBe(false);
+    expect(input).toHaveValue("Preserved side draft");
+
+    view.rerender(<Workbench {...props} />);
+    expect(input).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "发送 ↑" }));
+    await waitFor(() => expect(request).toHaveBeenCalledWith("workbench.chat.send", {
+      ...scope, conversationId: "child", text: "Preserved side draft",
+    }));
+  });
+
   it("limits pointer and keyboard resizing by sidebar and conversation widths", () => {
     vi.stubGlobal("innerWidth", 1440);
     vi.stubGlobal("PointerEvent", MouseEvent);

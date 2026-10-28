@@ -144,6 +144,8 @@ Exit codes:
 
 ### Session restoration
 
+In the desktop sidebar, hover a session to archive it. The archive button beside the sidebar heading opens archived sessions, where you can read or restore them. Archiving preserves history; restore a session to continue chatting. Automatic resume skips archived sessions. See [session archiving](docs/specs/session-archive.md).
+
 ```powershell
 # Continue the latest session for the current project
 uv run coding-agent --continue

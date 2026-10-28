@@ -10,6 +10,7 @@ from typing import Any, Awaitable, Callable, cast
 import uuid
 
 from agent_core import BeforeToolCallContext, BeforeToolCallResult, SessionManager
+from agent_core.session.ids import is_valid_session_id
 from agent_llm import ThinkingLevel, create_models
 
 from coding_agent.cli.main import _resolve_api_key_for
@@ -66,6 +67,14 @@ class DesktopRuntime:
         self._side_conversations: SideConversations | None = None
 
     async def dispatch(self, method: str, params: dict[str, Any]) -> Any:
+        if method in {
+            "run.start", "run.steer", "run.followUp", "mode.enterPlan", "plan.answer",
+            "plan.cancel", "plan.execute", "plan.handoff", "session.clear", "session.compact",
+            "model.select", "subagent.spawn", "workbench.chat.send",
+        } or (method == "workbench.chat.open" and not params.get("conversationId")) or (
+            method == "workbench.chat.approve" and params.get("allowed") is True
+        ):
+            self._ensure_session_not_archived()
         if method.startswith("workbench."):
             return await self._workbench_request(method, params)
         handlers: dict[str, Callable[[dict[str, Any]], Awaitable[Any]]] = {
@@ -74,6 +83,8 @@ class DesktopRuntime:
             "session.list": self._session_list,
             "session.new": self._session_new,
             "session.open": self._session_open,
+            "session.archive": self._session_archive,
+            "session.unarchive": self._session_unarchive,
             "session.snapshot": self._session_snapshot,
             "session.clear": self._session_clear,
             "command.list": self._command_list,
@@ -285,7 +296,9 @@ class DesktopRuntime:
     ) -> SessionManager:
         sessions_dir = get_sessions_dir()
         if session_id:
-            available = SessionManager.list_sessions(cwd=str(workspace), sessions_dir=sessions_dir)
+            available = SessionManager.list_sessions(
+                cwd=str(workspace), sessions_dir=sessions_dir,
+            )
             match = next((item for item in available if item.id == session_id), None)
             if match is None:
                 raise RpcError("SESSION_NOT_FOUND", f"找不到会话：{session_id}")
@@ -297,10 +310,51 @@ class DesktopRuntime:
         return SessionManager.create(cwd=str(workspace), sessions_dir=sessions_dir)
 
     async def _session_list(self, params: dict[str, Any]) -> list[dict[str, Any]]:
-        del params
+        archived = params.get("archived", False)
+        if not isinstance(archived, bool):
+            raise RpcError("INVALID_PARAMS", "session.list 的 archived 必须是布尔值")
         workspace = self._require_workspace()
-        infos = SessionManager.list_sessions(cwd=str(workspace), sessions_dir=get_sessions_dir())
+        infos = SessionManager.list_sessions(
+            cwd=str(workspace), sessions_dir=get_sessions_dir(), archived=archived,
+        )
         return [to_jsonable(item) for item in infos]
+
+    async def _session_archive(self, params: dict[str, Any]) -> dict[str, Any]:
+        return self._set_session_archived(params, archived=True)
+
+    async def _session_unarchive(self, params: dict[str, Any]) -> dict[str, Any]:
+        return self._set_session_archived(params, archived=False)
+
+    def _set_session_archived(self, params: dict[str, Any], *, archived: bool) -> dict[str, Any]:
+        session_id = params.get("sessionId")
+        if (not isinstance(session_id, str) or session_id != session_id.strip()
+                or not is_valid_session_id(session_id)):
+            raise RpcError("INVALID_PARAMS", "归档操作需要有效的 sessionId")
+        self._ensure_no_active_run("任务运行时不能更改会话归档状态")
+        session = self._require_session()
+        if session.subagents.has_active or (
+            self._side_conversations is not None
+            and any(record.task is not None and not record.task.done()
+                    for record in self._side_conversations.records.values())
+        ):
+            raise RpcError("RUN_IN_PROGRESS", "请先停止子代理或侧边对话，再更改会话归档状态")
+        workspace = self._require_workspace()
+        sessions_dir = get_sessions_dir()
+        match = next((item for item in SessionManager.list_sessions(
+            cwd=str(workspace), sessions_dir=sessions_dir, archived=None,
+        ) if item.id == session_id), None)
+        if match is None:
+            raise RpcError("SESSION_NOT_FOUND", f"找不到会话：{session_id}")
+        try:
+            manager = session.session_manager if session.session_manager.header.id == session_id else SessionManager.open(
+                match.path, sessions_dir=sessions_dir,
+            )
+            manager.set_archived(archived)
+        except (OSError, ValueError) as exc:
+            raise RpcError("SESSION_ARCHIVE_FAILED", "无法保存会话归档状态，请重试") from exc
+        payload = {"sessionId": session_id, "archived": archived}
+        self._publish("session.archived" if archived else "session.unarchived", payload)
+        return payload
 
     async def _session_new(self, params: dict[str, Any]) -> dict[str, Any]:
         del params
@@ -325,6 +379,7 @@ class DesktopRuntime:
         session = self._require_session()
         return {
             "sessionId": session.session_manager.header.id,
+            "archived": self._current_session_archived(),
             "messages": to_jsonable(session.state.messages),
             "stats": to_jsonable(session.get_stats()),
             "collaborationMode": session.collaboration_mode,
@@ -1089,6 +1144,7 @@ class DesktopRuntime:
         return {
             "path": str(self._require_workspace()),
             "sessionId": session.session_manager.header.id,
+            "archived": self._current_session_archived(),
             "model": to_jsonable(session.model),
             "thinkingLevel": session.thinking_level,
             "tools": [tool.name for tool in session.tools],
@@ -1122,6 +1178,19 @@ class DesktopRuntime:
             raise RpcError("COMPACTION_IN_PROGRESS", "上下文压缩中，请先停止压缩")
         if self._run_task is not None and not self._run_task.done():
             raise RpcError("RUN_IN_PROGRESS", message)
+
+    def _current_session_archived(self) -> bool:
+        manager = getattr(self._session, "session_manager", None)
+        refresh = getattr(manager, "refresh_archived", None)
+        try:
+            archived = refresh() if callable(refresh) else getattr(getattr(manager, "header", None), "archived", False)
+        except (OSError, ValueError) as exc:
+            raise RpcError("SESSION_ARCHIVE_FAILED", "无法读取会话归档状态，请检查会话记录") from exc
+        return archived is True
+
+    def _ensure_session_not_archived(self) -> None:
+        if self._current_session_archived():
+            raise RpcError("SESSION_ARCHIVED", "此会话已归档，请先恢复会话后继续")
 
     def _require_workspace(self) -> Path:
         if self._workspace is None:

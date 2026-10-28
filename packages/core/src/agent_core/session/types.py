@@ -50,6 +50,7 @@ class SessionHeader:
     type: Literal["session"] = "session"
     version: int = CURRENT_SESSION_VERSION
     parent_session: str | None = None
+    archived: bool = False
 
 
 # ─── Entry base + variants ────────────────
@@ -304,3 +305,4 @@ class SessionInfo:
     first_message: str
     all_messages_text: str
     name: str | None = None
+    archived: bool = False
