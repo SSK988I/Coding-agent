@@ -2,7 +2,9 @@ import { StrictMode } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { BrowserSnapshot, WorkbenchNativeEvent } from "../../shared/workbench";
+import type { WorkspacePayload } from "../../shared/types";
 import { BrowserPanel } from "./nativePanels";
+import { Workbench } from "./Workbench";
 
 const scope = { workspacePath: "G:\\project", sessionId: "main" };
 const listeners = new Set<(event: WorkbenchNativeEvent) => void>();
@@ -39,6 +41,26 @@ it("hides bounds when inactive, then restores the same owned browser", async () 
   await waitFor(() => expect(request).toHaveBeenCalledWith("browser.bounds", expect.objectContaining({ ...scope, key, visible: false })));
   expect(request.mock.calls.filter(([method]) => method === "browser.close")).toHaveLength(0);
   view.rerender(<BrowserPanel scope={scope} active />);
+  expect(request.mock.calls.filter(([method]) => method === "browser.open")).toHaveLength(1);
+});
+
+it("hides the native browser for the usage drawer and restores its existing page afterwards", async () => {
+  const props = {
+    workspace: { path: scope.workspacePath, sessionId: scope.sessionId } as WorkspacePayload,
+    open: true, onClose: vi.fn(), width: 480, onWidth: vi.fn(),
+  };
+  const view = render(<Workbench {...props} />);
+  fireEvent.click(screen.getByRole("button", { name: /^浏览器/ }));
+  await waitFor(() => expect(request.mock.calls.some(([method, params]) => method === "browser.bounds" && params.visible === true)).toBe(true));
+  const key = request.mock.calls.find(([method]) => method === "browser.open")![1].key;
+  view.rerender(<Workbench {...props} suspended />);
+  await waitFor(() => expect(request.mock.calls.filter(([method]) => method === "browser.bounds").at(-1)?.[1])
+    .toEqual(expect.objectContaining({ ...scope, key, visible: false })));
+  expect(screen.getByLabelText("网页地址")).toHaveValue("https://example.test/");
+  expect(request.mock.calls.filter(([method]) => method === "browser.close")).toHaveLength(0);
+  view.rerender(<Workbench {...props} />);
+  await waitFor(() => expect(request.mock.calls.filter(([method]) => method === "browser.bounds").at(-1)?.[1])
+    .toEqual(expect.objectContaining({ ...scope, key, visible: true })));
   expect(request.mock.calls.filter(([method]) => method === "browser.open")).toHaveLength(1);
 });
 

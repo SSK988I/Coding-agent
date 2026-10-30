@@ -34,8 +34,8 @@ class Settings:
     memory_user_id: str = "local-user"
     memory_max_records: int = 8
     memory_token_budget: int = 800
-    # Enabled by default. DeepSeek executes search natively with the same API
-    # credential; other providers use the configured application backend.
+    # DeepSeek Pro uses native search; Flash uses the standalone DeepSeek Search
+    # API with the same key. This backend setting is the non-DeepSeek fallback.
     web_search_enabled: bool = True
     web_search_backend: str = "zhipu-mcp"
     web_search_max_results: int = 5

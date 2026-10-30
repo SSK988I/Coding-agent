@@ -10,7 +10,8 @@ from coding_agent.search.types import SearchQuery, SearchResponse
 class SearchBackend(Protocol):
     """A service capable of resolving a normalized search query."""
 
-    name: str
+    @property
+    def name(self) -> str: ...
 
     async def search(self, query: SearchQuery, *, signal: Any = None) -> SearchResponse: ...
 

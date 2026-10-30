@@ -32,7 +32,10 @@ from agent_llm import (
     Context,
     Model,
     ThinkingLevel,
+    UserMessage,
 )
+from agent_llm.image_utils import validate_image_messages
+from agent_llm.providers.deepseek_models import supports_native_web_search
 from agent_core import (
     Agent,
     AgentEvent,
@@ -50,12 +53,15 @@ from agent_core import (
     GrepTool,
     LsTool,
     ReadTool,
+    ViewImageTool,
     SessionManager,
     WriteTool,
 )
 from agent_core.prompts import build_system_prompt
 from coding_agent.core.retry import RetryPolicy, retrying_stream
+from coding_agent.core.image_identification import image_identification_guidance
 from coding_agent.core.usage_metrics import UsageMetrics, project_usage_metrics
+from coding_agent.core.usage_analysis import project_usage_requests
 from coding_agent.core.permissions import PERMISSION_MODES, PermissionMode, requires_approval, is_approval_safe_shell_command
 from coding_agent.core.subagents import SubagentError, SubagentManager, SubagentTool
 from coding_agent.memory.types import MemoryScope
@@ -193,6 +199,7 @@ def _create_default_tools(cwd: str, shell_kind: str = "bash", platform: str = ""
     bash_tool = BashTool(cwd=cwd)
     return cast(list[AgentTool], [
         ReadTool(cwd=cwd),
+        ViewImageTool(cwd=cwd),
         WriteTool(cwd=cwd),
         EditTool(cwd=cwd),
         bash_tool,
@@ -282,17 +289,9 @@ class AgentSession:
             )
         self._web_search_backend = None
         if config.web_search_enabled and not config.no_tools and not config.no_builtin_tools:
-            from coding_agent.search.backends import ZhipuMcpSearchBackend
             from coding_agent.search.tool import WebSearchTool
 
-            backend = config.web_search_backend
-            if backend is None:
-                if config.web_search_backend_name != "zhipu-mcp":
-                    raise ValueError(f"Unsupported web search backend: {config.web_search_backend_name}")
-                backend = ZhipuMcpSearchBackend(
-                    config.web_search_credential_resolver or config.get_api_key,
-                    timeout_seconds=config.web_search_timeout_seconds,
-                )
+            backend = config.web_search_backend or self._create_search_backend()
             self._web_search_backend = backend
             if not any(tool.name == "web_search" for tool in raw_tools):
                 raw_tools.append(cast(AgentTool, WebSearchTool(
@@ -519,15 +518,24 @@ class AgentSession:
         if self._plan_state.phase in {"uncertain", "recovery_error"}:
             return []
         if self._plan_state.mode != "plan":
-            return [*self._development_tools, *self._subagent_tools]
+            return [tool for tool in [*self._development_tools, *self._subagent_tools]
+                    if tool.name != "view_image" or self._supports_image_tool()]
         if self._plan_state.phase != "drafting":
             return []
         return [
-            *self._plan_observation_tools,
+            *(tool for tool in self._plan_observation_tools
+              if tool.name != "view_image" or self._supports_image_tool()),
             cast(AgentTool, self._control_tool),
             cast(AgentTool, self._submit_plan_tool),
             *self._subagent_tools,
         ]
+
+    def _supports_image_tool(self) -> bool:
+        # Other adapters may accept user images but flatten tool images to text.
+        # Do not advertise a tool whose pixels would silently disappear.
+        model = self._agent.state.model if hasattr(self, "_agent") else self._config.model
+        return bool(model and model.provider == "deepseek" and model.api == "openai-responses"
+                    and "image" in model.input)
 
     def _validate_subagent_spawn(self) -> None:
         if self._config.no_tools or not any(tool.name == "subagent_spawn" for tool in self._subagent_tools):
@@ -539,10 +547,12 @@ class AgentSession:
 
     def _make_readonly_subagent(self) -> Agent:
         """Fresh built-ins only: custom tools cannot self-certify child access."""
-        safe_types = (ReadTool, GrepTool, FindTool, LsTool, GitStatusTool, GitLogTool, GitDiffTool, GitShowTool)
+        safe_types = (ReadTool, ViewImageTool, GrepTool, FindTool, LsTool, GitStatusTool, GitLogTool, GitDiffTool, GitShowTool)
         tools = []
         for tool in self._development_tools:
             if type(tool) not in safe_types or getattr(tool, "plan_access", "deny") != "observe":
+                continue
+            if tool.name == "view_image" and not self._supports_image_tool():
                 continue
             options = {"prefer_external": False} if type(tool) in (GrepTool, FindTool) else {}
             factory = cast(Callable[..., AgentTool], type(tool))
@@ -556,6 +566,14 @@ class AgentSession:
                 return BeforeToolCallResult(block=True, reason="SUBAGENT_READ_ONLY: tool not allowed")
             if self._plan_state.phase in {"uncertain", "recovery_error"}:
                 return BeforeToolCallResult(block=True, reason="PLAN_RECOVERY_REQUIRED")
+            image_gate = self._image_tool_gate(context)
+            if image_gate is not None:
+                return image_gate
+            if (self._config.before_tool_call is None and self.permission_mode is not None
+                    and requires_approval(self.permission_mode, context.tool_call.name, context.args,
+                                          Path(self.cwd), is_approval_safe_shell_command)):
+                return BeforeToolCallResult(block=True, code="PERMISSION_APPROVAL_REQUIRED",
+                                            reason="此操作需要审批；当前非交互运行无法请求批准", status="blocked")
             return await call_hook(self._config.before_tool_call, context, signal)
 
         return Agent(
@@ -580,18 +598,49 @@ class AgentSession:
         return any(tool.name == "web_search" for tool in self._development_tools)
 
     @property
+    def web_search_available(self) -> bool:
+        """Whether the host currently exposes search, before normal approval."""
+        return (
+            self.web_search_enabled
+            and self._plan_state.phase not in {"uncertain", "recovery_error"}
+            and (self._plan_state.mode == "default" or self._plan_state.phase == "drafting")
+            and any(tool.name == "web_search" for tool in self._tools)
+        )
+
+    @property
     def native_web_search_enabled(self) -> bool:
         """Whether this session will use the model provider's built-in search."""
         return (
-            self.web_search_enabled
-            and self._model.provider == "deepseek"
-            and self._plan_state.mode == "default"
-            and self._plan_state.phase not in {"uncertain", "recovery_error"}
+            self.web_search_available
+            and supports_native_web_search(self._model)
         )
 
     @property
     def web_search_backend_label(self) -> str:
-        return "deepseek-native" if self.native_web_search_enabled else self._config.web_search_backend_name
+        # Describe the selected backend even while search is disabled or paused.
+        if supports_native_web_search(self._model):
+            return "deepseek-native"
+        if self._config.web_search_backend is None and self._model.provider == "deepseek":
+            return "deepseek-search"
+        return self._config.web_search_backend_name
+
+    @property
+    def web_search_credential_provider(self) -> str:
+        if supports_native_web_search(self._model) or (
+            self._config.web_search_backend is None and self._model.provider == "deepseek"
+        ):
+            return "deepseek"
+        return "zai-coding-cn"
+
+    def _create_search_backend(self, *, model_provider: Callable[[], str] | None = None):
+        from coding_agent.search.backends.model import ModelSearchBackend
+
+        return ModelSearchBackend(
+            model_provider or (lambda: self._model.provider),
+            self._config.web_search_credential_resolver or self._config.get_api_key,
+            fallback_name=self._config.web_search_backend_name,
+            timeout_seconds=self._config.web_search_timeout_seconds,
+        )
 
     async def set_web_search_enabled(self, enabled: bool) -> None:
         """Enable or disable the application-owned search tool at runtime."""
@@ -608,19 +657,11 @@ class AgentSession:
                 return
             if self._config.excluded_tool_names and "web_search" in self._config.excluded_tool_names:
                 return
-            from coding_agent.search.backends import ZhipuMcpSearchBackend
             from coding_agent.search.tool import WebSearchTool
 
             backend = self._web_search_backend or self._config.web_search_backend
             if backend is None:
-                if self._config.web_search_backend_name != "zhipu-mcp":
-                    raise ValueError(
-                        f"Unsupported web search backend: {self._config.web_search_backend_name}"
-                    )
-                backend = ZhipuMcpSearchBackend(
-                    self._config.web_search_credential_resolver or self._config.get_api_key,
-                    timeout_seconds=self._config.web_search_timeout_seconds,
-                )
+                backend = self._create_search_backend()
             self._web_search_backend = backend
             self._development_tools.append(cast(AgentTool, WebSearchTool(
                 backend,
@@ -678,6 +719,11 @@ class AgentSession:
         return prompt
 
     def _refresh_collaboration_runtime(self) -> None:
+        # Settings can add/remove search after Plan was entered. Rebuild the
+        # observation profile from the current filtered tools, not an old copy.
+        self._plan_observation_tools = _create_plan_observation_tools(
+            self._development_tools, cwd=self.cwd,
+        )
         self._tools = self._effective_tools()
         self._system_prompt = self._build_effective_system_prompt()
         if hasattr(self, "_agent"):
@@ -687,6 +733,9 @@ class AgentSession:
     async def _before_tool_call(
         self, context: BeforeToolCallContext, signal: asyncio.Event,
     ) -> BeforeToolCallResult | None:
+        image_gate = self._image_tool_gate(context)
+        if image_gate is not None:
+            return image_gate
         if self._plan_state.mode == "plan" or self._plan_state.phase in {"uncertain", "recovery_error"}:
             policy_result = await enforce_plan_tool_policy(
                 context, self.cwd, phase=self._plan_state.phase,
@@ -709,7 +758,44 @@ class AgentSession:
                 block=True, code="PERMISSION_APPROVAL_REQUIRED",
                 reason="此操作需要审批；当前非交互运行无法请求批准", status="blocked",
             )
-        return await call_hook(self._config.before_tool_call, context, signal)
+        result = await call_hook(self._config.before_tool_call, context, signal)
+        if result is not None and result.block:
+            return result
+        if context.tool_call.name == "web_search":
+            # The permission dialog may yield while Plan becomes ready or the
+            # search capability is revoked. Approval does not pin old policy.
+            if signal.is_set():
+                return BeforeToolCallResult(block=True, code="WEB_SEARCH_ABORTED",
+                                            reason="联网检索已被中断", status="cancelled")
+            if not self.web_search_available:
+                return BeforeToolCallResult(block=True, code="WEB_SEARCH_UNAVAILABLE",
+                                            reason="当前阶段或工具配置不允许联网检索", status="blocked")
+        return result
+
+    def _image_tool_gate(self, context: BeforeToolCallContext) -> BeforeToolCallResult | None:
+        if context.tool_call.name != "view_image":
+            return None
+        if not self._supports_image_tool():
+            return BeforeToolCallResult(
+                block=True, code="IMAGE_INPUT_UNSUPPORTED",
+                reason="当前模型适配器不支持工具图片输入", status="blocked",
+            )
+        if self._plan_state.mode == "plan" and requires_approval(
+            "ask", "view_image", context.args, Path(self.cwd), is_approval_safe_shell_command,
+        ):
+            return BeforeToolCallResult(
+                block=True, code="PLAN_IMAGE_PATH_BLOCKED",
+                reason="Plan 中仅可查看工作区内的非敏感图片；外部路径需要退出 Plan 后审批", status="blocked",
+            )
+        if (self._config.before_tool_call is None and requires_approval(
+            self.permission_mode or "ask", "view_image", context.args,
+            Path(self.cwd), is_approval_safe_shell_command,
+        )):
+            return BeforeToolCallResult(
+                block=True, code="PERMISSION_APPROVAL_REQUIRED",
+                reason="查看工作区外或敏感目录的图片需要明确审批", status="blocked",
+            )
+        return None
 
     def _sync_plan_state(self, *, emit: bool = True) -> PlanState:
         """Rebuild authoritative Plan State after a persisted transition."""
@@ -973,6 +1059,7 @@ class AgentSession:
 
     async def execute_plan(
         self, plan_id: str, revision: int, digest: str, run_id: str | None = None,
+        *, before_complete: Callable[[], None] | None = None,
     ) -> PlanRevision:
         if self._is_processing or self._active_plan_run_id is not None:
             raise PlanModeError("RUN_IN_PROGRESS", "任务运行中，不能执行计划")
@@ -1017,13 +1104,16 @@ class AgentSession:
             await self._extract_accepted_plan_memory(latest, started_entry)
             if not self._plan_abort_requested:
                 await self.prompt(execution_prompt, _plan_run_id=run_id)
+            stop_reason = getattr(self._last_assistant_message, "stop_reason", None)
+            if (before_complete is not None and not self._plan_abort_requested
+                    and stop_reason not in {None, "aborted", "error", "length"}):
+                before_complete()
         except asyncio.CancelledError:
             self._finish_plan_run(latest, "aborted", run_id=run_id)
             raise
         except Exception as exc:
             self._finish_plan_run(latest, "failed", run_id=run_id, error=str(exc))
             raise
-        stop_reason = getattr(self._last_assistant_message, "stop_reason", None)
         if self._plan_abort_requested or stop_reason == "aborted":
             self._finish_plan_run(latest, "aborted", run_id=run_id)
         elif stop_reason in {None, "error", "length"}:
@@ -1242,6 +1332,11 @@ class AgentSession:
                 "QUESTION_NOT_PENDING",
                 "请先通过结构化问题控件回答当前 Plan 问题",
             )
+        from coding_agent.core.messages import convert_to_llm
+        prospective_message = UserMessage(content=message) if isinstance(message, str) else message
+        validate_image_messages(
+            convert_to_llm([*self._agent.state.messages, prospective_message]), self.model,
+        )
         branch_before = {entry.id for entry in self.session_manager.get_branch()}
         task_mode = _memory_mode or self._plan_state.mode
         query = _memory_query if _memory_query is not None else _message_text(message)
@@ -1671,6 +1766,14 @@ class AgentSession:
             return None
         return hashlib.sha256(encoded.encode("ascii")).hexdigest()
 
+    def get_usage_analysis(self) -> dict[str, Any]:
+        """Return scalar usage history for the active branch on demand."""
+        return {
+            "leafId": self.session_manager.leaf_id,
+            "stats": self.get_stats(),
+            "requests": project_usage_requests(self.session_manager.get_branch()),
+        }
+
     def get_stats(self) -> SessionStats:
         """Compute session statistics from session entries.
 
@@ -1848,22 +1951,20 @@ class AgentSession:
         Models instance.
         """
         from agent_llm.compat import stream_simple
-        from agent_llm.event_stream import lazy_stream
+        from agent_llm.event_stream import AssistantMessageEventStream, lazy_stream
 
         def _stream(model: Model, context, options=None):
             provider_native = (
-                model.provider == "deepseek"
+                supports_native_web_search(model)
                 and any(tool.name == "web_search" for tool in (context.tools or []))
             )
 
             def native_search_enabled() -> bool:
                 return (
-                    provider_native and self.web_search_enabled
-                    and self._plan_state.mode == "default"
-                    and self._plan_state.phase not in {"uncertain", "recovery_error"}
+                    provider_native and self.web_search_available
                 )
 
-            def start(native_allowed: bool = True):
+            def start(native_allowed: bool = True) -> AssistantMessageEventStream:
                 # Rebuild from the original input for each actual attempt, after
                 # authorization awaits. No retry may reuse a search flag/prompt.
                 effective_options: dict[str, Any] = dict(options or {})
@@ -1897,6 +1998,21 @@ class AgentSession:
                         messages=context.messages,
                         tools=effective_context.tools,
                     )
+                image_guidance = image_identification_guidance(
+                    effective_context,
+                    can_search=(
+                        self.web_search_available
+                        and (bool(effective_options.get("web_search")) or any(
+                            tool.name == "web_search" for tool in (effective_context.tools or [])
+                        ))
+                    ),
+                )
+                if image_guidance:
+                    effective_context = Context(
+                        system_prompt=f"{effective_context.system_prompt or ''}\n\n{image_guidance}".strip(),
+                        messages=effective_context.messages,
+                        tools=effective_context.tools,
+                    )
                 # Freeze before starting the producer: tool schemas and policy
                 # may change while this response (or another memory task) runs.
                 fingerprint = self._usage_context_fingerprint(
@@ -1919,14 +2035,22 @@ class AgentSession:
                         result.add_done_callback(bind_usage)
                 return inner
 
-            def attempt():
+            def attempt() -> AssistantMessageEventStream:
                 # Authorization belongs inside the retry factory: the host can
                 # revoke capabilities during backoff or while approval waits.
+                try:
+                    validate_image_messages(context.messages, model)
+                except ValueError as exc:
+                    async def reject_image(error: ValueError = exc):
+                        raise error
+                    return lazy_stream(model, reject_image)
                 if native_search_enabled() and self._config.before_native_web_search is not None:
-                    async def authorize_search():
+                    async def authorize_search() -> AssistantMessageEventStream:
                         allowed = await self._config.before_native_web_search(self._retry_abort_event)
                         if self._retry_abort_event.is_set():
                             raise asyncio.CancelledError
+                        # Host approval may have yielded while the context changed.
+                        validate_image_messages(context.messages, model)
                         return start(bool(allowed))
                     return lazy_stream(model, authorize_search)
                 return start(self.permission_mode != "ask")

@@ -16,13 +16,14 @@ from coding_agent.modes.interactive.components.permission_menu import Permission
 from coding_agent.modes.interactive.interactive_mode import InteractiveMode
 
 
-def make_mode(tmp_path, mode=None):
+def make_mode(tmp_path, mode=None, *, web_search_enabled=False):
     settings = SettingsManager(tmp_path / "settings.json")
     settings.load()
     session = AgentSession(AgentSessionConfig(
         cwd=str(tmp_path), session_manager=SessionManager.create(in_memory=True),
         model=Model(id="test", cost=ModelCost(input=0, output=0, cache_read=0, cache_write=0)),
         settings_manager=settings, permission_mode=mode,
+        web_search_enabled=web_search_enabled,
     ))
     return InteractiveMode(session)
 
@@ -233,7 +234,7 @@ def test_real_write_executes_only_after_required_approval(tmp_path, permission_m
 
 def test_native_search_decision_is_cached_only_within_one_task(tmp_path):
     async def scenario():
-        mode = make_mode(tmp_path)
+        mode = make_mode(tmp_path, web_search_enabled=True)
         signal = asyncio.Event()
         try:
             waiting = asyncio.create_task(mode._before_native_web_search(signal))

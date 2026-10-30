@@ -107,11 +107,27 @@ Every tool has one runtime-owned `plan_access` classification:
 classification controls tool registration and a pre-execution gate, so a
 frontend, custom tool or subagent cannot widen Plan access independently.
 
-Plan Mode exposes Python-backed workspace readers (`read`, `grep`, `find`,
-`ls`), Plan controls and structured Git readers. It does not expose `bash`,
-write/edit tools, test runners, linters, builders or package managers. Python
-backends are used for search and discovery so repository-local executables and
-`PATH` shims are not launched.
+While drafting, Plan Mode exposes Python-backed workspace readers (`read`,
+`grep`, `find`, `ls`), the observe-classified local image reader `view_image`,
+Plan controls, structured Git readers and configured read-only public web
+search. It does not expose `bash`, write/edit tools, test
+runners, linters, builders or package managers. Python backends are used for
+local search and discovery so repository-local executables and `PATH` shims
+are not launched.
+
+Application `web_search` calls and provider-native search use the same approval
+policy as Default Mode. This covers DeepSeek Flash's standalone Search API,
+Pro's native search and the configured search fallback. Search must remain
+enabled and configured; Plan Mode does not enable it automatically. Queries
+must not contain private code, credentials, internal URLs or personal data,
+and returned pages and snippets are untrusted data. Search approval permits
+only the supported read-only search path, not arbitrary network requests or
+project mutations.
+
+`awaiting_answer` and `ready` wait for host controls rather than starting model
+tool rounds; `uncertain` and `recovery_error` remain blocked pending an explicit
+recovery action. Search availability does not change these states, execution
+confirmation or the network restriction on bounded read-only subagents.
 
 `git_status`, `git_log`, `git_diff` and `git_show` launch Git with an argument
 array rather than through a shell. Pager, terminal prompts, optional locks and
@@ -220,6 +236,8 @@ and recovery behavior.
 - Replaying one active branch deterministically yields the same Plan State.
 - Unknown tools, shell commands, tests/builds and mutating tools are denied in
   Plan Mode before frontend approval.
+- Drafting permits configured read-only web search under ordinary approval;
+  denial, cancellation or a later policy change prevents the search request.
 - Structured Git diff/show cannot launch configured external diff or textconv
   helpers.
 - A stale tuple cannot execute or hand off; an orphaned run restores as

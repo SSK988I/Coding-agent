@@ -15,11 +15,14 @@ from agent_core.tools.git import (
 )
 from agent_core.tools.ls import LS_SCHEMA, LsTool
 from agent_core.tools.read import READ_SCHEMA, ReadTool
+from agent_core.tools.view_image import VIEW_IMAGE_SCHEMA, ViewImageTool
 from agent_core.tools.write import WRITE_SCHEMA, WriteTool
 
 __all__ = [
     "ReadTool",
     "READ_SCHEMA",
+    "ViewImageTool",
+    "VIEW_IMAGE_SCHEMA",
     "WriteTool",
     "WRITE_SCHEMA",
     "BashTool",

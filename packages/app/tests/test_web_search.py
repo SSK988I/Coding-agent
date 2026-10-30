@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 from agent_llm import AssistantMessage, AssistantMessageEventStream, Context, Model, ModelCost, TextContent, Tool
+from agent_llm.providers.deepseek_models import DEEPSEEK_MODELS
 
 from coding_agent.core.agent_session import AgentSession, AgentSessionConfig
 from coding_agent.core.retry import RetryPolicy
@@ -259,13 +260,7 @@ def test_agent_session_can_toggle_web_search_at_runtime() -> None:
 
 def test_deepseek_uses_native_search_without_exposing_duplicate_function(monkeypatch) -> None:
     backend = _FakeBackend()
-    model = Model(
-        id="deepseek-v4-flash",
-        api="openai-responses",
-        provider="deepseek",
-        context_window=16_000,
-        cost=ModelCost(input=0, output=0, cache_read=0, cache_write=0),
-    )
+    model = DEEPSEEK_MODELS["deepseek-v4-pro"]
     session = AgentSession(AgentSessionConfig(
         model=model,
         web_search_enabled=True,
@@ -296,6 +291,87 @@ def test_deepseek_uses_native_search_without_exposing_duplicate_function(monkeyp
     session.dispose()
 
 
+@pytest.mark.parametrize("model", [
+    DEEPSEEK_MODELS["deepseek-flash"],
+    Model(id="unknown-deepseek", provider="deepseek", api="openai-responses", cost=ModelCost(0, 0, 0, 0)),
+])
+def test_flash_and_unknown_models_keep_function_search_without_native_permission(monkeypatch, model) -> None:
+    captured, approvals = [], []
+
+    async def authorize(_signal):
+        approvals.append(True)
+        return True
+
+    def provider(_model, context, options):
+        captured.append((context, options))
+        result = AssistantMessageEventStream()
+        result.push({"type": "done", "reason": "stop", "message": AssistantMessage()})
+        return result
+
+    monkeypatch.setattr("agent_llm.compat.stream_simple", provider)
+    monkeypatch.setattr("coding_agent.core.agent_session.retrying_stream", lambda factory, *_a, **_kw: factory())
+
+    async def scenario():
+        session = AgentSession(AgentSessionConfig(
+            model=model, web_search_enabled=True, web_search_backend=_FakeBackend(),
+            before_native_web_search=authorize,
+        ))
+        try:
+            stream = session._create_stream_fn()(model, Context(tools=[Tool(name="web_search")]), {"web_search": True})
+            message = await stream.result()
+            assert getattr(message, "_usage_context_fingerprint", None)
+            assert session.native_web_search_enabled is False
+            assert session.web_search_backend_label == "zhipu-mcp"
+            assert approvals == []
+            assert len(captured) == 1, "Function search must not wait for native-search authorization"
+            context, options = captured[0]
+            assert [tool.name for tool in context.tools] == ["web_search"]
+            assert not (options or {}).get("web_search")
+            assert "<native_web_search>" not in (context.system_prompt or "")
+            await stream.aclose()
+        finally:
+            await session.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_switching_flash_and_pro_updates_search_backend_and_request_tools(monkeypatch) -> None:
+    captured = []
+
+    def provider(_model, context, options):
+        captured.append((context, options))
+        result = AssistantMessageEventStream()
+        result.push({"type": "done", "reason": "stop", "message": AssistantMessage()})
+        return result
+
+    monkeypatch.setattr("agent_llm.compat.stream_simple", provider)
+    monkeypatch.setattr("coding_agent.core.agent_session.retrying_stream", lambda factory, *_a, **_kw: factory())
+
+    async def scenario():
+        session = AgentSession(AgentSessionConfig(
+            model=DEEPSEEK_MODELS["deepseek-flash"], web_search_enabled=True, web_search_backend=_FakeBackend(),
+            permission_mode="full_access",
+        ))
+        stream_fn = session._create_stream_fn()
+        try:
+            for model_id in ("deepseek-flash", "deepseek-v4-pro", "deepseek-flash"):
+                session.set_model(DEEPSEEK_MODELS[model_id])
+                stream = stream_fn(session.model, Context(tools=[Tool(name="web_search")]), None)
+                message = await stream.result()
+                assert getattr(message, "_usage_context_fingerprint", None)
+                native = model_id == "deepseek-v4-pro"
+                context, options = captured[-1]
+                assert session.native_web_search_enabled is native
+                assert session.web_search_backend_label == ("deepseek-native" if native else "zhipu-mcp")
+                assert bool((options or {}).get("web_search")) is native
+                assert [tool.name for tool in (context.tools or [])] == ([] if native else ["web_search"])
+                await stream.aclose()
+        finally:
+            await session.aclose()
+
+    asyncio.run(scenario())
+
+
 def test_native_search_rebuilds_authorization_context_and_options_for_each_retry(monkeypatch) -> None:
     async def scenario():
         decisions = iter([True, False, True])
@@ -305,7 +381,7 @@ def test_native_search_rebuilds_authorization_context_and_options_for_each_retry
             checks.append(allowed)
             return allowed
         session = AgentSession(AgentSessionConfig(
-            model=Model(id="test", provider="deepseek", cost=ModelCost(0, 0, 0, 0)),
+            model=DEEPSEEK_MODELS["deepseek-v4-pro"],
             web_search_enabled=True, web_search_backend=_FakeBackend(),
             before_native_web_search=authorize,
             retry_policy=RetryPolicy(max_retries=2, initial_delay=0, max_delay=0),
@@ -344,15 +420,23 @@ def test_native_search_rebuilds_authorization_context_and_options_for_each_retry
 
 @pytest.mark.parametrize("transition", ["before_retry_without_hook", "during_retry_authorization"])
 def test_native_search_rechecks_core_plan_policy_on_retry(monkeypatch, transition) -> None:
+    from dataclasses import replace
+
     async def scenario():
         captured, checks = [], []
+
+        def await_plan_confirmation():
+            session.enter_plan_mode()
+            session._plan_state = replace(session.plan_state, phase="ready")
+            session._refresh_collaboration_runtime()
+
         async def authorize(_signal):
             checks.append(True)
             if len(checks) == 2:
-                session.enter_plan_mode()
+                await_plan_confirmation()
             return True
         session = AgentSession(AgentSessionConfig(
-            model=Model(id="test", provider="deepseek", cost=ModelCost(0, 0, 0, 0)),
+            model=DEEPSEEK_MODELS["deepseek-v4-pro"],
             web_search_enabled=True, web_search_backend=_FakeBackend(), permission_mode="full_access",
             before_native_web_search=authorize if transition == "during_retry_authorization" else None,
             retry_policy=RetryPolicy(max_retries=1, initial_delay=0, max_delay=0),
@@ -367,7 +451,7 @@ def test_native_search_rechecks_core_plan_policy_on_retry(monkeypatch, transitio
             return stream
         monkeypatch.setattr("agent_llm.compat.stream_simple", provider)
         if transition == "before_retry_without_hook":
-            session.on_event(lambda event: session.enter_plan_mode() if event.get("type") == "retry" else None)
+            session.on_event(lambda event: await_plan_confirmation() if event.get("type") == "retry" else None)
         stream = session._create_stream_fn()(session.model, Context(tools=[Tool(name="web_search")]), {"web_search": True})
         try:
             async for _event in stream:
@@ -386,6 +470,8 @@ def test_native_search_rechecks_core_plan_policy_on_retry(monkeypatch, transitio
 
 
 def test_default_search_backend_uses_dedicated_credential_resolver() -> None:
+    from coding_agent.search.backends.model import ModelSearchBackend
+
     def model_key(_provider: str) -> str:
         return "model-override-key"
 
@@ -398,16 +484,17 @@ def test_default_search_backend_uses_dedicated_credential_resolver() -> None:
         web_search_enabled=True,
         web_search_credential_resolver=search_key,
     ))
-    assert isinstance(session._web_search_backend, ZhipuMcpSearchBackend)
-    assert session._web_search_backend._credential_resolver is search_key
+    assert isinstance(session._web_search_backend, ModelSearchBackend)
+    backend = session._web_search_backend._selected_backend()
+    assert isinstance(backend, ZhipuMcpSearchBackend)
+    assert backend._credential_resolver is search_key
     session.dispose()
 
 
-@pytest.mark.parametrize("phase", ["drafting", "ready", "uncertain", "recovery_error", "memory"])
+@pytest.mark.parametrize("phase", ["awaiting_answer", "ready", "uncertain", "recovery_error", "memory"])
 def test_native_search_cannot_bypass_plan_or_background_context_tool_policy(monkeypatch, phase) -> None:
     from coding_agent.core.plan_mode import PlanState
-    model = Model(id="deepseek-v4-flash", api="openai-responses", provider="deepseek",
-                  context_window=16_000, cost=ModelCost(input=0, output=0, cache_read=0, cache_write=0))
+    model = DEEPSEEK_MODELS["deepseek-v4-pro"]
     session = AgentSession(AgentSessionConfig(
         model=model, web_search_enabled=True, web_search_backend=_FakeBackend(),
     ))

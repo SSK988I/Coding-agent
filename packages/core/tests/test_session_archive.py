@@ -355,6 +355,34 @@ def test_corrupt_canonical_archive_state_does_not_fall_back_to_legacy_marker(tmp
     assert read_header(manager.path) is None
 
 
+def test_archive_uses_short_sibling_temp_for_valid_long_windows_path(tmp_path: Path, monkeypatch):
+    from agent_core.session import storage
+
+    parent = tmp_path / ("deep-" + "x" * max(1, 185 - len(str(tmp_path)) - 6))
+    path = parent / "2026-10-25T13-18-03-696Z_01a17336-09b0-7212-97a7-c6c87396fb13.jsonl"
+    assert len(str(path)) < 260
+    header = SessionHeader(id="saved-session", timestamp="2026-10-25T13:18:03Z", cwd=CWD)
+    write_header_line(path, header)
+    with path.open("ab") as target:
+        target.write(b'{"preserved":"entry bytes"}\r\n')
+    tail = _tail(path)
+    mkstemp = storage.tempfile.mkstemp
+
+    def windows_mkstemp(*, prefix, suffix, dir):
+        # Apply the real Windows constraint on every platform, including CI.
+        if len(str(Path(dir) / f"{prefix}{'x' * 8}{suffix}")) >= 260:
+            raise FileNotFoundError("Windows MAX_PATH exceeded")
+        return mkstemp(prefix=prefix, suffix=suffix, dir=dir)
+
+    monkeypatch.setattr(storage.tempfile, "mkstemp", windows_mkstemp)
+    header.archived = True
+    rewrite_header_line(path, header)
+    archived_header = read_header(path)
+    assert archived_header is not None and archived_header.archived is True
+    assert _tail(path) == tail
+    assert list(parent.glob(".*.tmp")) == []
+
+
 @pytest.mark.parametrize("archived", [False, True, None])
 def test_list_rejects_other_workspace_when_directory_encoding_collides(tmp_path: Path, archived):
     from agent_core.session.ids import encode_cwd
