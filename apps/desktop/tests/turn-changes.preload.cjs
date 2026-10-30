@@ -95,4 +95,17 @@ contextBridge.exposeInMainWorld("turnChangesSmoke", {
     emit("run.completed", {}, runId);
   },
   staleChange: () => emit("workbench.turnChanged", { change: first }, first.runId, "turns-current"),
+  restoreFailed: (stopReason) => {
+    const runId = `failed-${stopReason}`;
+    current().messages = [
+      { role: "user", content: `保存代码后 ${stopReason}`, timestamp: 1 },
+      { role: "assistant", content: [{ type: "toolCall", id: "write-1", name: "write", arguments: { path: "code.py" } }], timestamp: 2 },
+      { role: "toolResult", tool_call_id: "write-1", tool_name: "write", content: "代码已写入", status: "completed", timestamp: 3 },
+      { role: "assistant", content: [], stop_reason: stopReason, timestamp: 4 },
+    ];
+    const change = summary(runId, 3, [file("code.py", 3, 0)]);
+    current().turnChanges = [change];
+    freezeReview(change);
+    emit("session.changed", workspace(), null);
+  },
 });

@@ -12,7 +12,12 @@ import warnings
 from PIL import Image, UnidentifiedImageError
 
 from agent_llm import ImageContent, TextContent
-from agent_llm.image_utils import IMAGE_FORMAT_MIMES, MAX_IMAGE_BYTES, validate_image_content
+from agent_llm.image_utils import (
+    IMAGE_FORMAT_MIMES,
+    MAX_IMAGE_BYTES,
+    preflight_image_bytes,
+    validate_image_content,
+)
 
 from agent_core.types import AgentToolResult, PlanAccess
 
@@ -69,6 +74,7 @@ class ViewImageTool:
         if len(raw) > MAX_IMAGE_BYTES:
             raise ValueError("Image exceeds the 5 MiB size limit")
 
+        preflight_image_bytes(raw)
         # Detect MIME from actual bytes, not an untrusted filename extension.
         try:
             with warnings.catch_warnings():

@@ -10,11 +10,13 @@ from pathlib import Path
 from typing import Any, Callable, cast
 import uuid
 
-from agent_core import BeforeToolCallContext, BeforeToolCallResult, SessionManager
+from agent_core import AgentTool, BeforeToolCallContext, BeforeToolCallResult, SessionManager
 from coding_agent.core.agent_session import AgentSession, AgentSessionConfig, _create_plan_observation_tools
 from coding_agent.core.permissions import PermissionMode, requires_approval, is_approval_safe_shell_command
 from coding_agent.core.plan_mode import enforce_plan_tool_policy
 from coding_agent.desktop.protocol import RpcError, to_jsonable
+from coding_agent.search.backends.model import ModelSearchBackend
+from coding_agent.search.tool import WebSearchTool
 
 CHILD_TOOLS = {"read", "write", "edit", "bash", "grep", "find", "ls", "git_status", "git_log", "git_diff", "git_show", "web_search"}
 
@@ -138,15 +140,29 @@ class SideConversations:
         inherited = [tool for tool in self.parent.tools if tool.name in CHILD_TOOLS]
         observations = {tool.name: tool for tool in _create_plan_observation_tools(inherited, cwd=self.parent.cwd)}
         tools = [observations.get(tool.name, tool) if tool.name in {"grep", "find"} else tool for tool in inherited]
+        search_backend = None
+        for index, tool in enumerate(tools):
+            if (self.parent._config.web_search_backend is None
+                    and isinstance(tool, WebSearchTool) and isinstance(tool.backend, ModelSearchBackend)):
+                # Built-in routing belongs to the child's model. Reusing the
+                # parent's router would follow later model switches and closes.
+                search_backend = self.parent._create_search_backend(model_provider=lambda: child.model.provider)
+                tools[index] = cast(AgentTool, WebSearchTool(search_backend, default_count=tool.default_count))
         child = AgentSession(AgentSessionConfig(
             model=self.parent.model, cwd=self.parent.cwd, tools=tools,
             session_manager=manager, no_builtin_tools=True,
             get_api_key=self.parent._config.get_api_key, reasoning=self.parent.agent.reasoning,
+            web_search_backend=self.parent._config.web_search_backend,
+            web_search_credential_resolver=self.parent._config.web_search_credential_resolver,
+            web_search_backend_name=self.parent._config.web_search_backend_name,
+            web_search_max_results=self.parent._config.web_search_max_results,
+            web_search_timeout_seconds=self.parent._config.web_search_timeout_seconds,
             context_files=self.parent._config.context_files, retry_policy=self.parent.retry_policy,
             memory_configured=False,
             permission_mode=cast(PermissionMode, self.permission()),
             append_system_prompt="This is a user-directed side conversation. Work independently. Its messages and results are not injected into the main conversation.",
         ))
+        child._web_search_backend = search_backend
         live = SideConversation(child)
         child._config.before_tool_call = lambda context, signal: self._approve(live, context, signal)
         child._config.before_native_web_search = lambda signal: self._approve_native_search(live, signal)

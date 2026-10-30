@@ -55,6 +55,65 @@ _DESKTOP_COMMANDS = {
 }
 
 
+class _RunAttachmentPersistence:
+    """Keep this run's attachment messages until their entries are durable."""
+
+    def __init__(self, session: AgentSession, *, with_files: bool = False) -> None:
+        self._session = session
+        self._code = "ATTACHMENT_PERSISTENCE_FAILED" if with_files else "IMAGE_PERSISTENCE_FAILED"
+        self._messages: dict[int, Any] = {}
+        self._initial_messages = {id(message) for message in getattr(getattr(session, "state", None), "messages", [])}
+        self._initial_entries = {
+            entry.id for entry in getattr(getattr(session, "session_manager", None), "entries", [])
+        }
+        subscribe = getattr(session, "on_event", None)
+        self._unsubscribe = cast(Callable[[], None], subscribe(self._on_event)) if callable(subscribe) else None
+
+    def track(self, message: Any) -> None:
+        content = getattr(message, "content", None)
+        if (
+            getattr(message, "role", None) in {"user", "toolResult"}
+            and (getattr(message, "attachments", None)
+                 or (isinstance(content, list) and any(isinstance(block, ImageContent) for block in content)))
+        ):
+            self._messages[id(message)] = message
+
+    def _on_event(self, event: Any) -> None:
+        if not isinstance(event, dict):
+            return
+        if event.get("type") == "message_end":
+            self.track(event.get("message"))
+        elif event.get("type") == "turn_end":
+            for result in event.get("tool_results", []):
+                self.track(result)
+
+    def validate(self) -> None:
+        for message in getattr(getattr(self._session, "state", None), "messages", []):
+            if id(message) not in self._initial_messages:
+                self.track(message)
+        if not self._messages:
+            return
+        persisted_messages = {
+            id(getattr(entry, "message", None))
+            for entry in self._session.session_manager.entries if entry.id not in self._initial_entries
+        }
+        if not self._messages.keys() <= persisted_messages:
+            raise RpcError(
+                self._code,
+                "本轮附件消息未成功保存到会话记录，请检查磁盘空间和写入权限后重试；未自动重新请求模型。",
+            )
+        # Subscribers can swallow append errors, and compaction can replace
+        # live history. Check every retained message before forcing durability.
+        try:
+            self._session.session_manager.flush()
+        except OSError as exc:
+            raise RpcError(self._code, f"附件会话保存失败，请检查磁盘空间和写入权限后重试：{exc}") from exc
+
+    def close(self) -> None:
+        if self._unsubscribe is not None:
+            self._unsubscribe()
+
+
 class DesktopRuntime:
     """Own one live workspace/session and translate RPC commands to AgentSession."""
 
@@ -653,20 +712,24 @@ class DesktopRuntime:
         self, session: AgentSession, question_id: str, answer: str, run_id: str,
     ) -> None:
         self._publish("run.started", {"planAnswer": True}, run_id=run_id)
+        attachments = _RunAttachmentPersistence(session)
         captured = None
         terminal = None
         try:
             captured = await self._capture_workbench(session, run_id)
             await session.answer_plan_question(question_id, answer)
+            if session.agent.last_run_status != "cancelled":
+                attachments.validate()
         except asyncio.CancelledError:
             terminal = ("run.cancelled", {})
-        except PlanModeError as exc:
+        except (PlanModeError, RpcError) as exc:
             terminal = ("run.failed", {"code": exc.code, "message": str(exc)})
         except Exception as exc:  # noqa: BLE001 - runtime boundary
             terminal = ("run.failed", {"message": str(exc)})
         else:
             terminal = self._prompt_outcome(session)
         finally:
+            attachments.close()
             await self._finalize_run(session, run_id, captured, terminal)
 
     async def _plan_cancel(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -747,12 +810,17 @@ class DesktopRuntime:
         digest: str, run_id: str,
     ) -> None:
         self._publish("run.started", {"planExecution": True}, run_id=run_id)
+        attachments = _RunAttachmentPersistence(session)
         captured = None
         terminal = None
         try:
             captured = await self._capture_workbench(session, run_id)
-            await session.execute_plan(plan_id, revision, digest, run_id=run_id)
-        except PlanModeError as exc:
+            await session.execute_plan(
+                plan_id, revision, digest, run_id=run_id, before_complete=attachments.validate,
+            )
+            if session.plan_state.phase == "failed":
+                attachments.validate()
+        except (PlanModeError, RpcError) as exc:
             terminal = ("run.failed", {"code": exc.code, "message": str(exc)})
         except asyncio.CancelledError:
             terminal = ("run.cancelled", {})
@@ -766,6 +834,7 @@ class DesktopRuntime:
             else:
                 terminal = ("run.completed", {"stats": to_jsonable(session.get_stats())})
         finally:
+            attachments.close()
             await self._finalize_run(session, run_id, captured, terminal)
 
     async def _drive_run(
@@ -773,32 +842,9 @@ class DesktopRuntime:
         *, images: list[ImageContent] | None = None, files: StoredAttachments | None = None,
     ) -> None:
         images = images or []
-        image_messages: dict[int, Any] = {}
-        initial_messages = {id(message) for message in getattr(getattr(session, "state", None), "messages", [])}
-        initial_entries = {
-            entry.id for entry in getattr(getattr(session, "session_manager", None), "entries", [])
-        }
-        stop_tracking: Callable[[], None] | None = None
+        attachments = _RunAttachmentPersistence(session, with_files=files is not None)
         captured = None
         terminal = None
-
-        def track_image_message(message: Any) -> None:
-            content = getattr(message, "content", None)
-            if (
-                getattr(message, "role", None) in {"user", "toolResult"}
-                and (getattr(message, "attachments", None)
-                     or (isinstance(content, list) and any(isinstance(block, ImageContent) for block in content)))
-            ):
-                image_messages[id(message)] = message
-
-        def track_image_event(event: Any) -> None:
-            if not isinstance(event, dict):
-                return
-            if event.get("type") == "message_end":
-                track_image_message(event.get("message"))
-            elif event.get("type") == "turn_end":
-                for result in event.get("tool_results", []):
-                    track_image_message(result)
 
         self._publish("run.started", {
             "text": text,
@@ -815,45 +861,20 @@ class DesktopRuntime:
                 ], attachments=files.metadata if files is not None else [])
                 if images or files is not None else text
             )
-            track_image_message(message)
-            subscribe = getattr(session, "on_event", None)
-            if callable(subscribe):
-                # Keep references even if auto-compaction replaces live history.
-                stop_tracking = cast(Callable[[], None], subscribe(track_image_event))
+            attachments.track(message)
             await session.prompt(message)
-            for current in getattr(getattr(session, "state", None), "messages", []):
-                if id(current) not in initial_messages:
-                    track_image_message(current)
-            if image_messages:
-                persisted_messages = {
-                    id(getattr(entry, "message", None))
-                    for entry in session.session_manager.entries if entry.id not in initial_entries
-                }
-                if not image_messages.keys() <= persisted_messages:
-                    terminal = ("run.failed", {
-                        "code": "ATTACHMENT_PERSISTENCE_FAILED" if files is not None else "IMAGE_PERSISTENCE_FAILED",
-                        "message": "本轮附件消息未成功保存到会话记录，请检查磁盘空间和写入权限后重试；未自动重新请求模型。",
-                    })
-                    return
-                # Agent event subscribers can swallow append errors. Do not
-                # acknowledge image delivery until its JSONL is durably saved.
-                try:
-                    session.session_manager.flush()
-                except OSError as exc:
-                    terminal = ("run.failed", {
-                        "code": "ATTACHMENT_PERSISTENCE_FAILED" if files is not None else "IMAGE_PERSISTENCE_FAILED",
-                        "message": f"附件会话保存失败，请检查磁盘空间和写入权限后重试：{exc}",
-                    })
-                    return
+            if session.agent.last_run_status != "cancelled":
+                attachments.validate()
         except asyncio.CancelledError:
             terminal = ("run.cancelled", {})
+        except (PlanModeError, RpcError) as exc:
+            terminal = ("run.failed", {"code": exc.code, "message": str(exc)})
         except Exception as exc:  # noqa: BLE001 - runtime boundary
             terminal = ("run.failed", {"message": str(exc)})
         else:
             terminal = self._prompt_outcome(session)
         finally:
-            if stop_tracking is not None:
-                stop_tracking()
+            attachments.close()
             await self._finalize_run(session, run_id, captured, terminal)
 
     @staticmethod

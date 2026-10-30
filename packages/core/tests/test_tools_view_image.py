@@ -11,7 +11,7 @@ import pytest
 
 from agent_core import ViewImageTool
 from agent_llm import ImageContent, TextContent
-from agent_llm.image_utils import MAX_IMAGE_BYTES
+from agent_llm.image_utils import ImageInputError, MAX_IMAGE_BYTES
 
 
 def _image_bytes(format: str = "PNG", size: tuple[int, int] = (8, 6)) -> bytes:
@@ -52,6 +52,20 @@ def test_view_image_accepts_absolute_path(tmp_path: Path) -> None:
     assert isinstance(result.content[1], ImageContent)
 
 
+@pytest.mark.parametrize("format", ["GIF", "WEBP"])
+def test_view_image_preserves_supported_animation(tmp_path: Path, format: str) -> None:
+    output = BytesIO()
+    frames = [Image.new("RGB", (2, 3), color) for color in ("red", "blue")]
+    frames[0].save(output, format=format, save_all=True, append_images=frames[1:], duration=40, loop=0)
+    raw = output.getvalue()
+    (tmp_path / "animation.txt").write_bytes(raw)
+    result = asyncio.run(ViewImageTool(cwd=str(tmp_path)).execute("view", {"path": "animation.txt"}))
+    image = result.content[1]
+    assert isinstance(image, ImageContent)
+    assert image.mime_type == f"image/{format.lower()}"
+    assert base64.b64decode(image.data) == raw
+
+
 @pytest.mark.parametrize("raw", [b"", b"not an image", b"\x89PNG\r\n\x1a\n"])
 def test_view_image_rejects_invalid_files(tmp_path: Path, raw: bytes) -> None:
     (tmp_path / "fake.png").write_bytes(raw)
@@ -81,6 +95,25 @@ def test_view_image_rejects_excessive_dimensions(tmp_path: Path) -> None:
     (tmp_path / "wide.png").write_bytes(_image_bytes(size=(8193, 1)))
     with pytest.raises(ValueError):
         asyncio.run(ViewImageTool(cwd=str(tmp_path)).execute("bad", {"path": "wide.png"}))
+
+
+def test_view_image_webp_canvas_is_bounded_before_mime_detection(tmp_path: Path, monkeypatch) -> None:
+    from PIL import WebPImagePlugin
+
+    output = BytesIO()
+    frames = [Image.new("RGB", (2, 3), color) for color in ("red", "blue")]
+    frames[0].save(output, format="WEBP", save_all=True, append_images=frames[1:], duration=40, loop=0)
+    raw = bytearray(output.getvalue())
+    assert raw[12:16] == b"VP8X"
+    raw[24:27] = (8000 - 1).to_bytes(3, "little")
+    raw[27:30] = (3000 - 1).to_bytes(3, "little")
+    assert len(raw) < 1024
+    (tmp_path / "unsafe.txt").write_bytes(raw)
+    monkeypatch.setattr(WebPImagePlugin._webp, "WebPAnimDecoder",
+                        lambda *_args: pytest.fail("unsafe WebP reached native MIME detection"))
+    with pytest.raises(ImageInputError) as error:
+        asyncio.run(ViewImageTool(cwd=str(tmp_path)).execute("bad", {"path": "unsafe.txt"}))
+    assert error.value.code == "IMAGE_DIMENSIONS_EXCEEDED"
 
 
 def test_view_image_rejects_non_regular_path(tmp_path: Path) -> None:

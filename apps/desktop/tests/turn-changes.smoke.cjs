@@ -106,13 +106,26 @@ async function main() {
   await evaluate("window.turnChangesSmoke.staleChange()");
   await paint();
   assert.equal(await evaluate("document.querySelectorAll('.turn-changes-card').length"), 0);
+  await evaluate("[...document.querySelectorAll('.session-item')].find(node => node.textContent.includes('逐轮变更审阅')).click()");
+  await waitFor("document.querySelectorAll('.turn-changes-card').length === 3");
+  for (const stopReason of ["error", "aborted"]) {
+    await evaluate(`window.turnChangesSmoke.restoreFailed(${JSON.stringify(stopReason)})`);
+    await waitFor("document.querySelectorAll('.turn-changes-card').length === 1 && document.querySelector('[aria-label=\"查看 code.py 的变更\"]')");
+    assert(await evaluate("(() => { const rows = [...document.querySelectorAll('.timeline-row')]; const tool = rows.findIndex(node => node.querySelector('.tool-card-view')); const card = rows.findIndex(node => node.querySelector('.turn-changes-card')); return tool >= 0 && card > tool; })()"),
+      "Saved changes must survive an invisible terminal message and follow the tool result");
+    await click(".turn-changes-view");
+    const expectedDiff = JSON.stringify(`failed-${stopReason}:code.py`);
+    await waitFor(`document.querySelector('.changes-panel')?.textContent.includes(${expectedDiff})`);
+    await click('[aria-label="关闭工具栏"]');
+  }
   const finalState = await evaluate("window.turnChangesSmoke.state()");
   assert.equal(finalState.calls.filter((call) => call.method === "run.start").length, 0);
   assert.deepEqual(blockedRequests, []);
   assert.deepEqual(errors, []);
   console.log(JSON.stringify({ passed: true, output, restoredTurnPositions: true, expandedFiles: true,
     exactReviewAndFile: true, olderReviewPreserved: true, noChangeAddsNoCard: true, duplicateLiveChangeIdempotent: true,
-    staleSessionIgnored: true, reviewCalls: finalState.calls.filter((call) => call.method === "workbench.changes").map((call) => call.params.runId),
+    staleSessionIgnored: true, hiddenErrorAndAbortRestored: true,
+    reviewCalls: finalState.calls.filter((call) => call.method === "workbench.changes").map((call) => call.params.runId),
     screenshots: ["turn-changes-card-wide.png", "turn-changes-details-wide.png", "turn-changes-details-narrow.png", "turn-changes-card-narrow.png"].map((name) => path.join(output, name)) }));
   window.destroy();
   app.quit();

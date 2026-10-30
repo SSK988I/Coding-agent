@@ -26,6 +26,37 @@ describe("per-turn change records", () => {
     expect(selectTimelineItems(state).filter((item) => item.kind === "changes").map((item) => item.runId)).toEqual(["run-1", "run-2"]);
   });
 
+  it.each(["error", "aborted"])("restores saved changes after a hidden %s message", (stopReason) => {
+    const messages: AgentMessage[] = [
+      { role: "user", content: "write code.py", timestamp: 1 },
+      { role: "assistant", content: [{ type: "toolCall", id: "write-1", name: "write", arguments: { path: "code.py" } }], timestamp: 2 },
+      { role: "toolResult", tool_call_id: "write-1", tool_name: "write", content: "written", timestamp: 3 },
+      { role: "assistant", content: [], stop_reason: stopReason, timestamp: 4 },
+      { role: "user", content: "next task", timestamp: 5 },
+      { role: "assistant", content: "next reply", timestamp: 6 },
+    ];
+    const items = selectTimelineItems(createTimelineStateFromMessages(messages, "session-1", [
+      { ...change, afterMessageIndex: 3 },
+      { ...change, runId: "run-2", entryId: "entry-2", afterMessageIndex: 5 },
+    ]));
+    expect(items.map((item) => item.kind)).toEqual(["message", "tool", "changes", "message", "message", "changes"]);
+    expect(items[2]).toMatchObject({ runId: "run-1", change: { afterMessageIndex: 3 } });
+    expect(items[3]).toMatchObject({ text: "next task" });
+    expect(items.filter((item) => item.kind === "message").map((item) => item.text))
+      .toEqual(["write code.py", "next task", "next reply"]);
+  });
+
+  it("rejects invalid persisted change anchors without losing valid hidden anchors", () => {
+    const messages: AgentMessage[] = [{ role: "assistant", content: [], stop_reason: "error" }];
+    const invalid = [-1, .5, Number.NaN, Number.POSITIVE_INFINITY, messages.length]
+      .map((afterMessageIndex, index) => ({ ...change, runId: `invalid-${index}`, afterMessageIndex }));
+    const items = selectTimelineItems(createTimelineStateFromMessages(messages, "session-1", [
+      ...invalid, { ...change, afterMessageIndex: 0 },
+    ]));
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ kind: "changes", runId: "run-1" });
+  });
+
   it("adds a changed turn once and rejects an empty or mismatched run notification", () => {
     const valid = runtimeEvent(2, "workbench.turnChanged", { change });
     const result = reduceRuntimeEventBatch(createTimelineState(), [

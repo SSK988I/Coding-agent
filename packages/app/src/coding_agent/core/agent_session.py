@@ -632,11 +632,11 @@ class AgentSession:
             return "deepseek"
         return "zai-coding-cn"
 
-    def _create_search_backend(self):
+    def _create_search_backend(self, *, model_provider: Callable[[], str] | None = None):
         from coding_agent.search.backends.model import ModelSearchBackend
 
         return ModelSearchBackend(
-            lambda: self._model.provider,
+            model_provider or (lambda: self._model.provider),
             self._config.web_search_credential_resolver or self._config.get_api_key,
             fallback_name=self._config.web_search_backend_name,
             timeout_seconds=self._config.web_search_timeout_seconds,
@@ -1059,6 +1059,7 @@ class AgentSession:
 
     async def execute_plan(
         self, plan_id: str, revision: int, digest: str, run_id: str | None = None,
+        *, before_complete: Callable[[], None] | None = None,
     ) -> PlanRevision:
         if self._is_processing or self._active_plan_run_id is not None:
             raise PlanModeError("RUN_IN_PROGRESS", "任务运行中，不能执行计划")
@@ -1103,13 +1104,16 @@ class AgentSession:
             await self._extract_accepted_plan_memory(latest, started_entry)
             if not self._plan_abort_requested:
                 await self.prompt(execution_prompt, _plan_run_id=run_id)
+            stop_reason = getattr(self._last_assistant_message, "stop_reason", None)
+            if (before_complete is not None and not self._plan_abort_requested
+                    and stop_reason not in {None, "aborted", "error", "length"}):
+                before_complete()
         except asyncio.CancelledError:
             self._finish_plan_run(latest, "aborted", run_id=run_id)
             raise
         except Exception as exc:
             self._finish_plan_run(latest, "failed", run_id=run_id, error=str(exc))
             raise
-        stop_reason = getattr(self._last_assistant_message, "stop_reason", None)
         if self._plan_abort_requested or stop_reason == "aborted":
             self._finish_plan_run(latest, "aborted", run_id=run_id)
         elif stop_reason in {None, "error", "length"}:

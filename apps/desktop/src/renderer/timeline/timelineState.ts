@@ -265,9 +265,11 @@ export function createTimelineStateFromMessages(
   turnChanges: readonly TurnChangesSummary[] = [],
 ): TimelineState {
   const items = timelineItemsFromPersistedMessages(messages, sessionId);
-  const present = new Set(items.map((item) => item.order));
   for (const change of turnChanges) {
-    if (!change.files.length || !present.has(change.afterMessageIndex)) continue;
+    // Anchors refer to the persisted transcript, including hidden empty
+    // error/aborted messages. Projection must not discard their saved changes.
+    if (!change.files.length || !Number.isInteger(change.afterMessageIndex)
+      || change.afterMessageIndex < 0 || change.afterMessageIndex >= messages.length) continue;
     items.push({ id: `changes:${change.runId}`, kind: "changes", change,
       order: change.afterMessageIndex + .5, revision: 0, sessionId, runId: change.runId,
       createdAt: change.timestamp, updatedAt: change.timestamp });

@@ -152,6 +152,91 @@ def test_small_animations_are_validated_without_rewriting(format: str) -> None:
     assert metadata == (image.mime_type, 2, 3, 12, 2)
 
 
+@pytest.mark.parametrize("size", [(8000, 3000), (8193, 1), (3000, 3000)])
+def test_webp_canvas_is_bounded_before_native_decoder(size, monkeypatch) -> None:
+    from PIL import WebPImagePlugin
+
+    raw = bytearray(base64.b64decode(animated_image_content("WEBP").data))
+    assert raw[12:16] == b"VP8X"
+    raw[24:27] = (size[0] - 1).to_bytes(3, "little")
+    raw[27:30] = (size[1] - 1).to_bytes(3, "little")
+    assert len(raw) < 1024
+    image = ImageContent(data=base64.b64encode(raw).decode(), mime_type="image/webp")
+    monkeypatch.setattr(WebPImagePlugin._webp, "WebPAnimDecoder",
+                        lambda *_args: pytest.fail("unsafe WebP reached native decoder"))
+    with pytest.raises(ImageInputError) as error:
+        validate_image_content(image)
+    assert error.value.code == "IMAGE_DIMENSIONS_EXCEEDED"
+
+
+@pytest.mark.parametrize("lossless", [False, True])
+def test_static_webp_bitstream_dimensions_are_bounded_before_native_decoder(lossless, monkeypatch) -> None:
+    from PIL import WebPImagePlugin
+
+    output = BytesIO()
+    Image.new("RGB", (2, 3), "red").save(output, format="WEBP", lossless=lossless)
+    raw = bytearray(output.getvalue())
+    if lossless:
+        assert raw[12:16] == b"VP8L"
+        raw[21:25] = ((8000 - 1) | ((3000 - 1) << 14)).to_bytes(4, "little")
+    else:
+        assert raw[12:16] == b"VP8 "
+        raw[26:28] = (8000).to_bytes(2, "little")
+        raw[28:30] = (3000).to_bytes(2, "little")
+    image = ImageContent(data=base64.b64encode(raw).decode(), mime_type="image/webp")
+    monkeypatch.setattr(WebPImagePlugin._webp, "WebPAnimDecoder",
+                        lambda *_args: pytest.fail("unsafe static WebP reached native decoder"))
+    with pytest.raises(ImageInputError) as error:
+        validate_image_content(image)
+    assert error.value.code == "IMAGE_DIMENSIONS_EXCEEDED"
+
+
+def test_webp_frame_count_is_bounded_before_native_decoder(monkeypatch) -> None:
+    from PIL import WebPImagePlugin
+
+    image = animated_image_content("WEBP", frames=65)
+    with monkeypatch.context() as patch:
+        patch.setattr(WebPImagePlugin._webp, "WebPAnimDecoder",
+                      lambda *_args: pytest.fail("excessive WebP frames reached native decoder"))
+        with pytest.raises(ImageInputError) as error:
+            validate_image_content(image)
+        assert error.value.code == "IMAGE_FRAMES_EXCEEDED"
+    assert validate_image_content(animated_image_content("WEBP", frames=64))
+
+
+@pytest.mark.parametrize("corruption", ["truncated", "chunk_bounds", "short_vp8x", "short_anmf"])
+def test_webp_invalid_headers_are_rejected_before_native_decoder(corruption, monkeypatch) -> None:
+    from PIL import WebPImagePlugin
+
+    raw = bytearray(base64.b64decode(animated_image_content("WEBP").data))
+    if corruption == "truncated":
+        del raw[-1]
+    elif corruption == "chunk_bounds":
+        raw[16:20] = (0xFFFFFFF0).to_bytes(4, "little")
+    elif corruption == "short_vp8x":
+        raw[16:20] = (9).to_bytes(4, "little")
+    else:
+        frame = raw.index(b"ANMF")
+        raw[frame + 4:frame + 8] = (15).to_bytes(4, "little")
+    image = ImageContent(data=base64.b64encode(raw).decode(), mime_type="image/webp")
+    monkeypatch.setattr(WebPImagePlugin._webp, "WebPAnimDecoder",
+                        lambda *_args: pytest.fail("invalid WebP reached native decoder"))
+    with pytest.raises(ImageInputError) as error:
+        validate_image_content(image)
+    assert error.value.code == "INVALID_IMAGE"
+
+
+@pytest.mark.parametrize("lossless", [False, True])
+def test_webp_preflight_accepts_static_metadata_and_padded_unknown_chunks(lossless) -> None:
+    output = BytesIO()
+    Image.new("RGB", (3, 4), "red").save(output, format="WEBP", lossless=lossless, exif=b"metadata")
+    raw = bytearray(output.getvalue())
+    raw.extend(b"TEST\x03\x00\x00\x00abc\x00")
+    raw[4:8] = (len(raw) - 8).to_bytes(4, "little")
+    image = ImageContent(data=base64.b64encode(raw).decode(), mime_type="image/webp")
+    assert validate_image_content(image) is image
+
+
 def expanding_gif(size: tuple[int, int], offset: tuple[int, int] = (0, 0)) -> bytes:
     palette = [255, 0, 0, 0, 0, 255] + [0] * 762
     encoded = []

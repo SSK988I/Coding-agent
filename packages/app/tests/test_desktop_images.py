@@ -9,14 +9,17 @@ import random
 
 import pytest
 from agent_core import AgentToolResult, SessionManager
+from agent_core.session.types import PlanRunEntry
+from agent_core.tools.view_image import ViewImageTool
 from agent_llm import (
     AssistantMessage, AssistantMessageEventStream, ImageContent, Model, ModelCost,
     TextContent, ToolCall, UserMessage,
 )
+from agent_llm.providers.deepseek_models import DEEPSEEK_MODELS
 from PIL import Image
 
 from coding_agent.core.agent_session import AgentSession, AgentSessionConfig
-from coding_agent.core.plan_mode import PlanQuestion
+from coding_agent.core.plan_mode import PlanQuestion, reduce_plan_state
 from coding_agent.desktop.attachments import parse_image_attachments
 from coding_agent.desktop.protocol import RpcError
 from coding_agent.desktop.runtime import DesktopRuntime
@@ -32,13 +35,13 @@ def png_attachment(size=(2, 2), *, noisy=False):
     return {"data": base64.b64encode(output.getvalue()).decode("ascii"), "mime_type": "image/png"}
 
 
-def make_runtime(tmp_path, *, input_modalities=None, tools=None):
+def make_runtime(tmp_path, *, input_modalities=None, tools=None, question_behavior="interactive", model=None):
     events = []
     runtime = DesktopRuntime(events.append)
     manager = SessionManager.create(cwd=str(tmp_path), sessions_dir=tmp_path / "sessions")
     session = AgentSession(AgentSessionConfig(
-        cwd=str(tmp_path), session_manager=manager, tools=tools or [],
-        model=Model(
+        cwd=str(tmp_path), session_manager=manager, tools=tools or [], question_behavior=question_behavior,
+        model=model or Model(
             id="vision-test", provider="test", input=input_modalities or ["text", "image"],
             cost=ModelCost(input=0, output=0, cache_read=0, cache_write=0),
         ),
@@ -94,6 +97,141 @@ def test_image_prompt_events_and_persistence_are_lossless(tmp_path, text):
             assert restored.messages[0] == session.state.messages[0]
         finally:
             await runtime.dispose()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("entrypoint", ["execute", "answer"])
+@pytest.mark.parametrize("outcome", [
+    "completed", "lost_append", "flush_failed", "cancelled", "cancelled_lost_append", "failed", "failed_lost_append",
+])
+def test_plan_image_results_are_durable_before_completion(tmp_path, monkeypatch, entrypoint, outcome):
+    import agent_core.session.session_manager as persistence
+
+    async def scenario():
+        image = tmp_path / "image.png"
+        image.write_bytes(base64.b64decode(png_attachment()["data"]))
+        runtime, session, events = make_runtime(
+            tmp_path, tools=[ViewImageTool(str(tmp_path))], question_behavior="deferred",
+            model=DEEPSEEK_MODELS["deepseek-flash"],
+        )
+        session.enter_plan_mode()
+        setup_call = ToolCall(
+            id="setup", name="submit_plan" if entrypoint == "execute" else "request_user_input",
+            arguments=(
+                {"title": "Inspect image", "markdown": "Inspect image.png."}
+                if entrypoint == "execute" else {"questions": [{
+                    "header": "Scope", "question": "Which image?", "options": [
+                        {"label": "Local", "description": "Inspect local image"},
+                        {"label": "Other", "description": "Inspect another image"},
+                    ],
+                }]}
+            ),
+        )
+
+        def response(message):
+            stream = AssistantMessageEventStream()
+            stream.push({"type": "done", "reason": message.stop_reason, "message": message})
+            return stream
+
+        session.agent.stream_fn = lambda *_: response(AssistantMessage(content=[setup_call], stop_reason="tool_use"))
+        await runtime.dispatch("run.start", {"text": "Plan an image inspection"})
+        await asyncio.wait_for(runtime._run_task, 5)
+        assert events[-1]["event"]["type"] == "run.completed"
+        events.clear()
+        calls = []
+
+        def stream(*_):
+            calls.append(True)
+            if len(calls) == 1:
+                return response(AssistantMessage(content=[ToolCall(
+                    id="view", name="view_image", arguments={"path": "image.png"},
+                )], stop_reason="tool_use"))
+            if outcome.startswith("cancelled"):
+                return response(AssistantMessage(content=[], stop_reason="aborted"))
+            if outcome.startswith("failed"):
+                return response(AssistantMessage(content=[], stop_reason="error", error_message="provider unavailable"))
+            return successful_stream()
+
+        append = persistence.append_entry_line
+        flush = session.session_manager.flush
+        rejected = []
+        flush_errors = []
+        lose_image = "lost_append" in outcome
+
+        def reject_image(path, entry):
+            message = getattr(entry, "message", None)
+            if lose_image and not rejected and getattr(message, "role", None) == "toolResult" and any(
+                isinstance(block, ImageContent) for block in message.content
+            ):
+                rejected.append(entry.id)
+                raise OSError("image append interrupted")
+            return append(path, entry)
+
+        def fail_image_flush_once():
+            if outcome == "flush_failed" and not flush_errors and any(
+                isinstance(message.content, list)
+                and any(isinstance(block, ImageContent) for block in message.content)
+                for message in session.state.messages
+            ):
+                flush_errors.append(True)
+                raise OSError("image flush interrupted")
+            return flush()
+
+        session.agent.stream_fn = stream
+        monkeypatch.setattr(persistence, "append_entry_line", reject_image)
+        monkeypatch.setattr(session.session_manager, "flush", fail_image_flush_once)
+        try:
+            if entrypoint == "execute":
+                plan = session.plan_state.latest_revision
+                params = {"planId": plan.plan_id, "revision": plan.revision, "digest": plan.digest}
+            else:
+                params = {"questionId": session.plan_state.pending_question.question_id, "answer": "Local"}
+            accepted = await runtime.dispatch(f"plan.{entrypoint}", params)
+            await asyncio.wait_for(runtime._run_task, 5)
+            assert len(rejected) == int(lose_image)
+            assert len(flush_errors) == int(outcome == "flush_failed")
+            assert len(calls) == 2
+            session.session_manager.flush()  # Later successful writes cannot restore the removed entry.
+            reopened = SessionManager.open(session.session_manager.path)
+            assert any(
+                getattr(entry, "message", None) is not None
+                and isinstance(entry.message.content, list)
+                and any(isinstance(block, ImageContent) for block in entry.message.content)
+                for entry in reopened.entries
+            ) is (not lose_image)
+            expected = "completed" if outcome == "completed" else "cancelled" if outcome.startswith("cancelled") else "failed"
+            assert events[-1]["event"]["type"] == f"run.{expected}"
+            if expected == "failed" and outcome != "failed":
+                assert events[-1]["event"]["payload"]["code"] == "IMAGE_PERSISTENCE_FAILED"
+            assert events[-1]["runId"] == accepted["runId"]
+            assert any(event["event"]["type"] == "run.completed" for event in events) is (expected == "completed")
+            assert runtime._run_task is None and runtime._run_id is None
+            if entrypoint == "execute":
+                runs = [entry for entry in reopened.entries if isinstance(entry, PlanRunEntry)]
+                status = "aborted" if expected == "cancelled" else expected
+                assert [entry.status for entry in runs] == ["started", status]
+                assert all(
+                    (entry.plan_id, entry.revision, entry.digest, entry.run_id)
+                    == (plan.plan_id, plan.revision, plan.digest, accepted["runId"])
+                    for entry in runs
+                )
+                phase = "settled" if expected == "completed" else status
+                assert session.plan_state.phase == phase
+                assert reduce_plan_state(reopened.get_branch()).phase == phase
+
+            monkeypatch.setattr(persistence, "append_entry_line", append)
+            monkeypatch.setattr(session.session_manager, "flush", lambda: (_ for _ in ()).throw(
+                OSError("a text-only next run must not flush old image state"),
+            ))
+            session.agent.stream_fn = successful_stream
+            await runtime.dispatch("run.start", {"text": "Next text-only request"})
+            await asyncio.wait_for(runtime._run_task, 5)
+            assert events[-1]["event"]["type"] == "run.completed"
+        finally:
+            monkeypatch.setattr(persistence, "append_entry_line", append)
+            monkeypatch.setattr(session.session_manager, "flush", flush)
+            await runtime.dispose()
+
     asyncio.run(scenario())
 
 

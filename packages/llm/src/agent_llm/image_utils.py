@@ -145,6 +145,80 @@ def _preflight_gif(raw: bytes) -> None:
         position = skip_subblocks(position + 1)  # LZW code-size byte, then data.
 
 
+def _preflight_webp(raw: bytes) -> None:
+    """Bound WebP canvases before Image.open creates WebPAnimDecoder.
+
+    Pillow's native decoder allocates animation canvases while opening, before
+    size or frame-count properties are available. Walk RIFF chunk headers only;
+    VP8X and ANMF declare the full canvas budget without decoding any pixels.
+    """
+    if raw[:4] != b"RIFF" or raw[8:12] != b"WEBP":
+        return
+
+    def invalid() -> None:
+        raise ImageInputError("INVALID_IMAGE", "WebP 图片已损坏或截断")
+
+    riff_end = 8 + int.from_bytes(raw[4:8], "little")
+    if riff_end < 20 or riff_end > len(raw) or riff_end % 2:
+        invalid()
+    position = 12
+    canvas_width = canvas_height = frame_count = 0
+    while position < riff_end:
+        if position + 8 > riff_end:
+            invalid()
+        kind = raw[position:position + 4]
+        size = int.from_bytes(raw[position + 4:position + 8], "little")
+        start = position + 8
+        end = start + size
+        padded_end = end + (size & 1)
+        if padded_end > riff_end:
+            invalid()
+        if position == 12 and kind not in (b"VP8X", b"VP8 ", b"VP8L"):
+            invalid()
+        if kind == b"VP8X":
+            if position != 12 or size != 10:
+                invalid()
+            canvas_width = 1 + int.from_bytes(raw[start + 4:start + 7], "little")
+            canvas_height = 1 + int.from_bytes(raw[start + 7:start + 10], "little")
+            _check_frame_budget(canvas_width, canvas_height, canvas_width * canvas_height, 0)
+        elif kind == b"ANMF":
+            if not canvas_width or size < 16:
+                invalid()
+            frame_count += 1
+            _check_frame_budget(canvas_width, canvas_height,
+                                canvas_width * canvas_height * frame_count, frame_count)
+            left = 2 * int.from_bytes(raw[start:start + 3], "little")
+            top = 2 * int.from_bytes(raw[start + 3:start + 6], "little")
+            width = 1 + int.from_bytes(raw[start + 6:start + 9], "little")
+            height = 1 + int.from_bytes(raw[start + 9:start + 12], "little")
+            if left + width > canvas_width or top + height > canvas_height:
+                invalid()
+        elif kind == b"VP8 ":
+            if size < 10 or raw[start + 3:start + 6] != b"\x9d\x01\x2a":
+                invalid()
+            width = int.from_bytes(raw[start + 6:start + 8], "little") & 0x3FFF
+            height = int.from_bytes(raw[start + 8:start + 10], "little") & 0x3FFF
+            _check_frame_budget(width, height, width * height, 1)
+        elif kind == b"VP8L":
+            if size < 5 or raw[start] != 0x2F:
+                invalid()
+            dimensions = int.from_bytes(raw[start + 1:start + 5], "little")
+            width = 1 + (dimensions & 0x3FFF)
+            height = 1 + ((dimensions >> 14) & 0x3FFF)
+            _check_frame_budget(width, height, width * height, 1)
+        position = padded_end
+
+
+def preflight_image_bytes(raw: bytes) -> None:
+    """Check allocation-prone headers before any Pillow open, including MIME detection.
+
+    Callers must first enforce MAX_IMAGE_BYTES; this scan never decodes pixels.
+    Actual format validation and pixel decoding remain validate_image_content's job.
+    """
+    _preflight_gif(raw)
+    _preflight_webp(raw)
+
+
 def validate_image_content(image: ImageContent) -> ImageContent:
     """Validate actual image bytes; never launch a file helper or external URL."""
     raw = _image_bytes(image)
@@ -155,7 +229,7 @@ def validate_image_content(image: ImageContent) -> ImageContent:
             _inspected_images.move_to_end(digest)
     if inspected is None:
         try:
-            _preflight_gif(raw)
+            preflight_image_bytes(raw)
             with warnings.catch_warnings():
                 warnings.simplefilter("error", Image.DecompressionBombWarning)
                 with Image.open(io.BytesIO(raw), formats=list(IMAGE_FORMAT_MIMES)) as decoded:
