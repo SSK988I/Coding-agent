@@ -83,8 +83,8 @@
 .workbench-markdown { padding: 12px 18px; font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
 .workbench-markdown pre { overflow: auto; font-size: 12px; padding: 10px; background: var(--accent-soft); border-radius: 7px; }
 .side-chat-messages { flex: 1; min-height: 0; overflow: auto; padding: 5px 16px 16px; }
-.side-chat-message { padding: 10px 0; font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
-.side-chat-message.user { background: var(--accent-soft); padding: 10px 12px; border-radius: 9px; margin: 10px 0; }
+.side-chat-message { min-width: 0; max-width: 100%; padding: 10px 0; font-size: 13px; line-height: 1.6; text-align: left; overflow-wrap: anywhere; }
+.side-chat-message.user { width: fit-content; max-width: 88%; background: var(--accent-soft); padding: 10px 12px; border-radius: 9px; margin: 10px 0; margin-left: auto; }
 .side-chat-message > strong { font-size: 11px; color: var(--text-secondary); }
 .side-chat-message pre, .side-chat-tool pre { font-size: 11px; overflow: auto; background: var(--accent-soft); border-radius: 6px; padding: 9px; }
 .side-chat-tool { font-size: 11px; color: var(--text-secondary); }

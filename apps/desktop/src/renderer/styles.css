@@ -213,6 +213,8 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #8e8a82; outli
 .prompt-chips button:hover { border-color: #bcb8b0; background: #f8f7f4; }
 
 .message { display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 12px; padding: 14px 0; }
+.message.user { grid-template-columns: minmax(0, 1fr) 30px; }
+.message.user .message-avatar { grid-column: 2; grid-row: 1; }
 .message + .message { border-top: 0; }
 .message-avatar {
   width: 27px;
@@ -229,9 +231,13 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #8e8a82; outli
 .message.assistant .message-avatar { border-color: #292824; background: #292824; color: #fff; }
 .message-body { min-width: 0; color: #34322f; font-size: 13px; line-height: 1.72; }
 .message.user .message-body {
-  justify-self: start;
+  grid-column: 1;
+  grid-row: 1;
+  justify-self: end;
   width: fit-content;
-  max-width: 100%;
+  max-width: 85%;
+  text-align: left;
+  overflow-wrap: anywhere;
   padding: 7px 12px;
   border-radius: 10px;
   background: #f2f1ed;
