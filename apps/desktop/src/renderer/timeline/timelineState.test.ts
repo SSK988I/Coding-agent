@@ -1,14 +1,65 @@
 import { describe, expect, it } from "vitest";
 import type { AgentMessage, RuntimeEvent } from "../../shared/types";
+import type { TurnChangesSummary } from "../../shared/workbench";
 import {
   createTimelineState,
   createTimelineStateFromMessages,
   reduceRuntimeEventBatch,
+  readAgentMessageContent,
   selectTimelineItems,
   type TimelineCompactionItem,
   type TimelineMessageItem,
   type TimelineToolItem,
 } from "./timelineState";
+
+describe("per-turn change records", () => {
+  const change: TurnChangesSummary = { runId: "run-1", entryId: "entry-1", timestamp: 100,
+    afterMessageIndex: 1, additions: 1, deletions: 1, truncated: false,
+    files: [{ path: "main.ts", status: "M", additions: 1, deletions: 1, binary: false }] };
+
+  it("restores each card after its exact message index even when timestamps match", () => {
+    const messages: AgentMessage[] = ["user", "assistant", "user", "assistant"].map((role) => ({ role, content: role, timestamp: 1 }));
+    const state = createTimelineStateFromMessages(messages, "session-1", [change,
+      { ...change, runId: "run-2", entryId: "entry-2", afterMessageIndex: 3 },
+      { ...change, runId: "compacted", afterMessageIndex: 99 }]);
+    expect(selectTimelineItems(state).map((item) => item.kind)).toEqual(["message", "message", "changes", "message", "message", "changes"]);
+    expect(selectTimelineItems(state).filter((item) => item.kind === "changes").map((item) => item.runId)).toEqual(["run-1", "run-2"]);
+  });
+
+  it("adds a changed turn once and rejects an empty or mismatched run notification", () => {
+    const valid = runtimeEvent(2, "workbench.turnChanged", { change });
+    const result = reduceRuntimeEventBatch(createTimelineState(), [
+      runtimeEvent(1, "run.started", { text: "edit" }), valid, valid,
+      runtimeEvent(3, "workbench.turnChanged", { change: { ...change, runId: "another-run" } }),
+      runtimeEvent(4, "workbench.turnChanged", { change: { ...change, files: [] } }),
+      runtimeEvent(5, "run.completed"),
+    ]);
+    expect(selectTimelineItems(result).map((item) => item.kind)).toEqual(["message", "changes"]);
+    expect(result.running).toBe(false);
+  });
+});
+
+describe("file attachment timeline", () => {
+  const file = { name: "notes.txt", mime_type: "text/plain", size: 5, path: "G:/managed/notes.txt" };
+  it("projects file-only admission once and restores the same file card from history", () => {
+    const started = runtimeEvent(1, "run.started", { text: "", files: [file] });
+    const state = reduceRuntimeEventBatch(createTimelineState(), [started, started]);
+    const items = selectTimelineItems(state) as TimelineMessageItem[];
+    expect(items).toHaveLength(1);
+    expect(items[0].files).toEqual([file]);
+    const restored = selectTimelineItems(createTimelineStateFromMessages([{ role: "user", content: [], attachments: [file] }], "session-1"));
+    expect((restored[0] as TimelineMessageItem).files).toEqual([file]);
+  });
+
+  it("hides only generated context matching the recorded attachment and retains ordinary user text", () => {
+    const block = `<attached_file>\n${JSON.stringify(file)}\nhello\n</attached_file>`;
+    const user = { role: "user", content: [{ type: "text", text: block }] };
+    expect(readAgentMessageContent(user).text).toBe(block);
+    expect(readAgentMessageContent({ ...user, attachments: [file] }).text).toBe("");
+    expect(readAgentMessageContent({ ...user, attachments: [{ ...file, path: "G:/another-file.txt" }] }).text).toBe(block);
+    expect(readAgentMessageContent({ role: "user", content: "user body", attachments: [file] })).toMatchObject({ text: "user body", files: [file] });
+  });
+});
 
 function runtimeEvent(
   seq: number,
@@ -55,35 +106,16 @@ describe("timeline state", () => {
     expect(state.entities).toEqual(initial.entities);
   });
 
-  it("copies timeline order only when adding or removing items in a batch", () => {
-    const initial = createTimelineStateFromMessages([
-      { role: "user", content: "preserved", timestamp: 1 },
-    ], "session-1");
-    const initialIds = [...initial.orderedIds];
-    const inserted = reduceRuntimeEventBatch(initial, [
-      runtimeEvent(1, "message_start", { messageId: "empty", message: assistant("") }),
-      runtimeEvent(2, "message_start", { messageId: "kept", message: assistant("") }),
-      runtimeEvent(3, "message_end", { messageId: "empty", message: assistant("") }),
-      runtimeEvent(4, "tool_execution_start", { tool_call_id: "t", tool_name: "read" }),
-      runtimeEvent(5, "message_end", { messageId: "kept", message: assistant("answer") }),
-      runtimeEvent(6, "message_start", { messageId: "removed-later", message: assistant("") }),
-    ]);
-
-    expect(inserted.orderedIds).not.toBe(initial.orderedIds);
-    expect(initial.orderedIds).toEqual(initialIds);
-    expect(selectTimelineItems(initial)).toMatchObject([{ text: "preserved" }]);
-    expect(selectTimelineItems(inserted)).toMatchObject([
-      { text: "preserved" }, { text: "answer" }, { toolCallId: "t" }, { text: "" },
-    ]);
-    expect(new Set(inserted.orderedIds).size).toBe(inserted.orderedIds.length);
-
-    const insertedIds = [...inserted.orderedIds];
-    const removed = reduceRuntimeEventBatch(inserted, [
-      runtimeEvent(7, "message_end", { messageId: "removed-later", message: assistant("") }),
-    ]);
-    expect(removed.orderedIds).not.toBe(inserted.orderedIds);
-    expect(inserted.orderedIds).toEqual(insertedIds);
-    expect(removed.orderedIds).toEqual(insertedIds.slice(0, -1));
+  it("restores image-only content and accepts the same structured content from run.started", () => {
+    const image = { data: "aGVsbG8=", mime_type: "image/png" };
+    const restored = selectTimelineItems(createTimelineStateFromMessages([
+      { role: "user", content: [{ type: "image", ...image }], timestamp: 1 },
+    ]));
+    expect(restored[0]).toMatchObject({ role: "user", text: "", images: [image] });
+    const event = runtimeEvent(1, "run.started", { text: "", images: [image] });
+    const live = selectTimelineItems(reduceRuntimeEventBatch(createTimelineState(), [event, event]));
+    expect(live).toHaveLength(1);
+    expect(live[0]).toMatchObject({ role: "user", text: "", images: [image] });
   });
 
   it("does not show execution until Core admits the tool", () => {
@@ -184,6 +216,37 @@ describe("timeline state", () => {
     expect(item.lastSeq).toBe(5);
     expect(started.entities[messageId]).toBe(startItem);
     expect(reduced.orderedIds).toBe(started.orderedIds);
+  });
+
+  it("copies timeline order only when adding or removing items in a batch", () => {
+    const initial = createTimelineStateFromMessages([
+      { role: "user", content: "preserved", timestamp: 1 },
+    ], "session-1");
+    const initialIds = [...initial.orderedIds];
+    const inserted = reduceRuntimeEventBatch(initial, [
+      runtimeEvent(1, "message_start", { messageId: "empty", message: assistant("") }),
+      runtimeEvent(2, "message_start", { messageId: "kept", message: assistant("") }),
+      runtimeEvent(3, "message_end", { messageId: "empty", message: assistant("") }),
+      runtimeEvent(4, "tool_execution_start", { tool_call_id: "t", tool_name: "read" }),
+      runtimeEvent(5, "message_end", { messageId: "kept", message: assistant("answer") }),
+      runtimeEvent(6, "message_start", { messageId: "removed-later", message: assistant("") }),
+    ]);
+
+    expect(inserted.orderedIds).not.toBe(initial.orderedIds);
+    expect(initial.orderedIds).toEqual(initialIds);
+    expect(selectTimelineItems(initial)).toMatchObject([{ text: "preserved" }]);
+    expect(selectTimelineItems(inserted)).toMatchObject([
+      { text: "preserved" }, { text: "answer" }, { toolCallId: "t" }, { text: "" },
+    ]);
+    expect(new Set(inserted.orderedIds).size).toBe(inserted.orderedIds.length);
+
+    const insertedIds = [...inserted.orderedIds];
+    const removed = reduceRuntimeEventBatch(inserted, [
+      runtimeEvent(7, "message_end", { messageId: "removed-later", message: assistant("") }),
+    ]);
+    expect(removed.orderedIds).not.toBe(inserted.orderedIds);
+    expect(inserted.orderedIds).toEqual(insertedIds);
+    expect(removed.orderedIds).toEqual(insertedIds.slice(0, -1));
   });
 
   it("keeps interleaved streams isolated by run id and preserves start order", () => {

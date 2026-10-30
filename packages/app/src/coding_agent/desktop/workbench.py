@@ -6,10 +6,13 @@ import base64
 import difflib
 import hashlib
 import json
+import math
 import mimetypes
 import os
 from pathlib import Path
+import re
 import subprocess
+import time
 from typing import Any
 
 from coding_agent.desktop.protocol import RpcError
@@ -154,11 +157,11 @@ class WorkspaceWorkbench:
                 truncated = True
         return {"version": 1, "sessionId": self.session_id, "workspace": str(self.workspace), "files": files, "truncated": truncated}
 
-    async def capture(self) -> None:
+    async def capture(self) -> dict[str, Any]:
         async with self._capture_lock:
-            await asyncio.to_thread(self._capture)
+            return await asyncio.to_thread(self._capture)
 
-    def _capture(self) -> None:
+    def _capture(self) -> dict[str, Any]:
         snapshot = self._snapshot()
         self.storage.mkdir(parents=True, exist_ok=True)
         serialized = json.dumps(snapshot, ensure_ascii=False)
@@ -169,6 +172,7 @@ class WorkspaceWorkbench:
             temporary = target.with_suffix(".tmp")
             temporary.write_text(serialized, encoding="utf-8")
             temporary.replace(target)
+        return snapshot
 
     def _baseline_changes(self, source: str) -> dict[str, Any]:
         try:
@@ -177,7 +181,9 @@ class WorkspaceWorkbench:
             raise RpcError("BASELINE_UNAVAILABLE", "尚未记录该会话的变更基线；发送下一条任务后即可查看") from exc
         if baseline.get("workspace") != str(self.workspace) or baseline.get("sessionId") != self.session_id:
             raise RpcError("BASELINE_INVALID", "变更基线与当前会话不匹配")
-        current = self._snapshot()
+        return self._compare_snapshots(baseline, self._snapshot())
+
+    def _compare_snapshots(self, baseline: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
         files = []
         remaining = MAX_DIFF_BYTES
         truncated = baseline["truncated"] or current["truncated"]
@@ -199,6 +205,102 @@ class WorkspaceWorkbench:
             truncated |= clipped
             files.append({"path": name, "status": "M" if before and after else "A" if after else "D", "additions": additions, "deletions": deletions, "binary": binary, "diff": diff, "truncated": clipped})
         return {"files": files, "truncated": truncated}
+
+    def _turn_path(self, run_id: Any) -> Path:
+        if not isinstance(run_id, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", run_id) is None:
+            raise RpcError("INVALID_PARAMS", "运行 ID 无效")
+        return self.storage / "turns" / f"{run_id}.json"
+
+    def _turn_index(self) -> dict[str, Any]:
+        try:
+            raw = json.loads((self.storage / "turns" / "index.json").read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as exc:
+            raise RpcError("TURN_REVIEW_INVALID", "历史变更索引无法读取") from exc
+        if not isinstance(raw, dict) or raw.get("workspace") != str(self.workspace) or raw.get("sessionId") != self.session_id or not isinstance(raw.get("turns"), dict):
+            raise RpcError("TURN_REVIEW_INVALID", "历史变更索引与当前会话不匹配")
+        return raw["turns"]
+
+    def turn_summaries(self) -> list[dict[str, Any]]:
+        """Metadata only; historical diff bodies are read on explicit review."""
+        return [self._validate_turn_summary(summary, run_id) for run_id, summary in self._turn_index().items()]
+
+    def _validate_turn_summary(self, value: Any, run_id: Any) -> dict[str, Any]:
+        def count(number: Any) -> bool:
+            return isinstance(number, int) and not isinstance(number, bool) and 0 <= number <= 2**53 - 1
+
+        invalid = RpcError("TURN_REVIEW_INVALID", "历史变更记录内容无效")
+        if not isinstance(value, dict) or value.get("runId") != run_id:
+            raise invalid
+        self._turn_path(run_id)
+        stamp = value.get("timestamp")
+        files = value.get("files")
+        if (not isinstance(value.get("entryId"), str) or not value["entryId"]
+            or isinstance(stamp, bool) or not isinstance(stamp, (int, float)) or stamp > 2**53 - 1 or not math.isfinite(stamp) or stamp < 0
+            or not isinstance(value.get("truncated"), bool) or not isinstance(files, list) or len(files) > MAX_FILES * 2
+            or not count(value.get("additions")) or not count(value.get("deletions"))):
+            raise invalid
+        for file in files:
+            if (not isinstance(file, dict) or not isinstance(file.get("path"), str) or not file["path"]
+                or not isinstance(file.get("status"), str) or file["status"] not in {"A", "M", "D"} or not isinstance(file.get("binary"), bool)
+                or not count(file.get("additions")) or not count(file.get("deletions"))
+                or not isinstance(file.get("truncated"), bool)):
+                raise invalid
+        if (value["additions"] != sum(file["additions"] for file in files)
+            or value["deletions"] != sum(file["deletions"] for file in files)):
+            raise invalid
+        return dict(value)
+
+    def turn_review(self, run_id: Any) -> dict[str, Any]:
+        target = self._turn_path(run_id)
+        try:
+            review = json.loads(target.read_text(encoding="utf-8"))
+        except FileNotFoundError as exc:
+            raise RpcError("TURN_REVIEW_UNAVAILABLE", "该轮变更详情不存在或尚未保存") from exc
+        except (OSError, ValueError) as exc:
+            raise RpcError("TURN_REVIEW_INVALID", "该轮变更详情无法读取") from exc
+        if not isinstance(review, dict) or review.get("workspace") != str(self.workspace) or review.get("sessionId") != self.session_id or review.get("runId") != run_id or not isinstance(review.get("entryId"), str) or not isinstance(review.get("files"), list):
+            raise RpcError("TURN_REVIEW_INVALID", "该轮变更详情与当前会话不匹配")
+        self._validate_turn_summary(review, run_id)
+        if any(not isinstance(file.get("diff"), str) for file in review["files"]):
+            raise RpcError("TURN_REVIEW_INVALID", "该轮变更差异内容无效")
+        return review
+
+    async def finish_turn(self, run_id: str, baseline: dict[str, Any], entry_id: str) -> dict[str, Any] | None:
+        async with self._capture_lock:
+            return await asyncio.to_thread(self._finish_turn, run_id, baseline, entry_id)
+
+    def _finish_turn(self, run_id: str, baseline: dict[str, Any], entry_id: str) -> dict[str, Any] | None:
+        target = self._turn_path(run_id)
+        result = self._compare_snapshots(baseline, self._snapshot())
+        if not result["files"]:
+            return None
+        summary = {
+            "runId": run_id, "entryId": entry_id, "timestamp": time.time() * 1000,
+            "fileCount": len(result["files"]), "truncated": result["truncated"],
+            "files": [{key: file[key] for key in ("path", "status", "additions", "deletions", "binary", "truncated")} for file in result["files"]],
+            "additions": sum(file["additions"] for file in result["files"]),
+            "deletions": sum(file["deletions"] for file in result["files"]),
+        }
+        review = {**summary, "version": 1, "workspace": str(self.workspace), "sessionId": self.session_id,
+                  "source": "turn", "branch": "", "branches": [], "baseRef": None, "files": result["files"]}
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # A run's review is immutable. A partially interrupted write is never
+        # indexed or shown as a successful snapshot, and is never overwritten.
+        with target.open("x", encoding="utf-8") as stream:
+            json.dump(review, stream, ensure_ascii=False, separators=(",", ":"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        turns = self._turn_index()
+        turns[run_id] = summary
+        temporary = target.parent / "index.tmp"
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump({"version": 1, "workspace": str(self.workspace), "sessionId": self.session_id, "turns": turns}, stream, ensure_ascii=False, separators=(",", ":"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(target.parent / "index.json")
+        return summary
 
     @staticmethod
     def _bounded_diff(diff: str, remaining: int) -> tuple[str, bool, int]:
@@ -232,6 +334,10 @@ class WorkspaceWorkbench:
         source = params.get("source", "unstaged")
         if source not in {"unstaged", "staged", "branch", "session", "turn"}:
             raise RpcError("INVALID_PARAMS", "未知变更来源")
+        if "runId" in params:
+            if source != "turn":
+                raise RpcError("INVALID_PARAMS", "只有按轮次查看变更时可指定运行 ID")
+            return self.turn_review(params["runId"])
         try:
             branch = self.git("symbolic-ref", "--quiet", "--short", "HEAD").decode().strip()
         except RpcError:

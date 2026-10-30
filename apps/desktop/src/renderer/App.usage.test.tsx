@@ -12,7 +12,7 @@ const stats = (percent: number): SessionStats => ({
 });
 const workspace = (sessionId = "session-1", usage?: SessionStats): WorkspacePayload => ({
   path: "G:\\Coding-agent", sessionId,
-  model: { id: "deepseek-flash", name: "Flash", provider: "deepseek" },
+  model: { id: "deepseek-flash", name: "Flash", provider: "deepseek", input: ["text", "image"] },
   thinkingLevel: null, tools: [], messages: [], collaborationMode: "default",
   planState: { phase: "idle", activePlanId: null, latestRevision: null, pendingQuestion: null },
   memory: { enabled: false, userId: null, projectId: null }, stats: usage,

@@ -40,7 +40,7 @@ def requires_approval(
         return False
     if tool_name in _OBSERVATION_AND_CONTROL_TOOLS:
         return False
-    if tool_name in {"write", "edit"}:
+    if tool_name in {"write", "edit", "view_image"}:
         raw_path = args.get("path")
         if workspace is None or not isinstance(raw_path, str) or not raw_path:
             return True

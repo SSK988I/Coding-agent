@@ -11,6 +11,7 @@ import pytest
 from agent_core import SessionManager
 from agent_llm import AssistantMessage, Context, Model, ModelCost, TextContent, Usage, UserMessage
 from agent_llm.event_stream import AssistantMessageEventStream
+from agent_llm.providers.deepseek_models import DEEPSEEK_MODELS
 
 from coding_agent.core.agent_session import AgentSession, AgentSessionConfig
 from coding_agent.core.retry import RetryPolicy
@@ -232,12 +233,14 @@ def test_native_search_request_binding_survives_shaping_but_not_revocation(tmp_p
         requests, _messages = _install_stream(monkeypatch)
         authorize = AsyncMock(return_value=allowed)
         session = _session(
-            tmp_path, model=_model(provider="deepseek"), no_builtin_tools=False,
+            tmp_path, model=DEEPSEEK_MODELS["deepseek-v4-pro"], no_builtin_tools=False,
             web_search_enabled=True, web_search_backend=SimpleNamespace(aclose=AsyncMock()),
             before_native_web_search=authorize, permission_mode="ask",
         )
         try:
             await session.prompt("research")
+            authorize.assert_awaited_once()
+            assert session.native_web_search_enabled is True
             assert requests[0][1].get("web_search", False) is allowed
             assert ("<native_web_search>" in requests[0][0].system_prompt) is allowed
             assert all(tool.name != "web_search" for tool in requests[0][0].tools or [])

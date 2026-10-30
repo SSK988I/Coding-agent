@@ -1,7 +1,8 @@
-import type { AgentMessage, ContentBlock, RuntimeEvent } from "../../shared/types";
+import type { AgentMessage, ContentBlock, FileAttachmentMetadata, ImageAttachmentPayload, RuntimeEvent } from "../../shared/types";
+import type { TurnChangesSummary } from "../../shared/workbench";
 import { isToolActive, projectToolStatus, type ToolDisplayStatus } from "../../shared/toolStatus";
 
-export type TimelineItemKind = "message" | "tool" | "compaction";
+export type TimelineItemKind = "message" | "tool" | "compaction" | "changes";
 
 interface TimelineItemBase {
   id: string;
@@ -20,6 +21,8 @@ export interface TimelineMessageItem extends TimelineItemBase {
   role: "user" | "assistant";
   text: string;
   thinking: string;
+  images?: ImageAttachmentPayload[];
+  files?: FileAttachmentMetadata[];
   status?: string;
   /** The protocol-level id, when the runtime supplies one. */
   messageId?: string;
@@ -58,10 +61,16 @@ export interface TimelineCompactionItem extends TimelineItemBase {
   detail?: string;
 }
 
+export interface TimelineChangesItem extends TimelineItemBase {
+  kind: "changes";
+  change: TurnChangesSummary;
+}
+
 export type TimelineItem =
   | TimelineMessageItem
   | TimelineToolItem
-  | TimelineCompactionItem;
+  | TimelineCompactionItem
+  | TimelineChangesItem;
 
 /**
  * A normalized timeline store. Rendering code can subscribe to an individual
@@ -130,15 +139,44 @@ export function selectTimelineItems(state: TimelineState): TimelineItem[] {
   return items;
 }
 
-export function readAgentMessageContent(message: AgentMessage): { text: string; thinking: string } {
-  if (typeof message.content === "string") return { text: message.content, thinking: "" };
+function attachmentMetadata(value: unknown): FileAttachmentMetadata[] {
+  return Array.isArray(value) ? value.flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const file = item as Partial<FileAttachmentMetadata>;
+    return typeof file.name === "string" && typeof file.mime_type === "string" && typeof file.path === "string"
+      && typeof file.size === "number" && Number.isSafeInteger(file.size) && file.size >= 0
+      ? [{ name: file.name, mime_type: file.mime_type, path: file.path, size: file.size }] : [];
+  }) : [];
+}
+
+function isAttachedFileContext(text: string | undefined, files: FileAttachmentMetadata[]): boolean {
+  if (!files.length || !text?.startsWith("<attached_file>\n") || !text.endsWith("\n</attached_file>")) return false;
+  try {
+    const metadata = JSON.parse(text.slice("<attached_file>\n".length).split("\n", 1)[0]) as FileAttachmentMetadata;
+    return files.some((file) => file.path === metadata.path && file.name === metadata.name
+      && file.mime_type === metadata.mime_type && file.size === metadata.size);
+  } catch { return false; }
+}
+
+export function readAgentMessageContent(message: AgentMessage): {
+  text: string; thinking: string; images?: ImageAttachmentPayload[]; files?: FileAttachmentMetadata[];
+} {
+  const files = attachmentMetadata(message.attachments);
+  const fileProps = files.length ? { files } : {};
+  if (typeof message.content === "string") return { text: message.content, thinking: "", ...fileProps };
   let text = "";
   let thinking = "";
+  const images: ImageAttachmentPayload[] = [];
   for (const block of message.content as ContentBlock[]) {
-    if (block.type === "text") text += block.text ?? "";
+    if (block.type === "text" && !isAttachedFileContext(block.text, files)) {
+      text += block.text ?? "";
+    }
     if (block.type === "thinking") thinking += block.thinking ?? "";
+    if (block.type === "image" && typeof block.data === "string" && typeof block.mime_type === "string") {
+      images.push({ data: block.data, mime_type: block.mime_type });
+    }
   }
-  return { text, thinking };
+  return { text, thinking, ...fileProps, ...(images.length ? { images } : {}) };
 }
 
 /** Converts the current JSONL-backed transcript to the same item model as live events. */
@@ -196,11 +234,11 @@ export function timelineItemsFromPersistedMessages(
         }] : []) : [];
 
     const content = readAgentMessageContent(message);
-    if (message.role === "user" && content.text.trimStart().startsWith("/")) return [];
+    if (message.role === "user" && !content.images?.length && !content.files?.length && content.text.trimStart().startsWith("/")) return [];
     if (message.role === "user" && content.text.trimStart().startsWith("<confirmed_plan_execution>")) {
       content.text = "执行已确认计划";
     }
-    if (message.role === "assistant" && !content.text && !content.thinking) return incomplete;
+    if (message.role === "assistant" && !content.text && !content.thinking && !content.images?.length) return incomplete;
 
     return [{
       id: `persisted-${timestamp}-${index}`,
@@ -214,6 +252,8 @@ export function timelineItemsFromPersistedMessages(
       role: message.role,
       text: content.text,
       thinking: content.thinking,
+      ...(content.images ? { images: content.images } : {}),
+      ...(content.files ? { files: content.files } : {}),
       status: message.stop_reason,
     } satisfies TimelineMessageItem, ...incomplete];
   });
@@ -222,8 +262,17 @@ export function timelineItemsFromPersistedMessages(
 export function createTimelineStateFromMessages(
   messages: readonly AgentMessage[],
   sessionId: string | null = null,
+  turnChanges: readonly TurnChangesSummary[] = [],
 ): TimelineState {
-  return createTimelineState(timelineItemsFromPersistedMessages(messages, sessionId));
+  const items = timelineItemsFromPersistedMessages(messages, sessionId);
+  const present = new Set(items.map((item) => item.order));
+  for (const change of turnChanges) {
+    if (!change.files.length || !present.has(change.afterMessageIndex)) continue;
+    items.push({ id: `changes:${change.runId}`, kind: "changes", change,
+      order: change.afterMessageIndex + .5, revision: 0, sessionId, runId: change.runId,
+      createdAt: change.timestamp, updatedAt: change.timestamp });
+  }
+  return createTimelineState(items.sort((left, right) => left.order - right.order));
 }
 
 export function reduceRuntimeEvent(state: TimelineState, event: RuntimeEvent): TimelineState {
@@ -330,7 +379,35 @@ export function reduceRuntimeEventBatch(
     const { type, payload } = envelope.event;
     const runKey = runtimeRunKey(envelope);
 
+    if (type === "workbench.turnChanged") {
+      const change = payload.change as TurnChangesSummary | undefined;
+      if (!change || change.runId !== envelope.runId || !Array.isArray(change.files) || !change.files.length) continue;
+      const id = `changes:${change.runId}`;
+      if (!entities[id]) insert({ id, kind: "changes", change, order: nextOrder(), revision: 0,
+        sessionId: envelope.sessionId, runId: envelope.runId, createdAt: envelope.timestamp,
+        updatedAt: envelope.timestamp, lastSeq: envelope.seq });
+      continue;
+    }
+
     if (type === "run.started") {
+      // Admission is authoritative: rejected requests never become sent messages.
+      // The stable run key also makes duplicate start notifications idempotent.
+      const text = typeof payload.text === "string" ? payload.text : "";
+      const files = attachmentMetadata(payload.files);
+      const images: ImageAttachmentPayload[] = Array.isArray(payload.images)
+        ? payload.images.flatMap((image) => {
+          if (!image || typeof image !== "object") return [];
+          const block = image as Record<string, unknown>;
+          return typeof block.data === "string" && typeof block.mime_type === "string"
+            ? [{ data: block.data, mime_type: block.mime_type }] : [];
+        }) : [];
+      const id = `user:${encodeURIComponent(runKey)}`;
+      if ((text || images.length || files.length) && !entities[id]) {
+        insert({ id, kind: "message", order: nextOrder(), revision: 0,
+          sessionId: envelope.sessionId, runId: envelope.runId,
+          createdAt: envelope.timestamp, updatedAt: envelope.timestamp, lastSeq: envelope.seq,
+          role: "user", text, thinking: "", ...(images.length ? { images } : {}), ...(files.length ? { files } : {}) });
+      }
       if (!running) {
         running = true;
         changed = true;
@@ -441,7 +518,7 @@ export function reduceRuntimeEventBatch(
       const item = entities[id];
       if (!item || item.kind !== "message") continue;
       const content = readAgentMessageContent(raw);
-      if (!content.text && !content.thinking) {
+      if (!content.text && !content.thinking && !content.images?.length) {
         remove(id);
       } else {
         entities[id] = {

@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from dataclasses import dataclass, field
+from datetime import datetime
 import json
 from pathlib import Path
 from typing import Any, Callable, cast
@@ -42,6 +44,7 @@ class SideConversations:
     def _snapshot(self, live: SideConversation) -> dict[str, Any]:
         return {
             "conversationId": live.session.session_manager.header.id,
+            "title": self._title(live),
             "status": live.status, "error": live.error, "streaming": live.streaming,
             "messages": to_jsonable(live.session.state.messages), "approval": live.approval,
         }
@@ -60,23 +63,65 @@ class SideConversations:
         temporary.write_text(json.dumps({"status": live.status, "error": live.error}), encoding="utf-8")
         temporary.replace(target)
 
+    @staticmethod
+    def _normalized_title(text: str) -> str:
+        return " ".join(text.split())[:80]
+
+    def _title(self, live: SideConversation) -> str:
+        for message in live.session.state.messages:
+            if getattr(message, "role", None) != "user":
+                continue
+            content = getattr(message, "content", "")
+            if isinstance(content, list):
+                content = "\n".join(text for block in content if isinstance(text := getattr(block, "text", None), str))
+            if isinstance(content, str) and (title := self._normalized_title(content)):
+                return title
+        return f"新对话 · {live.session.session_manager.header.id[-8:]}"
+
+    @staticmethod
+    def _activity(live: SideConversation) -> float:
+        try:
+            latest = datetime.fromisoformat(live.session.session_manager.header.timestamp.replace("Z", "+00:00")).timestamp()
+        except (AttributeError, ValueError, TypeError, OverflowError, OSError):
+            latest = 0.0
+        for message in live.session.state.messages:
+            timestamp = getattr(message, "timestamp", None)
+            if isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool) and 0 <= timestamp <= 2**53 - 1:
+                latest = max(latest, timestamp / 1000)
+        return latest
+
     def list(self) -> list[dict[str, Any]]:
-        saved = {item.id: {"conversationId": item.id, "title": item.first_message[:80] or "侧边对话"} for item in SessionManager.list_sessions(cwd=self.parent.cwd, sessions_dir=self.storage)}
+        saved = {}
+        activity = {}
+        for item in SessionManager.list_sessions(cwd=self.parent.cwd, sessions_dir=self.storage):
+            title = self._normalized_title(item.first_message) or f"新对话 · {item.id[-8:]}"
+            saved[item.id] = {"conversationId": item.id, "title": title}
+            activity[item.id] = item.modified
         for identity, live in self.records.items():
-            saved.setdefault(identity, {"conversationId": identity, "title": "侧边对话"})
-            first = next((message for message in live.session.state.messages if getattr(message, "role", None) == "user"), None)
-            if first is not None:
-                content = getattr(first, "content", "")
-                if isinstance(content, str):
-                    saved[identity]["title"] = content[:80]
-            saved[identity]["status"] = live.status
-        return list(saved.values())[::-1]
+            saved[identity] = {"conversationId": identity, "title": self._title(live), "status": live.status}
+            activity[identity] = max(activity.get(identity, 0.0), self._activity(live))
+        counts = Counter(item["title"] for item in saved.values())
+        for identity, item in saved.items():
+            if counts[item["title"]] > 1:
+                item["title"] = f"{item['title'][:68]} · {identity[-8:]}"
+        return sorted(saved.values(), key=lambda item: (activity[item["conversationId"]], item["conversationId"]), reverse=True)
 
     def open(self, identity: str | None = None) -> dict[str, Any]:
         if self.closed:
             raise RpcError("STALE_WORKSPACE", "会话已经切换")
         if identity is not None and identity in self.records:
             return self._snapshot(self.records[identity])
+        if identity is None:
+            inherited_names = {tool.name for tool in self.parent.tools if tool.name in CHILD_TOOLS}
+            for live in reversed(self.records.values()):
+                if (live.status == "idle" and live.task is None and live.approval is None
+                    and live.decision is None and live.error is None and not live.streaming
+                    and live.native_search_decision is None and not live.session.state.messages
+                    and not live.session.session_manager.entries
+                    and live.session.model == self.parent.model
+                    and live.session.agent.reasoning == self.parent.agent.reasoning
+                    and {tool.name for tool in live.session.tools} == inherited_names):
+                    return self._snapshot(live)
         if len(self.records) >= 16:
             raise RpcError("SIDE_CHAT_LIMIT", "最多同时打开 16 个侧边对话")
         manager = None
@@ -205,16 +250,14 @@ class SideConversations:
     def _native_search_allowed(self, signal: asyncio.Event) -> bool:
         return (
             not self.closed and not signal.is_set()
-            and self.parent.collaboration_mode == "default"
-            and self.parent.plan_state.phase not in {"uncertain", "recovery_error"}
-            and any(tool.name == "web_search" for tool in self.parent.tools)
+            and self.parent.web_search_available
         )
 
     async def _approve_native_search(self, live: SideConversation, signal: asyncio.Event) -> bool:
         # Provider-native search never passes through before_tool_call. Share the
         # side chat's approval queue, but revalidate the parent for every request.
         async with live.approval_lock:
-            if not self._native_search_allowed(signal):
+            if not self._native_search_allowed(signal) or not live.session.web_search_available:
                 return False
             if live.native_search_decision is None:
                 live.native_search_decision = (
@@ -222,7 +265,10 @@ class SideConversations:
                     if requires_approval(self.permission(), "web_search", {}, Path(self.parent.cwd), is_approval_safe_shell_command)
                     else True
                 )
-            return live.native_search_decision and self._native_search_allowed(signal)
+            return bool(
+                live.native_search_decision and self._native_search_allowed(signal)
+                and live.session.web_search_available
+            )
 
     async def _request_decision(self, live: SideConversation, tool_name: str, args: dict[str, Any], signal: asyncio.Event) -> bool:
         live.decision = asyncio.get_running_loop().create_future()

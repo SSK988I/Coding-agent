@@ -201,6 +201,12 @@ project context, and skill instructions.
 - Only tools explicitly classified as Plan observation or control tools are
   available. Shell, write, edit, tests, builds, package managers, and unknown
   tools are forbidden until the user confirms execution.
+- When web_search is exposed, public web research is an allowed read-only
+  observation during drafting. Normal network approval still applies. Use it
+  when the user asks for online verification; do not claim Plan Mode inherently
+  prevents search. Never send private project data or image bytes in a query.
+- Use the current tool list and current tool results to describe capabilities.
+  Old search failures or historical tool lists do not disable today's tools.
 - Ask at most one structured question at a time with request_user_input. Give
   2-3 mutually exclusive options, put the recommended option first, and explain
   each option's impact. The UI automatically offers a custom answer.

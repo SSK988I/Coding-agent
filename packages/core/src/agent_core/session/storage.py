@@ -430,7 +430,9 @@ def rewrite_header_line(path: Path, header: SessionHeader) -> None:
     with open(path, "rb") as source:
         source.readline()
         remainder = source.read()
-    fd, raw_temp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    # Keep a sibling for atomic replace, but leave room under Windows MAX_PATH
+    # even when the existing JSONL filename nearly fills the remaining space.
+    fd, raw_temp = tempfile.mkstemp(prefix=".session-", suffix=".tmp", dir=path.parent)
     temp_path = Path(raw_temp)
     try:
         with os.fdopen(fd, "wb") as target:

@@ -14,6 +14,8 @@ from typing import Any, cast
 
 from agent_llm.api.simple_options import adjust_max_tokens_for_thinking, build_base_options
 from agent_llm.event_stream import AssistantMessageEventStream
+from agent_llm.image_utils import validate_image_request_size
+from agent_llm.providers.deepseek_models import supports_native_web_search
 from agent_llm.types import (
     AssistantMessage,
     Context,
@@ -32,18 +34,6 @@ from agent_llm.types import (
 from agent_llm.utils.json_parse import parse_streaming_json
 
 
-def _content_to_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    parts: list[str] = []
-    for block in content or []:
-        if isinstance(block, TextContent):
-            parts.append(block.text)
-        elif isinstance(block, ImageContent):
-            parts.append("(image)")
-    return "\n".join(parts)
-
-
 def _user_content(content: Any) -> str | list[dict[str, Any]]:
     if isinstance(content, str):
         return content
@@ -58,6 +48,17 @@ def _user_content(content: Any) -> str | list[dict[str, Any]]:
                 "image_url": f"data:{block.mime_type};base64,{block.data}",
             })
     return parts
+
+
+def _tool_output(content: Any) -> str | list[dict[str, Any]]:
+    """Preserve tool image pixels without changing the legacy text wire shape."""
+    if isinstance(content, str):
+        return content or "(no output)"
+    if any(isinstance(block, ImageContent) for block in content or []):
+        return _user_content(content)
+    return "\n".join(
+        block.text for block in content or [] if isinstance(block, TextContent)
+    ) or "(no output)"
 
 
 def _provider_response_items(message: AssistantMessage) -> list[dict[str, Any]]:
@@ -119,7 +120,7 @@ def convert_input(context: Context) -> list[dict[str, Any]]:
             items.append({
                 "type": "function_call_output",
                 "call_id": message.tool_call_id,
-                "output": _content_to_text(message.content) or "(no output)",
+                "output": _tool_output(message.content),
             })
     return items
 
@@ -156,7 +157,7 @@ def build_params(
         params["max_output_tokens"] = max_tokens
 
     tools = convert_tools(context.tools or [])
-    if opts.get("web_search"):
+    if opts.get("web_search") and supports_native_web_search(model):
         tools.append({"type": "web_search"})
     if tools:
         params["tools"] = tools
@@ -170,6 +171,7 @@ def build_params(
             level, "max" if level == "xhigh" else level,
         ) or "high"
     params["reasoning"] = {"effort": effort}
+    validate_image_request_size(params)
     return params
 
 

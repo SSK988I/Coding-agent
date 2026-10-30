@@ -10,6 +10,8 @@ const path = require("node:path");
 const assert = require("node:assert/strict");
 
 async function main() {
+  const sideChatOnly = process.env.CODING_AGENT_SIDE_CHAT_SMOKE_ONLY === "1";
+  if (sideChatOnly) app.disableHardwareAcceleration();
   const output = await fs.mkdtemp(path.join(os.tmpdir(), "coding-agent-workbench-smoke-"));
   app.setPath("userData", path.join(output, "profile"));
   const project = path.join(output, "project");
@@ -26,6 +28,7 @@ async function main() {
   const child = spawn(python, ["-m", "coding_agent.desktop"], { cwd: root, windowsHide: true, env: { ...process.env, CODING_AGENT_HOME: path.join(output, "agent"), PYTHONUTF8: "1", PYTHONUNBUFFERED: "1", PYTHONPATH: ["llm", "core", "tui", "app"].map((name) => path.join(root, "packages", name, "src")).join(path.delimiter) }, stdio: ["pipe", "pipe", "pipe"] });
   let next = 0, window, native;
   const pending = new Map();
+  const calls = [];
   const errors = [];
   const lines = readline.createInterface({ input: child.stdout });
   lines.on("line", (line) => {
@@ -38,13 +41,14 @@ async function main() {
   });
   child.stderr.on("data", (data) => errors.push(data.toString()));
   const request = (method, params = {}) => new Promise((resolve, reject) => {
+    calls.push({ method, params });
     const id = "wb-" + ++next;
     const timeout = setTimeout(() => { pending.delete(id); reject(Error("Backend timeout: " + method)); }, 15000);
     pending.set(id, { resolve, reject, timeout }); child.stdin.write(JSON.stringify({ v: 1, id, method, params }) + "\n");
   });
   const server = createServer((_request, response) => { response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" }); response.end("<!doctype html><title>Workbench local browser</title><h1>Local page</h1><button id='interact' onclick='document.querySelector(\"#result\").textContent=\"Browser interaction works\"'>Click me</button><p id='result'></p>"); });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  window = new BrowserWindow({ show: true, width: 1440, height: 920, webPreferences: { preload: path.join(__dirname, "workbench.preload.cjs"), contextIsolation: true, sandbox: true, backgroundThrottling: false } });
+  window = new BrowserWindow({ show: !sideChatOnly, width: 1440, height: 920, webPreferences: { preload: path.join(__dirname, "workbench.preload.cjs"), contextIsolation: true, sandbox: true, backgroundThrottling: false, offscreen: sideChatOnly } });
   native = new NativeWorkbench(window, request);
   const trusted = (event) => assert.equal(event.sender, window.webContents);
   ipcMain.handle("wb:bootstrap", (event) => { trusted(event); return { defaultWorkspace: project, platform: process.platform }; });
@@ -58,6 +62,44 @@ async function main() {
   };
   const click = (label) => evaluate(`(() => { const b=[...document.querySelectorAll('button')].find(b=>b.getAttribute('aria-label')===${JSON.stringify(label)} || b.textContent.trim()===${JSON.stringify(label)}); if(!b||b.disabled) throw Error('Missing button '+${JSON.stringify(label)}); b.click(); })()`);
   const screenshot = async (name) => fs.writeFile(path.join(output, name), (await window.capturePage()).toPNG());
+  const paint = () => evaluate("new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))");
+  const assertSideConversationDraft = async () => {
+    await click("开始侧边对话");
+    await waitFor("document.querySelector('textarea[aria-label=侧边对话消息]') && document.querySelector('select[aria-label=选择侧边对话]')?.value && !document.querySelector('select[aria-label=选择侧边对话]').disabled");
+    const selection = () => evaluate(`(() => {
+      const select = document.querySelector('select[aria-label=选择侧边对话]');
+      return { selected: select.value, placeholderDisabled: select.options[0].disabled,
+        options: [...select.options].filter(option => option.value).map(option => ({ id: option.value, title: option.textContent })) };
+    })()`);
+    const first = await selection();
+    assert.equal(first.options.length, 1);
+    assert.equal(first.options[0].id, first.selected);
+    assert(first.options[0].title.startsWith("新对话 · "), "Unused drafts need a distinguishable title");
+    assert(first.placeholderDisabled, "The placeholder must not behave as a new-chat action");
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await click("新建侧边对话");
+      await waitFor("!document.querySelector('select[aria-label=选择侧边对话]').disabled");
+      assert.deepEqual(await selection(), first, "Repeated new actions must reuse the same unsent draft");
+    }
+    const opensBeforePlaceholder = calls.filter(call => call.method === "workbench.chat.open").length;
+    await evaluate(`(() => {
+      const select = document.querySelector('select[aria-label=选择侧边对话]');
+      select.value = '';
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`);
+    await paint();
+    assert.equal(calls.filter(call => call.method === "workbench.chat.open").length, opensBeforePlaceholder);
+    assert.deepEqual(await selection(), first);
+    await click("关闭工具栏");
+    assert(await evaluate("document.querySelector('.workbench').hidden"));
+    await click("打开工具栏");
+    await waitFor("document.querySelector('select[aria-label=选择侧边对话]')?.checkVisibility()");
+    assert.deepEqual(await selection(), first, "Hiding and reopening the workbench must retain the selected draft");
+    assert.equal(calls.some(call => call.method === "run.start" || call.method === "workbench.chat.send"), false);
+    await paint();
+    await screenshot("side-conversation-wide.png");
+    return { selected: first.selected, title: first.options[0].title, options: 1, repeatedNewReused: true, placeholderNoop: true };
+  };
   const dragWidth = (delta) => evaluate(`(() => {
     const separator=document.querySelector('.workbench-resize');
     separator.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,clientX:1000}));
@@ -74,6 +116,12 @@ async function main() {
     await click("打开工具栏");
     await waitFor("document.querySelector('.workbench-launcher button')");
     assert.equal(await evaluate("document.querySelectorAll('.workbench-launcher > div > button').length"), 5);
+    if (sideChatOnly) {
+      await evaluate("[...document.querySelectorAll('.workbench-launcher button')].find(b=>b.textContent.includes('侧边对话')).click()");
+      const sideChat = await assertSideConversationDraft();
+      console.log(JSON.stringify({ passed: true, output, sideChat, backendErrors: errors }));
+      return;
+    }
     await screenshot("launcher-wide.png");
     await dragWidth(2000);
     await assertWidth();
@@ -146,10 +194,8 @@ async function main() {
     assert.equal(native.browser.webContents, page);
     await click("打开其他工具");
     await evaluate("[...document.querySelectorAll('.workbench-launcher button')].find(b=>b.textContent.includes('侧边对话')).click()");
-    await click("开始侧边对话");
-    await waitFor("document.querySelector('textarea[aria-label=侧边对话消息]')");
+    await assertSideConversationDraft();
     assert.equal(await evaluate("document.querySelectorAll('.workbench-tab').length"), 5);
-    await screenshot("side-conversation-wide.png");
     window.setSize(820, 680);
     await click("打开其他工具");
     await waitFor("document.querySelector('.workbench-launcher') && innerWidth <= 820");

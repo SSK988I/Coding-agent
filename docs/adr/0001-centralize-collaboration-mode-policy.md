@@ -2,7 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-08-22
-- Updated: 2026-09-07
+- Updated: 2026-10-17
 
 ## Context
 
@@ -30,10 +30,13 @@ title/Markdown without semantic rewriting, persists an immutable digest-bound
 revision and terminates the turn.
 
 Tool availability uses one `plan_access` classification owned by the runtime.
-Unclassified tools fail closed. Plan exploration uses Python workspace readers
-and structured Git tools; arbitrary shell, tests, builds and mutation tools are
-not registered and are blocked again at execution time. Git diff/show disable
-external diff and textconv explicitly.
+Unclassified tools fail closed. Plan drafting uses Python workspace readers,
+structured Git tools and configured read-only public web search. Application
+search and provider-native search both follow the ordinary approval policy;
+allowing search does not allow arbitrary network requests. Bounded read-only
+subagents still have no network access. Arbitrary shell, tests, builds and
+mutation tools are not registered and are blocked again at execution time.
+Git diff/show disable external diff and textconv explicitly.
 
 Execution authorization binds the latest `planId`, `revision` and `digest`.
 Persisted `completed` means only a settled Agent turn. An orphaned `started`

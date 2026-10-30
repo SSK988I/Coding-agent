@@ -523,7 +523,7 @@ def main(argv: list[str] | None = None) -> int:
             args.web_search if args.web_search is not None else settings.web_search_enabled
         ),
         # --api-key is a model-provider override and must never be forwarded
-        # to a different service. Search always resolves its own Zhipu key.
+        # to a different service. Search resolves its own backend's credentials.
         web_search_credential_resolver=lambda provider_id: _resolve_api_key_for(provider_id),
         web_search_backend_name=settings.web_search_backend,
         web_search_max_results=settings.web_search_max_results,
