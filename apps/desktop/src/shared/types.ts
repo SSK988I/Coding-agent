@@ -26,11 +26,13 @@ export interface RpcErrorPayload {
 }
 
 export interface WorkspacePayload {
+  turnChanges?: import("./workbench").TurnChangesSummary[];
+  turnChangesError?: string;
   archived?: boolean;
   permissionMode?: PermissionMode;
   path: string;
   sessionId: string;
-  model: { id: string; name: string; provider: string };
+  model: { id: string; name: string; provider: string; input?: string[] };
   thinkingLevel: string | null;
   tools: string[];
   messages: AgentMessage[];
@@ -38,6 +40,7 @@ export interface WorkspacePayload {
   planState: PlanStatePayload;
   memory: MemoryStatePayload;
   subagents?: SubagentTaskPayload[];
+  webSearch?: WebSearchStatePayload;
   stats?: SessionStats;
 }
 
@@ -59,6 +62,37 @@ export interface SessionStats {
     context_percent: number | null;
     context_estimated: boolean;
   };
+}
+
+export interface UsageAnalysisRequest {
+  id: string;
+  index: number;
+  timestamp: number | null;
+  provider: string;
+  model: string;
+  stopReason: string;
+  inputTokens: number | null;
+  uncachedInputTokens: number | null;
+  outputTokens: number | null;
+  cacheReadTokens: number | null;
+  cacheWriteTokens: number | null;
+  cacheHitRate: number | null;
+  cost: number | null;
+}
+
+export interface UsageAnalysisPayload {
+  sessionId: string;
+  leafId: string | null;
+  stats: SessionStats;
+  requests: UsageAnalysisRequest[];
+}
+
+export interface WebSearchStatePayload {
+  enabled: boolean;
+  backend: string;
+  available: boolean;
+  status: "idle" | "disabled" | "unavailable";
+  errorCode: string | null;
 }
 
 export interface SubagentTaskPayload {
@@ -155,8 +189,11 @@ export interface PlanStatePayload {
 }
 
 export interface SessionSnapshotPayload {
+  turnChanges?: import("./workbench").TurnChangesSummary[];
+  turnChangesError?: string;
   archived?: boolean;
   permissionMode?: PermissionMode;
+  webSearch?: WebSearchStatePayload;
   sessionId: string;
   messages: AgentMessage[];
   stats: SessionStats;
@@ -173,6 +210,7 @@ export interface PermissionModePayload {
 }
 
 export interface AgentMessage {
+  attachments?: FileAttachmentMetadata[];
   tool_call_id?: string;
   tool_name?: string;
   details?: unknown;
@@ -195,6 +233,24 @@ export interface ContentBlock {
   name?: string;
   id?: string;
   arguments?: Record<string, unknown>;
+  data?: string;
+  mime_type?: string;
+}
+
+export interface ImageAttachmentPayload {
+  data: string;
+  mime_type: string;
+}
+
+export interface FileAttachmentPayload extends ImageAttachmentPayload {
+  name: string;
+}
+
+export interface FileAttachmentMetadata {
+  name: string;
+  mime_type: string;
+  size: number;
+  path: string;
 }
 
 export interface SessionInfo {

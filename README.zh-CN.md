@@ -35,11 +35,22 @@ Coding Agent 是一个面向本地开发工作的编程 Agent。项目以 Python
 
 - 打开本地项目和切换历史会话
 - 流式显示正文与思考内容
+- “添加文件”、粘贴和拖入附件，保留图片预览；支持混合发送、失败恢复与历史文件卡片，详见[桌面附件](docs/specs/desktop-attachments.md)
 - 展示工具调用状态和执行结果
 - 对 `bash`、`write`、`edit` 请求执行确认
 - 输入 `/` 打开命令面板
 - 右上角“工具栏”：独立侧边对话、逐行变更、交互终端、内嵌浏览器和文件树预览；使用与权限边界见[桌面工作栏](docs/specs/workbench.md)
 - `/help`、`/new`、`/model`、`/compact`、`/clear`、`/session`、`/plan`、`/cancel-plan`、`/execute-plan`、`/memory`
+
+#### 聊天中的文件和图片
+
+点击“添加文件”、粘贴文件管理器中复制的文件，或拖入输入框。截图和浏览器复制图片仍显示预览；附件可以单独或混合发送，失败时保留以供重试，切换会话会清空未发送附件。每轮最多 8 个附件、合计 20 MiB，普通文件每个最多 10 MiB。副本保存在项目之外的应用目录；UTF-8 文本和代码提供有界摘录，PDF、Word 等二进制文件仅作为文件引用，需由适当工具读取。详见[桌面附件契约](docs/specs/desktop-attachments.md)。
+
+图片直接交给当前模型供应商识别，使用现有后端凭据，并以 Base64 保存在本地会话 JSONL。当前模型必须声明支持图片输入。识别图片不强制联网；用户要求核实时才按画面中的公开线索提取关键词搜索，不把原图上传给搜索引擎，也不把关键词结果当作已证明的图片来源。证据不足时说明不确定，不固定追加“未联网”提示；未完成用户要求的查询时简要说明原因。全局搜索开关仍由现有设置控制。
+
+支持 PNG、JPEG、GIF 和 WebP，每轮最多 4 张、每张 5 MiB、合计 12 MiB。后端验证实际格式和尺寸：每边最多 8192 像素、总像素最多 1600 万；动画最多 64 帧，所有帧合计最多 1600 万像素。历史模型上下文最多 24 张图片和 24 MiB 图片文件，DeepSeek 含图片请求的完整 JSON 还需不超过 40 MiB。超限时先压缩或新建会话；切到纯文本模型不会静默删除历史图片，而会要求使用兼容模型或新会话。
+
+DeepSeek V4.1 Flash 可通过 `view_image` 查看本地图片。Default 下，工作区外或敏感目录中的图片需要审批，完全访问模式除外；Plan 只允许工作区内非敏感图片，完全访问也不放宽此边界。其他适配器在能够保留工具结果中的图片前不会暴露此工具；查看图片不授予编辑或 Shell 权限。
 
 ## 环境要求
 
@@ -208,10 +219,11 @@ uv run coding-agent --no-tools
 
 联网检索默认开启，并按当前模型自动选择执行路径：
 
-- DeepSeek：通过 Responses API 使用服务端原生 `web_search`，复用 `DEEPSEEK_API_KEY`，不需要额外的搜索 Key。
-- 其他模型：使用已保存的智谱 Z.AI Coding Plan 凭据连接 Web Search Prime Remote MCP。
+- DeepSeek V4 Pro：通过 Responses API 使用服务端原生 `web_search`，复用 `DEEPSEEK_API_KEY`。
+- DeepSeek V4.1 Flash：通过函数工具 `web_search` 调用独立的 [DeepSeek Search API](https://api-docs.deepseek.com/guides/search/)，同样使用 `DEEPSEEK_API_KEY`，无需智谱 Coding Plan 凭据。不会将聊天模型切换为 Pro，也不会把图片或历史消息发送给搜索接口。Flash 的原生 Responses 搜索仍不生效，详见[兼容性表](https://api-docs.deepseek.com/guides/responses_api/#tools)。
+- 其他模型：继续使用已保存的智谱 Z.AI Coding Plan 凭据连接 Web Search Prime Remote MCP。`web_search_backend: zhipu-mcp` 只描述非 DeepSeek 的回退后端，不会强制 DeepSeek 使用智谱；宿主显式注入的搜索后端保持不变。
 
-欢迎卡片中的 `WEB on/off` 显示当前开关；DeepSeek 原生搜索仍会计入工具总数，但不会建立 MCP 连接。
+欢迎卡片中的 `WEB on/off` 显示当前开关；两条 DeepSeek 路径均不建立 MCP 连接。桌面端根据当前模型检查 Flash 或 Pro 凭据，即使搜索已关闭也能显示配置状态，并随模型切换更新。
 
 ```powershell
 # 仅为本次运行启用（可覆盖持久设置）
@@ -224,7 +236,7 @@ uv run coding-agent --web-search "搜索 Python 当前稳定版本，并附上�
 uv run coding-agent --no-web-search
 ```
 
-搜索词会发送给当前搜索服务，并可能消耗 DeepSeek API 或 Coding Plan MCP 额度。不要在查询中放入 API Key、Cookie、私有代码、内部 URL 或个人数据。搜索摘要属于不可信外部数据，最终回答应保留来源 URL。
+搜索词会发送给当前搜索服务，并可能消耗 DeepSeek API 或 Coding Plan MCP 额度。独立 DeepSeek Search API 对成功且非空的请求计费，详见[计费规则](https://api-docs.deepseek.com/guides/search/#billing)。查询最多 128 个 Unicode 字符，包含附加的域名和日期条件；超限要求缩短，不静默截断。域名筛选使用 `site:`，时效筛选按 UTC 日历日生成 `after:`，不保证精确的滚动小时范围。Plan drafting 可在普通审批策略下使用只读公开搜索，不解锁写入、Shell、测试或构建；受限只读子代理仍不能联网。搜索不自动重试 HTTP 请求。不要在查询中放入 API Key、Cookie、私有代码、内部 URL 或个人数据。搜索摘要属于不可信外部数据，最终回答应保留来源 URL。
 
 ### 附加文件和图片
 
@@ -250,7 +262,8 @@ uv run coding-agent --provider zhipu --model glm-5v-turbo `
 | `find` | 按名称或模式查找文件 |
 | `ls` | 查看目录内容 |
 | `bash` | 执行 Shell 命令 |
-| `web_search` | 搜索公开网络；DeepSeek 使用原生 Responses 工具，其他模型回退到配置的 Remote MCP；默认开启 |
+| `web_search` | 搜索公开网络；Pro 使用原生 Responses 搜索，Flash 使用独立 Search API，其他模型回退到配置的 Remote MCP；默认开启 |
+| `view_image` | 兼容的 DeepSeek 适配器查看本地图片，遵循工作区和权限检查 |
 
 工具通过统一接口声明名称、描述、JSON Schema 参数和异步执行方法。Agent Runtime 会在执行前校验参数，并发出开始、更新和结束事件。嵌入式前端可以通过执行前后 Hook 加入审批、审计或结果处理逻辑。
 
@@ -295,6 +308,8 @@ uv run coding-agent --provider zhipu --model glm-5v-turbo `
 ## 会话与配置
 
 桌面输入框下方和 TUI 底栏显示缓存命中率、当前上下文用量／容量、累计输入输出和费用估算；`/session` 可查看详情。非交互文本模式将用量摘要写入 stderr，不影响 stdout 或 JSON 输出。缺失数据使用 `—`，估算容量带“约”标识。计算口径见[用量指标](docs/specs/usage-metrics.md)。
+
+桌面底栏点击“用量分析”可打开按需加载的分析抽屉，查看当前分支每次模型请求的 Token／费用趋势、输入缓存构成和分页请求明细。
 
 默认数据目录为 `~/.coding-agent`，可以通过 `CODING_AGENT_HOME` 修改：
 

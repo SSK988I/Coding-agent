@@ -1,6 +1,6 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import type { WorkspacePayload } from "../../shared/types";
-import type { WorkbenchScope, WorkbenchTool } from "../../shared/workbench";
+import type { ChangeReviewRequest, WorkbenchScope, WorkbenchTool } from "../../shared/workbench";
 import { ChangesPanel, FilesPanel, SideChatPanel } from "./panels";
 import { BrowserPanel, TerminalPanel } from "./nativePanels";
 import "./workbench.css";
@@ -15,7 +15,7 @@ const TOOLS: { kind: WorkbenchTool; label: string; description: string; path: st
 interface ToolTab { id: string; kind: WorkbenchTool; title: string }
 function ToolIcon({ kind }: { kind: WorkbenchTool }) { return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={TOOLS.find((tool) => tool.kind === kind)!.path} /></svg>; }
 
-export const Workbench = memo(function Workbench({ workspace, open, onClose, width, onWidth, sidebarOpen = true }: { workspace: WorkspacePayload; open: boolean; onClose: () => void; width: number; onWidth: (width: number) => void; sidebarOpen?: boolean }) {
+export const Workbench = memo(function Workbench({ workspace, open, onClose, width, onWidth, sidebarOpen = true, suspended = false, requestedChange = null }: { workspace: WorkspacePayload; open: boolean; onClose: () => void; width: number; onWidth: (width: number) => void; sidebarOpen?: boolean; suspended?: boolean; requestedChange?: ChangeReviewRequest | null }) {
   const scope = useMemo<WorkbenchScope>(() => ({ workspacePath: workspace.path, sessionId: workspace.sessionId }), [workspace.path, workspace.sessionId]);
   const [tabs, setTabs] = useState<ToolTab[]>([]);
   const [active, setActive] = useState<string | null>(null);
@@ -45,6 +45,12 @@ export const Workbench = memo(function Workbench({ workspace, open, onClose, wid
     const title = kind === "terminal" ? `${label} ${++terminalCounter.current}` : label;
     setTabs((current) => [...current, { id, kind, title }]); activate(id);
   };
+  useEffect(() => {
+    if (!requestedChange) return;
+    setTabs((current) => current.some((tab) => tab.kind === "changes") ? current
+      : [...current, { id: "changes", kind: "changes", title: "变更" }]);
+    activate("changes");
+  }, [requestedChange]);
   const closeTab = (id: string) => {
     const remaining = tabs.filter((tab) => tab.id !== id);
     setTabs(remaining); history.current = history.current.filter((item) => item !== id);
@@ -78,12 +84,14 @@ export const Workbench = memo(function Workbench({ workspace, open, onClose, wid
     {launcher && <section className="workbench-launcher" aria-label="打开工具"><div>{TOOLS.map((tool) => <button type="button" key={tool.kind} onClick={() => openTool(tool.kind)}><ToolIcon kind={tool.kind} /><span><strong>{tool.label}</strong><small>{tool.description}</small></span><span className="workbench-chevron">›</span></button>)}</div>{active && <button type="button" className="workbench-return" onClick={() => setLauncher(false)}>← 返回当前工具</button>}</section>}
     {tabs.map((tab) => {
       const visible = open && !launcher && active === tab.id;
+      const nativeActive = visible && !suspended;
       return <div className="workbench-tool-panel" role="tabpanel" id={`workbench-panel-${tab.id}`} aria-label={tab.title} key={tab.id} hidden={!visible}>
-        {tab.kind === "changes" && <ChangesPanel scope={scope} active={visible} onOpenFile={(path) => { setRequestedFile((current) => ({ path, serial: (current?.serial ?? 0) + 1 })); openTool("files"); }} />}
+        {tab.kind === "changes" && <ChangesPanel scope={scope} active={visible} requestedChange={requestedChange}
+          onOpenFile={(path) => { setRequestedFile((current) => ({ path, serial: (current?.serial ?? 0) + 1 })); openTool("files"); }} />}
         {tab.kind === "files" && <FilesPanel scope={scope} requestedFile={requestedFile} />}
         {tab.kind === "chat" && <SideChatPanel scope={scope} readOnly={Boolean(workspace.archived)} />}
-        {tab.kind === "terminal" && <TerminalPanel scope={scope} tabKey={tab.id} active={visible} />}
-        {tab.kind === "browser" && <BrowserPanel scope={scope} active={visible} />}
+        {tab.kind === "terminal" && <TerminalPanel scope={scope} tabKey={tab.id} active={nativeActive} />}
+        {tab.kind === "browser" && <BrowserPanel scope={scope} active={nativeActive} />}
       </div>;
     })}
   </aside>;

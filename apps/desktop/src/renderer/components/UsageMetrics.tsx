@@ -21,7 +21,7 @@ function cost(value: number | undefined): string {
 }
 
 /** Present server-derived metrics without inferring context size or cache policy. */
-export function UsageMetrics({ stats }: { stats?: SessionStats }) {
+export function UsageMetrics({ stats, onOpenAnalysis }: { stats?: SessionStats; onOpenAnalysis?: () => void }) {
   const metrics = stats?.metrics;
   const cacheHit = metrics?.cache_hit_rate;
   const contextPercent = metrics?.context_percent;
@@ -59,6 +59,13 @@ export function UsageMetrics({ stats }: { stats?: SessionStats }) {
       <span className="usage-metric" title="按模型价格累计估算的美元费用；不是供应商账单，不包含未上报的工具等费用。">
         <span>估算费用</span><strong data-testid="usage-cost">{cost(stats?.cost)}</strong>
       </span>
+      {onOpenAnalysis && <button type="button" className="usage-analysis-trigger"
+        aria-label="查看用量分析" onClick={onOpenAnalysis}>
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden="true">
+          <path d="M2 2v11h12M5 10V7m4 3V4m4 6V6" />
+        </svg>
+        用量分析
+      </button>}
     </section>
   );
 }

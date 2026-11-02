@@ -5,6 +5,7 @@ import asyncio
 import pytest
 from agent_core import AgentContext, BeforeToolCallContext
 from agent_llm import AssistantMessage, Model, ModelCost, ToolCall, TextContent
+from agent_llm.providers.deepseek_models import DEEPSEEK_MODELS
 
 from coding_agent.core.agent_session import AgentSession, AgentSessionConfig
 from coding_agent.core.settings import Settings, SettingsManager
@@ -135,7 +136,7 @@ def test_native_search_waits_for_permission_and_rejects_caller_bypass(monkeypatc
                 waiting.set()
         runtime = DesktopRuntime(emit)
         runtime._workspace = tmp_path
-        model = Model(id="test", provider="deepseek", cost=ModelCost(input=0, output=0, cache_read=0, cache_write=0))
+        model = DEEPSEEK_MODELS["deepseek-v4-pro"]
         def fake_stream(_model, ctx, options):
             captured.append((ctx, options))
             stream = AssistantMessageEventStream()
@@ -182,7 +183,7 @@ def test_stopping_native_search_approval_never_starts_provider(monkeypatch, tmp_
         runtime = DesktopRuntime(emit)
         runtime._workspace = tmp_path
         runtime._session = AgentSession(AgentSessionConfig(
-            cwd=str(tmp_path), model=Model(id="test", provider="deepseek", cost=ModelCost(input=0, output=0, cache_read=0, cache_write=0)),
+            cwd=str(tmp_path), model=DEEPSEEK_MODELS["deepseek-v4-pro"],
             web_search_enabled=True, before_native_web_search=runtime._before_native_web_search,
         ))
         try:

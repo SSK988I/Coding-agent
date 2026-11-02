@@ -22,7 +22,7 @@ describe("desktop session archive", () => {
 
   const payload = (id = selected, path = project): WorkspacePayload => ({
     path, sessionId: id, archived: records.get(id)?.archived ?? false,
-    model: { id: "offline", name: "Offline", provider: "offline" },
+    model: { id: "offline", name: "Offline", provider: "offline", input: ["text"] },
     thinkingLevel: null, tools: [], collaborationMode: "default",
     messages: [
       { role: "user", content: `Question in ${id}` },
@@ -220,6 +220,7 @@ describe("desktop session archive", () => {
   it("resets the archived filter when a different project opens", async () => {
     window.desktop.chooseWorkspace = async () => "G:\\Other-project";
     mount();
+    await findRowAction("Current conversation");
     fireEvent.click(await screen.findByRole("button", { name: "查看已归档会话" }));
     await findRowAction("Archived conversation", true);
     fireEvent.click(screen.getByRole("button", { name: "打开项目" }));

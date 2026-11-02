@@ -2,17 +2,21 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from dataclasses import dataclass, field
+from datetime import datetime
 import json
 from pathlib import Path
 from typing import Any, Callable, cast
 import uuid
 
-from agent_core import BeforeToolCallContext, BeforeToolCallResult, SessionManager
+from agent_core import AgentTool, BeforeToolCallContext, BeforeToolCallResult, SessionManager
 from coding_agent.core.agent_session import AgentSession, AgentSessionConfig, _create_plan_observation_tools
 from coding_agent.core.permissions import PermissionMode, requires_approval, is_approval_safe_shell_command
 from coding_agent.core.plan_mode import enforce_plan_tool_policy
 from coding_agent.desktop.protocol import RpcError, to_jsonable
+from coding_agent.search.backends.model import ModelSearchBackend
+from coding_agent.search.tool import WebSearchTool
 
 CHILD_TOOLS = {"read", "write", "edit", "bash", "grep", "find", "ls", "git_status", "git_log", "git_diff", "git_show", "web_search"}
 
@@ -42,6 +46,7 @@ class SideConversations:
     def _snapshot(self, live: SideConversation) -> dict[str, Any]:
         return {
             "conversationId": live.session.session_manager.header.id,
+            "title": self._title(live),
             "status": live.status, "error": live.error, "streaming": live.streaming,
             "messages": to_jsonable(live.session.state.messages), "approval": live.approval,
         }
@@ -60,23 +65,65 @@ class SideConversations:
         temporary.write_text(json.dumps({"status": live.status, "error": live.error}), encoding="utf-8")
         temporary.replace(target)
 
+    @staticmethod
+    def _normalized_title(text: str) -> str:
+        return " ".join(text.split())[:80]
+
+    def _title(self, live: SideConversation) -> str:
+        for message in live.session.state.messages:
+            if getattr(message, "role", None) != "user":
+                continue
+            content = getattr(message, "content", "")
+            if isinstance(content, list):
+                content = "\n".join(text for block in content if isinstance(text := getattr(block, "text", None), str))
+            if isinstance(content, str) and (title := self._normalized_title(content)):
+                return title
+        return f"新对话 · {live.session.session_manager.header.id[-8:]}"
+
+    @staticmethod
+    def _activity(live: SideConversation) -> float:
+        try:
+            latest = datetime.fromisoformat(live.session.session_manager.header.timestamp.replace("Z", "+00:00")).timestamp()
+        except (AttributeError, ValueError, TypeError, OverflowError, OSError):
+            latest = 0.0
+        for message in live.session.state.messages:
+            timestamp = getattr(message, "timestamp", None)
+            if isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool) and 0 <= timestamp <= 2**53 - 1:
+                latest = max(latest, timestamp / 1000)
+        return latest
+
     def list(self) -> list[dict[str, Any]]:
-        saved = {item.id: {"conversationId": item.id, "title": item.first_message[:80] or "侧边对话"} for item in SessionManager.list_sessions(cwd=self.parent.cwd, sessions_dir=self.storage)}
+        saved = {}
+        activity = {}
+        for item in SessionManager.list_sessions(cwd=self.parent.cwd, sessions_dir=self.storage):
+            title = self._normalized_title(item.first_message) or f"新对话 · {item.id[-8:]}"
+            saved[item.id] = {"conversationId": item.id, "title": title}
+            activity[item.id] = item.modified
         for identity, live in self.records.items():
-            saved.setdefault(identity, {"conversationId": identity, "title": "侧边对话"})
-            first = next((message for message in live.session.state.messages if getattr(message, "role", None) == "user"), None)
-            if first is not None:
-                content = getattr(first, "content", "")
-                if isinstance(content, str):
-                    saved[identity]["title"] = content[:80]
-            saved[identity]["status"] = live.status
-        return list(saved.values())[::-1]
+            saved[identity] = {"conversationId": identity, "title": self._title(live), "status": live.status}
+            activity[identity] = max(activity.get(identity, 0.0), self._activity(live))
+        counts = Counter(item["title"] for item in saved.values())
+        for identity, item in saved.items():
+            if counts[item["title"]] > 1:
+                item["title"] = f"{item['title'][:68]} · {identity[-8:]}"
+        return sorted(saved.values(), key=lambda item: (activity[item["conversationId"]], item["conversationId"]), reverse=True)
 
     def open(self, identity: str | None = None) -> dict[str, Any]:
         if self.closed:
             raise RpcError("STALE_WORKSPACE", "会话已经切换")
         if identity is not None and identity in self.records:
             return self._snapshot(self.records[identity])
+        if identity is None:
+            inherited_names = {tool.name for tool in self.parent.tools if tool.name in CHILD_TOOLS}
+            for live in reversed(self.records.values()):
+                if (live.status == "idle" and live.task is None and live.approval is None
+                    and live.decision is None and live.error is None and not live.streaming
+                    and live.native_search_decision is None and not live.session.state.messages
+                    and not live.session.session_manager.entries
+                    and live.session.model == self.parent.model
+                    and live.session.agent.reasoning == self.parent.agent.reasoning
+                    and {tool.name for tool in live.session.tools} == inherited_names):
+                    return self._snapshot(live)
         if len(self.records) >= 16:
             raise RpcError("SIDE_CHAT_LIMIT", "最多同时打开 16 个侧边对话")
         manager = None
@@ -93,15 +140,29 @@ class SideConversations:
         inherited = [tool for tool in self.parent.tools if tool.name in CHILD_TOOLS]
         observations = {tool.name: tool for tool in _create_plan_observation_tools(inherited, cwd=self.parent.cwd)}
         tools = [observations.get(tool.name, tool) if tool.name in {"grep", "find"} else tool for tool in inherited]
+        search_backend = None
+        for index, tool in enumerate(tools):
+            if (self.parent._config.web_search_backend is None
+                    and isinstance(tool, WebSearchTool) and isinstance(tool.backend, ModelSearchBackend)):
+                # Built-in routing belongs to the child's model. Reusing the
+                # parent's router would follow later model switches and closes.
+                search_backend = self.parent._create_search_backend(model_provider=lambda: child.model.provider)
+                tools[index] = cast(AgentTool, WebSearchTool(search_backend, default_count=tool.default_count))
         child = AgentSession(AgentSessionConfig(
             model=self.parent.model, cwd=self.parent.cwd, tools=tools,
             session_manager=manager, no_builtin_tools=True,
             get_api_key=self.parent._config.get_api_key, reasoning=self.parent.agent.reasoning,
+            web_search_backend=self.parent._config.web_search_backend,
+            web_search_credential_resolver=self.parent._config.web_search_credential_resolver,
+            web_search_backend_name=self.parent._config.web_search_backend_name,
+            web_search_max_results=self.parent._config.web_search_max_results,
+            web_search_timeout_seconds=self.parent._config.web_search_timeout_seconds,
             context_files=self.parent._config.context_files, retry_policy=self.parent.retry_policy,
             memory_configured=False,
             permission_mode=cast(PermissionMode, self.permission()),
             append_system_prompt="This is a user-directed side conversation. Work independently. Its messages and results are not injected into the main conversation.",
         ))
+        child._web_search_backend = search_backend
         live = SideConversation(child)
         child._config.before_tool_call = lambda context, signal: self._approve(live, context, signal)
         child._config.before_native_web_search = lambda signal: self._approve_native_search(live, signal)
@@ -205,16 +266,14 @@ class SideConversations:
     def _native_search_allowed(self, signal: asyncio.Event) -> bool:
         return (
             not self.closed and not signal.is_set()
-            and self.parent.collaboration_mode == "default"
-            and self.parent.plan_state.phase not in {"uncertain", "recovery_error"}
-            and any(tool.name == "web_search" for tool in self.parent.tools)
+            and self.parent.web_search_available
         )
 
     async def _approve_native_search(self, live: SideConversation, signal: asyncio.Event) -> bool:
         # Provider-native search never passes through before_tool_call. Share the
         # side chat's approval queue, but revalidate the parent for every request.
         async with live.approval_lock:
-            if not self._native_search_allowed(signal):
+            if not self._native_search_allowed(signal) or not live.session.web_search_available:
                 return False
             if live.native_search_decision is None:
                 live.native_search_decision = (
@@ -222,7 +281,10 @@ class SideConversations:
                     if requires_approval(self.permission(), "web_search", {}, Path(self.parent.cwd), is_approval_safe_shell_command)
                     else True
                 )
-            return live.native_search_decision and self._native_search_allowed(signal)
+            return bool(
+                live.native_search_decision and self._native_search_allowed(signal)
+                and live.session.web_search_available
+            )
 
     async def _request_decision(self, live: SideConversation, tool_name: str, args: dict[str, Any], signal: asyncio.Event) -> bool:
         live.decision = asyncio.get_running_loop().create_future()

@@ -5,6 +5,7 @@ import {
   ToolCard,
   ToolRendererRegistry,
   classifyToolName,
+  formatToolOutput,
   parseUnifiedDiff,
   type ToolCardData,
   type ToolRendererProps,
@@ -28,6 +29,7 @@ describe("tool renderer registry", () => {
     ["bash", "shell"],
     ["exec_command", "shell"],
     ["read", "read"],
+    ["view_image", "read"],
     ["filesystem_read_file", "read"],
     ["write", "write"],
     ["apply_patch", "write"],
@@ -58,6 +60,35 @@ describe("tool renderer registry", () => {
 });
 
 describe("ToolCard", () => {
+  it.each([false, true])("previews view_image pixels and text without dumping bytes (persisted: %s)", (persisted) => {
+    const data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB";
+    const result = { content: [
+      { type: "text", text: "Image: screenshots/screen.png" },
+      { type: "image", data, mime_type: "image/png" },
+    ] };
+    const { container } = render(<ToolCard tool={tool({
+      name: "view_image", args: { path: "screenshots/screen.png" },
+      result: persisted ? { role: "toolResult", tool_name: "view_image", tool_call_id: "tool-1", ...result } : result,
+    })} />);
+    expect(container.querySelector("[data-tool-category=read]")).toBeInTheDocument();
+    expect(screen.getByText("screenshots/screen.png")).toBeInTheDocument();
+    expect(screen.getByText("Image: screenshots/screen.png")).toBeInTheDocument();
+    expect(screen.getByText("已返回 1 张图片。")).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "附件图片 1" })).toHaveAttribute("src", `data:image/png;base64,${data}`);
+    expect(container.textContent).not.toContain(data);
+    expect(container.textContent).not.toContain('"content"');
+  });
+
+  it("summarizes pure-image results without a large JSON fallback", () => {
+    const data = "eA==";
+    const result = { content: [{ type: "image", data, mime_type: "image/png" }] };
+    const { container } = render(<ToolCard tool={tool({ name: "view_image", args: { path: "x.png" }, result })} />);
+    expect(screen.getByText("已返回 1 张图片。")).toBeInTheDocument();
+    expect(container.textContent).not.toContain(data);
+    expect(container.querySelector("pre")).not.toBeInTheDocument();
+    expect(formatToolOutput(result)).toBe("已返回 1 张图片。");
+  });
+
   it.each(["read", "grep", "custom_action"])("formats %s output again only when its result changes", (name) => {
     const result = { toJSON: vi.fn(() => ({ summary: "original result" })) };
     const initial = tool({ name, status: "pending", result });
@@ -86,10 +117,12 @@ describe("ToolCard", () => {
     ["", "等待文件内容…"],
     [0, "0"],
     [false, "false"],
-    [{ content: [{ type: "text", text: "visible text" }] }, "visible text"],
+    [{ content: [{ type: "text", text: "visible text" }, { type: "image", data: "hidden-image-bytes", mime_type: "image/png" }] }, "visible text"],
+    [{ content: [{ type: "image", data: "hidden-image-bytes", mime_type: "image/png" }] }, "已返回 1 张图片。"],
   ])("preserves raw read output semantics for %j", (result, expected) => {
-    render(<ToolCard tool={tool({ name: "read", args: { path: "a.txt" }, result })} />);
+    const { container } = render(<ToolCard tool={tool({ name: "read", args: { path: "a.txt" }, result })} />);
     expect(screen.getByText(expected as string)).toBeInTheDocument();
+    expect(container.textContent).not.toContain("hidden-image-bytes");
   });
 
   it("selects shallow metadata before earlier deeper matches when traversing tool data", () => {
@@ -125,6 +158,19 @@ describe("ToolCard", () => {
     expect(args.self).toBe(args);
     expect(args.children).toBe(children);
     expect(children).toHaveLength(2001);
+  });
+
+  it.each([
+    { mime_type: "image/svg+xml", data: "PHN2Zz48L3N2Zz4=" },
+    { mime_type: "text/html", data: "PHNjcmlwdD4=" },
+    { mime_type: "image/png", data: "https://evil.example/image.png" },
+  ])("refuses untrusted image sources without rendering raw payload: %s", (image) => {
+    const { container } = render(<ToolCard tool={tool({ name: "view_image", args: { path: "x.png" },
+      result: { content: [{ type: "image", ...image }] } })} />);
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    expect(screen.getByText("图片无法显示")).toBeInTheDocument();
+    expect(container.textContent).not.toContain(image.data);
+    expect(container.querySelector("pre")).not.toBeInTheDocument();
   });
 
   it("shows shell command and cwd and can collapse its output", () => {

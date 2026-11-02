@@ -5,8 +5,8 @@ import { Workbench } from "./Workbench";
 import { ChangesPanel, DiffView, FilesPanel, SideChatPanel } from "./panels";
 
 vi.mock("./nativePanels", () => ({
-  TerminalPanel: ({ tabKey }: { tabKey: string }) => <div data-testid="terminal">{tabKey}</div>,
-  BrowserPanel: () => <div data-testid="browser">Browser</div>,
+  TerminalPanel: ({ tabKey, active }: { tabKey: string; active: boolean }) => <div data-testid="terminal" data-active={active}>{tabKey}</div>,
+  BrowserPanel: ({ active }: { active: boolean }) => <div data-testid="browser" data-active={active}>Browser</div>,
 }));
 
 const scope = { workspacePath: "G:\\project", sessionId: "main" };
@@ -34,6 +34,40 @@ beforeEach(() => {
   window.desktop = { chooseWorkspace: async () => null, getBootstrap: async () => ({ defaultWorkspace: scope.workspacePath, platform: "win32" }) };
 });
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
+
+it("reviews immutable turns without polling and ignores a late response for the previously selected turn", async () => {
+  let resolveOld!: (value: unknown) => void;
+  const timers = vi.spyOn(window, "setInterval");
+  request.mockImplementation((method, params) => {
+    if (method !== "workbench.changes") return Promise.resolve({});
+    if (params.runId === "old") return new Promise((resolve) => { resolveOld = resolve; });
+    return Promise.resolve({ ...scope, ...changes, source: "turn", runId: "new", files: [{ ...changes.files[0], path: "new.ts" }] });
+  });
+  const view = render(<ChangesPanel scope={scope} active onOpenFile={vi.fn()} requestedChange={{ runId: "old", serial: 1 }} />);
+  await waitFor(() => expect(request).toHaveBeenCalledWith("workbench.changes", { ...scope, source: "turn", runId: "old" }));
+  view.rerender(<ChangesPanel scope={scope} active onOpenFile={vi.fn()} requestedChange={{ runId: "new", serial: 2 }} />);
+  await screen.findByText("new.ts");
+  await act(async () => resolveOld({ ...scope, ...changes, source: "turn", runId: "old", files: [{ ...changes.files[0], path: "old.ts" }] }));
+  expect(screen.queryByText("old.ts")).not.toBeInTheDocument();
+  // Testing Library uses a short interval while waiting for DOM updates.
+  expect(timers.mock.calls.filter((args) => args[1] === 5000)).toHaveLength(0);
+  timers.mockRestore();
+});
+
+it("does not let a hidden pending review block re-opening the same turn", async () => {
+  let resolveOld!: (value: unknown) => void;
+  const review = { ...scope, ...changes, source: "turn", runId: "same" };
+  request.mockImplementationOnce(() => new Promise((resolve) => { resolveOld = resolve; })).mockResolvedValue(review);
+  const target = { runId: "same", serial: 1 };
+  const view = render(<ChangesPanel scope={scope} active onOpenFile={vi.fn()} requestedChange={target} />);
+  await waitFor(() => expect(request).toHaveBeenCalledOnce());
+  view.rerender(<ChangesPanel scope={scope} active={false} onOpenFile={vi.fn()} requestedChange={target} />);
+  view.rerender(<ChangesPanel scope={scope} active onOpenFile={vi.fn()} requestedChange={target} />);
+  await screen.findByText("sample.py");
+  expect(request).toHaveBeenCalledTimes(2);
+  await act(async () => resolveOld({ ...review, files: [{ ...changes.files[0], path: "stale.py" }] }));
+  expect(screen.queryByText("stale.py")).not.toBeInTheDocument();
+});
 
 describe("workspace workbench", () => {
   const props = { workspace, open: true, onClose: vi.fn(), width: 480, onWidth: vi.fn() };
@@ -123,6 +157,23 @@ describe("workspace workbench", () => {
     await waitFor(() => expect(request).toHaveBeenCalledWith("workbench.chat.send", {
       ...scope, conversationId: "child", text: "Preserved side draft",
     }));
+  });
+
+  it.each([
+    { label: "终端", testId: "terminal" },
+    { label: "浏览器", testId: "browser" },
+  ])("suspends $label for a usage overlay without remounting its tab", ({ label, testId }) => {
+    const view = render(<Workbench {...props} />);
+    fireEvent.click(screen.getByRole("button", { name: new RegExp(`^${label}`) }));
+    const panel = screen.getByTestId(testId);
+    expect(panel).toHaveAttribute("data-active", "true");
+    view.rerender(<Workbench {...props} suspended />);
+    expect(screen.getByTestId(testId)).toBe(panel);
+    expect(panel).toHaveAttribute("data-active", "false");
+    expect(screen.getByRole("tab", { name: label === "终端" ? "终端 1" : label })).toHaveAttribute("aria-selected", "true");
+    view.rerender(<Workbench {...props} />);
+    expect(screen.getByTestId(testId)).toBe(panel);
+    expect(panel).toHaveAttribute("data-active", "true");
   });
 
   it("limits pointer and keyboard resizing by sidebar and conversation widths", () => {

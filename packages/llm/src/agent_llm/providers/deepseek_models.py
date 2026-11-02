@@ -39,7 +39,7 @@ DEEPSEEK_MODELS: dict[str, Model] = {
         api="openai-responses",
         provider="deepseek",
         base_url="https://api.deepseek.com",
-        compat=dict(_DEEPSEEK_COMPAT),
+        compat={**_DEEPSEEK_COMPAT, "supports_native_web_search": False},
         reasoning=True,
         thinking_level_map=dict(_DEEPSEEK_THINKING_LEVEL_MAP),  # type: ignore[arg-type]
         input=["text", "image"],
@@ -53,7 +53,7 @@ DEEPSEEK_MODELS: dict[str, Model] = {
         api="openai-responses",
         provider="deepseek",
         base_url="https://api.deepseek.com",
-        compat=dict(_DEEPSEEK_COMPAT),
+        compat={**_DEEPSEEK_COMPAT, "supports_native_web_search": True},
         reasoning=True,
         thinking_level_map=dict(_DEEPSEEK_THINKING_LEVEL_MAP),  # type: ignore[arg-type]
         input=["text"],
@@ -62,3 +62,17 @@ DEEPSEEK_MODELS: dict[str, Model] = {
         max_tokens=393_216,
     ),
 }
+
+
+def supports_native_web_search(model: Model) -> bool:
+    """Only explicitly opted-in models on the supported adapter have native search.
+
+    DeepSeek Flash accepts images but silently ignores the Responses web_search
+    tool. Unknown/custom models therefore keep client-side function search unless
+    their catalog explicitly declares this provider-specific capability.
+    """
+    return (
+        model.provider == "deepseek"
+        and model.api == "openai-responses"
+        and (model.compat or {}).get("supports_native_web_search") is True
+    )

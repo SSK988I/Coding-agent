@@ -16,7 +16,7 @@ class WebSearchTool:
     name = "web_search"
     label = "web search"
     effect = "read"
-    plan_access: PlanAccess = "deny"
+    plan_access: PlanAccess = "observe"
     execution_mode = "parallel"
     description = (
         "Search the public web for current information and return source URLs. "

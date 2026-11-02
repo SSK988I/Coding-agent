@@ -22,8 +22,11 @@ Application `web_search` calls use the ordinary tool approval hook. Provider
 native search is authorized before enabling its capability: strict mode asks
 once per task, and a rejection or timeout keeps search disabled for that task.
 Stopping while approval is pending prevents the provider stream from starting.
-Model API communication itself is unaffected. Plan, recovery, memory and child
-contexts cannot enable native search through this approval hook.
+Model API communication itself is unaffected. Plan drafting permits read-only
+web search through either path under this same approval policy; entering Plan
+does not turn search on or bypass approval. Waiting-for-answer, ready and
+recovery states do not start model tool rounds. Memory extraction and bounded
+read-only subagents cannot enable native search through this approval hook.
 
 `permission.setMode {mode}` saves the choice before updating live state and
 returns `{sessionId, permissionMode}`. It emits `permission.changed` with the same

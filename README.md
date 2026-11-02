@@ -19,6 +19,7 @@ It can read and modify project files, search code, execute shell commands, and s
 - **Project context**: discovers `AGENTS.md`, `CLAUDE.md`, skills, and prompt templates.
 - **Terminal UI**: renders Markdown, streaming content, tool cards, model selection, and line-based differential updates.
 - **Desktop MVP**: supports workspace selection, session history, streaming messages, tool approval, model switching, and a slash-command palette.
+- **File and image input**: select, paste, or drop files into desktop chat. Text and code attachments include bounded excerpts; other documents remain available as file references. Vision-capable models also accept images.
 - **Cross-client Plan Mode**: provides runtime-enforced observation tools, structured questions, immutable plan revisions, recovery states, and explicit execution confirmation shared by CLI and desktop.
 
 ## Interfaces
@@ -40,6 +41,24 @@ The desktop MVP currently supports:
 - A command palette that opens when `/` is entered
 - A right-hand workbench with independent side conversations, line diffs, interactive terminals, an embedded browser, and file previews; see the [workbench guide](docs/specs/workbench.md) for lifecycle and permission boundaries
 - `/help`, `/new`, `/model`, `/compact`, `/clear`, `/session`, `/plan`, `/cancel-plan`, `/execute-plan`, and `/memory`
+
+#### Files and images in chat
+
+Select **添加文件**, paste files copied from your file manager, or drop them into the composer. Screenshots and copied browser images still paste as image previews. Files appear as removable cards and can be sent without text, together with images. Failed sends keep the attachments available for retry; switching sessions clears unsent attachments.
+
+Each send accepts up to 8 attachments and 20 MiB combined; individual non-image files may be up to 10 MiB. File copies are kept in application storage for session recovery, outside the project directory. UTF-8 text and code include bounded excerpts; PDF, Word and other binary formats are references for suitable tools, not native document uploads to the model. See the [desktop attachment contract](docs/specs/desktop-attachments.md).
+
+Images go directly to the selected model provider for understanding. The agent can read screenshots, describe scenes and identify subjects without a web search. It uses search when you request online verification or the task needs external evidence; attaching an image does not require a lookup. Uncertainty should reflect the available evidence, without routine "not searched" or "unverified" disclaimers. If a requested check cannot be completed, the agent should say so briefly.
+
+Image-related searches use public visual keywords and cite returned sources. They are not reverse image search and do not establish the original image's source by themselves; the search tool does not upload the image. Read-only search remains available while drafting in Plan Mode, under the usual approval policy. The attachment area only shows previews and removal controls; search configuration stays in the existing global settings.
+
+The current model must support image input. Images go to that model's provider using the existing backend credentials, not to a separate OCR service. They are also saved in the local session JSONL as Base64 data. Do not attach sensitive images unless you intend to share them with the provider.
+
+Supported formats are PNG, JPEG, GIF, and WebP. Each send allows up to 4 images, 5 MiB per image and 12 MiB combined. The backend decodes the actual image and rejects corrupt files, mismatched formats, dimensions over 8192 pixels per side, or more than 16 million pixels. Animated images are limited to 64 frames and 16 million pixels across all frames. Split long screenshots into readable sections rather than shrinking their text.
+
+History counts too: the active model context permits at most 24 images and 24 MiB of decoded image files. DeepSeek requests containing images must also fit within a 40 MiB complete JSON body. Compact the context or start a new session when a limit is reached. Switching to a text-only model does not silently discard historical images; requests are rejected until you choose a compatible model or a new conversation.
+
+With DeepSeek V4.1 Flash, the agent can use `view_image` to inspect local files. In Default Mode, images outside the workspace or in sensitive directories require approval unless full access is enabled. Plan Mode only permits non-sensitive images inside the workspace, including when full access is enabled; image viewing does not authorize edits or shell commands. Other adapters do not expose this tool until they can preserve images in tool results.
 
 ## Requirements
 
@@ -206,10 +225,11 @@ uv run coding-agent --no-tools
 
 Web search is enabled by default and automatically follows the selected model:
 
-- DeepSeek uses the native server-side `web_search` tool through the Responses API and reuses `DEEPSEEK_API_KEY`; no separate search key is required.
-- Other models use the stored Zhipu Z.AI Coding Plan credential through the Web Search Prime Remote MCP fallback.
+- DeepSeek V4 Pro uses the native server-side `web_search` tool through the Responses API and reuses `DEEPSEEK_API_KEY`; no separate search key is required.
+- DeepSeek V4.1 Flash uses the standalone [DeepSeek Search API](https://api-docs.deepseek.com/guides/search/) through the function tool `web_search`, also with `DEEPSEEK_API_KEY`. It does not switch the chat model to Pro or send images/history to the search endpoint. A DeepSeek key is sufficient for both image understanding and keyword-based web lookup; no Zhipu Coding Plan credential is required. Flash still ignores the native Responses search tool, as described in the [Responses compatibility table](https://api-docs.deepseek.com/guides/responses_api/#tools).
+- Other model providers keep the Zhipu Z.AI Coding Plan Web Search Prime Remote MCP backend. The existing `web_search_backend: zhipu-mcp` setting describes this non-DeepSeek fallback; it does not force DeepSeek sessions to use Zhipu. Hosts that inject their own search backend keep that backend.
 
-The welcome card reports the effective state as `WEB on/off`. Native DeepSeek search is counted as an available tool but does not open an MCP connection.
+The welcome card reports the effective state as `WEB on/off`. Neither DeepSeek path opens an MCP connection. Desktop search status checks DeepSeek credentials for Flash and Pro, including while search is disabled, and follows model switches.
 
 ```powershell
 # Enable for this run only (overrides the persisted setting)
@@ -222,7 +242,7 @@ uv run coding-agent --web-search "Find the current stable Python release and cit
 uv run coding-agent --no-web-search
 ```
 
-Queries are sent to the active search service and may consume DeepSeek API or Coding Plan MCP quota. Never include API keys, cookies, private code, internal URLs, or personal data. Search snippets are untrusted external data, and final answers should retain the returned source URLs.
+Queries are sent to the active search service and may consume DeepSeek API or Coding Plan MCP quota. The standalone DeepSeek Search API is billed per successful non-empty request; check the [current billing rules](https://api-docs.deepseek.com/guides/search/#billing). Its query limit is 128 Unicode characters, including appended domain/date operators; longer queries are rejected with a request to shorten them, not silently truncated. Domain filters use `site:` clauses; freshness uses UTC calendar-day `after:` boundaries, not an exact rolling-hour guarantee. Plan drafting permits public web search through either DeepSeek path or the configured backend, under the same approval policy as Default Mode. It does not unlock writes, shell commands, tests or builds, and bounded read-only subagents still have no network access. Search has no automatic HTTP retries. Never include API keys, cookies, private code, internal URLs, or personal data. Search snippets are untrusted external data, and final answers should retain the returned source URLs.
 
 ### File and image attachments
 
@@ -250,7 +270,8 @@ Images can only be sent to models whose catalog entries declare `image` input su
 | `bash` | Execute shell commands |
 | `subagent_spawn` | Start a bounded read-only investigation or review with an independent context |
 | `subagent_status`, `subagent_wait`, `subagent_cancel` | Inspect, wait for, or stop a task on the active session branch |
-| `web_search` | Search the public web through native DeepSeek Responses or the configured Remote MCP fallback; enabled by default |
+| `web_search` | Search the public web through DeepSeek Pro native Responses, the Flash Search API, or the configured Remote MCP fallback; enabled by default |
+| `view_image` | Inspect local images with compatible DeepSeek adapters, subject to workspace and permission checks |
 
 Tools expose their name, description, JSON Schema parameters, and asynchronous execution method through a common interface. The agent runtime validates arguments and approval before emitting the running event. Terminal results distinguish failure, cancellation, timeout, denial and unknown outcomes; a nonzero shell exit is a failure. Embedding frontends can use before/after hooks for approval, auditing, or result transformation.
 
@@ -295,6 +316,8 @@ Memories are isolated by user and project. Forget and clear operations append to
 ## Sessions and configuration
 
 Both desktop and terminal clients show cache hit rate, current context usage/capacity, cumulative input/output tokens and estimated cost. Text print mode writes a usage summary to stderr; JSON output stays machine-readable. Missing cache data shows `—`, and estimated context values are marked. See [usage metrics](docs/specs/usage-metrics.md) for calculation and recovery behavior.
+
+In the desktop footer, **用量分析** opens an on-demand analysis drawer with per-request token and cost charts, input/cache composition, and paginated request details for the active branch.
 
 The default data directory is `~/.coding-agent`. Override it with `CODING_AGENT_HOME`:
 
@@ -392,8 +415,10 @@ uv build --all-packages
 ```powershell
 cd apps/desktop
 pnpm install
+pnpm test
 pnpm typecheck
 pnpm build
+pnpm test:vision
 ```
 
 ## Security boundary

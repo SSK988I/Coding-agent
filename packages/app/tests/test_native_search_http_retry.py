@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import json
 
 import httpx
@@ -47,7 +48,7 @@ def successful_response():
         "type": "response.completed", "sequence_number": 1,
         "response": {
             "id": "local-response", "object": "response", "created_at": 0,
-            "model": "deepseek-flash", "status": "completed",
+            "model": "deepseek-v4-pro", "status": "completed",
             "output": [{
                 "type": "message", "id": "local-message", "role": "assistant", "status": "completed",
                 "content": [{"type": "output_text", "text": "done", "annotations": []}],
@@ -63,10 +64,10 @@ def successful_response():
 @pytest.mark.parametrize("failure", ["503", "429", "timeout"])
 @pytest.mark.parametrize("core_retries", [0, 1])
 @pytest.mark.parametrize("permission", ["full_access", "ask"])
-def test_real_sdk_retry_cannot_keep_native_search_after_parent_enters_plan(tmp_path, mock_http, failure, core_retries, permission):
+def test_real_sdk_retry_cannot_keep_native_search_after_parent_awaits_plan_confirmation(tmp_path, mock_http, failure, core_retries, permission):
     async def scenario():
         parent = AgentSession(AgentSessionConfig(
-            cwd=str(tmp_path), model=DEEPSEEK_MODELS["deepseek-flash"],
+            cwd=str(tmp_path), model=DEEPSEEK_MODELS["deepseek-v4-pro"],
             session_manager=SessionManager.create(cwd=str(tmp_path), sessions_dir=tmp_path / "sessions"),
             get_api_key=lambda _provider: "local-test-key", web_search_enabled=True,
             retry_policy=RetryPolicy(max_retries=core_retries, initial_delay=0, max_delay=0),
@@ -82,6 +83,8 @@ def test_real_sdk_retry_cannot_keep_native_search_after_parent_enters_plan(tmp_p
             requests.append((json.loads(request.content), parent.collaboration_mode, request.headers.get("x-stainless-retry-count")))
             if len(requests) == 1:
                 parent.enter_plan_mode()
+                parent._plan_state = replace(parent.plan_state, phase="ready")
+                parent._refresh_collaboration_runtime()
             if len(requests) == 1 or core_retries == 0:
                 return failure_response(request, failure)
             return successful_response()
@@ -131,7 +134,7 @@ def test_deepseek_provider_never_enables_sdk_retries_from_stream_options(mock_ht
             return failure_response(request, failure)
         clients = mock_http(handle)
         event_stream = stream(
-            DEEPSEEK_MODELS["deepseek-flash"],
+            DEEPSEEK_MODELS["deepseek-v4-pro"],
             Context(messages=[UserMessage(content="research")]),
             {"api_key": "local-test-key", "web_search": True, "max_retries": 9},
         )

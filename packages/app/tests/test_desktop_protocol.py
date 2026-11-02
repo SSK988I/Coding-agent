@@ -451,6 +451,7 @@ def test_session_snapshot_includes_authoritative_plan_state() -> None:
     runtime = DesktopRuntime(lambda _event: None)
     runtime._session = SimpleNamespace(
         collaboration_mode="plan",
+        model=Model(id="snapshot-test", provider="test", cost=ModelCost(0, 0, 0, 0)),
         plan_state=SimpleNamespace(to_payload=lambda: state_payload),
         session_manager=SimpleNamespace(header=SimpleNamespace(id="session-plan")),
         state=SimpleNamespace(messages=[]),

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+from io import BytesIO
+import json
 import sys
 from types import SimpleNamespace
 
@@ -22,7 +25,7 @@ from agent_llm.providers.deepseek_models import DEEPSEEK_MODELS
 
 
 def test_build_params_exposes_native_search_and_responses_function_tools() -> None:
-    model = DEEPSEEK_MODELS["deepseek-flash"]
+    model = DEEPSEEK_MODELS["deepseek-v4-pro"]
     context = Context(
         system_prompt="Be useful",
         messages=[UserMessage(content="latest Python release")],
@@ -34,7 +37,7 @@ def test_build_params_exposes_native_search_and_responses_function_tools() -> No
     )
     params = build_params(model, context, {"api_key": "x", "web_search": True})
 
-    assert params["model"] == "deepseek-flash"
+    assert params["model"] == "deepseek-v4-pro"
     assert params["instructions"] == "Be useful"
     assert params["reasoning"] == {"effort": "none"}
     assert params["tools"][0] == {
@@ -45,6 +48,15 @@ def test_build_params_exposes_native_search_and_responses_function_tools() -> No
         "strict": False,
     }
     assert params["tools"][1] == {"type": "web_search"}
+
+
+def test_flash_never_sends_ignored_native_search_and_preserves_function_search() -> None:
+    params = build_params(DEEPSEEK_MODELS["deepseek-flash"], Context(
+        tools=[Tool(name="web_search", description="Search", parameters={"type": "object"})],
+    ), {"web_search": True})
+    assert len(params["tools"]) == 1
+    assert params["tools"][0]["type"] == "function"
+    assert params["tools"][0]["name"] == "web_search"
 
 
 @pytest.mark.parametrize(
@@ -108,6 +120,60 @@ def test_convert_input_replays_provider_items_and_function_results() -> None:
     }
 
 
+@pytest.mark.parametrize("include_text", [False, True])
+def test_tool_images_are_preserved_as_responses_content_parts(include_text: bool) -> None:
+    content: list[TextContent | ImageContent] = [TextContent(text="local screenshot")] if include_text else []
+    content.append(ImageContent(data="aW1hZ2U=", mime_type="image/png"))
+    items = convert_input(Context(messages=[ToolResultMessage(
+        tool_call_id="view-1", tool_name="view_image", content=content,
+    )]))
+    output = []
+    if include_text:
+        output.append({"type": "input_text", "text": "local screenshot"})
+    output.append({
+        "type": "input_image", "detail": "auto", "image_url": "data:image/png;base64,aW1hZ2U=",
+    })
+    assert items == [{"type": "function_call_output", "call_id": "view-1", "output": output}]
+
+
+def test_empty_tool_result_keeps_legacy_text_fallback() -> None:
+    items = convert_input(Context(messages=[ToolResultMessage(
+        tool_call_id="empty-1", tool_name="read", content=[],
+    )]))
+    assert items == [{"type": "function_call_output", "call_id": "empty-1", "output": "(no output)"}]
+
+
+def test_image_request_budget_checks_the_complete_provider_payload(monkeypatch) -> None:
+    captured = []
+    monkeypatch.setattr(
+        "agent_llm.api.deepseek_responses.validate_image_request_size", captured.append,
+    )
+    params = build_params(DEEPSEEK_MODELS["deepseek-flash"], Context(
+        system_prompt="system instructions",
+        messages=[ToolResultMessage(
+            tool_call_id="image-1", tool_name="view_image",
+            content=[ImageContent(data="aW1hZ2U=", mime_type="image/png")],
+        )],
+        tools=[Tool(name="view_image", description="View", parameters={"type": "object"})],
+    ), {"reasoning": "high", "web_search": True})
+    assert captured == [params]
+    assert captured[0]["instructions"] == "system instructions"
+    assert captured[0]["reasoning"] == {"effort": "high"}
+    assert captured[0]["tools"][-1]["name"] == "view_image"
+    assert not any(tool["type"] == "web_search" for tool in captured[0]["tools"])
+
+
+def test_image_request_budget_rejection_propagates_before_sending(monkeypatch) -> None:
+    def reject(_params):
+        raise ValueError("Image request too large")
+
+    monkeypatch.setattr("agent_llm.api.deepseek_responses.validate_image_request_size", reject)
+    with pytest.raises(ValueError, match="Image request too large"):
+        build_params(DEEPSEEK_MODELS["deepseek-flash"], Context(messages=[UserMessage(content=[
+            ImageContent(data="aW1hZ2U=", mime_type="image/png"),
+        ])]))
+
+
 class _Dumpable(SimpleNamespace):
     def model_dump(self, *, exclude_none: bool = False):
         del exclude_none
@@ -158,7 +224,7 @@ def test_stream_maps_text_citations_usage_and_native_search_history(monkeypatch)
     )
     response = SimpleNamespace(
         id="resp-1",
-        model="deepseek-flash",
+        model="deepseek-v4-pro",
         usage=usage,
         output=[search_item, message_item],
     )
@@ -188,7 +254,7 @@ def test_stream_maps_text_citations_usage_and_native_search_history(monkeypatch)
 
     async def scenario():
         event_stream = stream(
-            DEEPSEEK_MODELS["deepseek-flash"],
+            DEEPSEEK_MODELS["deepseek-v4-pro"],
             Context(messages=[UserMessage(content="what is current?")]),
             {"api_key": "secret", "web_search": True},
         )
@@ -202,8 +268,68 @@ def test_stream_maps_text_citations_usage_and_native_search_history(monkeypatch)
     assert result.response_id == "resp-1"
     assert result.usage.input == 10
     assert result.usage.cache_read == 2
-    assert result.usage.cost.total == pytest.approx((10 * 0.3 + 2 * 0.006 + 8 * 1.2) / 1_000_000)
+    assert result.usage.cost.total == pytest.approx((10 * 1.32 + 2 * 0.044 + 8 * 3.96) / 1_000_000)
     assert result.provider_data["response_items"][0]["type"] == "web_search_call"
     assert captured["tools"] == [{"type": "web_search"}]
-    assert captured["model"] == "deepseek-flash"
+    assert captured["model"] == "deepseek-v4-pro"
     assert captured["client"]["max_retries"] == 0
+
+
+def test_real_sdk_serializes_tool_image_pixels_in_responses_request(monkeypatch) -> None:
+    """Exercise SDK JSON serialization, not just the provider conversion helper."""
+    import httpx
+    import openai
+    from PIL import Image
+
+    image_buffer = BytesIO()
+    Image.new("RGB", (3, 2), "blue").save(image_buffer, format="PNG")
+    image_data = base64.b64encode(image_buffer.getvalue()).decode("ascii")
+    requests = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        event = {"type": "response.completed", "response": {
+            "id": "response-vision", "object": "response", "created_at": 0,
+            "model": "deepseek-flash", "status": "completed", "output": [{
+                "type": "message", "id": "message-vision", "role": "assistant",
+                "status": "completed", "content": [{
+                    "type": "output_text", "text": "A blue rectangle.", "annotations": [],
+                }],
+            }], "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+        }}
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"},
+            content=f"data: {json.dumps(event)}\n\n".encode(),
+        )
+
+    real_client = openai.AsyncOpenAI
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http_client:
+            monkeypatch.setattr(openai, "AsyncOpenAI", lambda **kwargs: real_client(
+                **kwargs, http_client=http_client,
+            ))
+            event_stream = stream(DEEPSEEK_MODELS["deepseek-flash"], Context(messages=[
+                UserMessage(content="View image.png"),
+                AssistantMessage(content=[ToolCall(
+                    id="view-1", name="view_image", arguments={"path": "image.png"},
+                )]),
+                ToolResultMessage(tool_call_id="view-1", tool_name="view_image", content=[
+                    TextContent(text="Image: image.png"),
+                    ImageContent(data=image_data, mime_type="image/png"),
+                ]),
+            ]), {"api_key": "mock-key"})
+            events = [event async for event in event_stream]
+            return events, await event_stream.result()
+
+    events, result = asyncio.run(scenario())
+    assert events[-1]["type"] == "done"
+    assert isinstance(result.content[0], TextContent)
+    assert result.content[0].text == "A blue rectangle."
+    assert len(requests) == 1
+    assert requests[0]["input"][-1] == {
+        "type": "function_call_output", "call_id": "view-1", "output": [
+            {"type": "input_text", "text": "Image: image.png"},
+            {"type": "input_image", "detail": "auto", "image_url": f"data:image/png;base64,{image_data}"},
+        ],
+    }

@@ -37,6 +37,7 @@ from agent_core.tools.grep import GrepTool
 from agent_core.tools.git import GitDiffTool, GitLogTool, GitShowTool, GitStatusTool
 from agent_core.tools.ls import LsTool
 from agent_core.tools.read import ReadTool
+from agent_core.tools.view_image import ViewImageTool
 from agent_core.tools.write import WriteTool
 from agent_core.session import (
     CompactionSettings,
@@ -70,6 +71,7 @@ __all__ = [
     "AfterToolCallContext",
     "AfterToolCallResult",
     "ReadTool",
+    "ViewImageTool",
     "WriteTool",
     "BashTool",
     "BashRawResult",

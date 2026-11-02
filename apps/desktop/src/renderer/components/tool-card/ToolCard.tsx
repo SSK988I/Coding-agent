@@ -7,6 +7,8 @@ import {
 
 import "./ToolCard.css";
 import type { ToolDisplayStatus } from "../../../shared/toolStatus";
+import type { ImageAttachmentPayload } from "../../../shared/types";
+import { MessageImages } from "../../attachments/ImageAttachmentPicker";
 
 export type ToolCardStatus = ToolDisplayStatus;
 export type ToolCategory = "shell" | "read" | "write" | "search" | "generic";
@@ -112,7 +114,7 @@ const SHELL_ALIASES = new Set([
   "run_command",
   "shell_command",
 ]);
-const READ_ALIASES = new Set(["read", "read_file", "file_read"]);
+const READ_ALIASES = new Set(["read", "read_file", "file_read", "view_image"]);
 const WRITE_ALIASES = new Set([
   "write",
   "edit",
@@ -212,12 +214,19 @@ function textContent(value: unknown): string {
     .join("\n");
 }
 
+function imageContentBlocks(value: unknown): Record<string, unknown>[] {
+  if (!isRecord(value) || !Array.isArray(value.content)) return [];
+  return value.content.filter((item): item is Record<string, unknown> => isRecord(item) && item.type === "image");
+}
+
 export function formatToolOutput(value: unknown): string {
   if (value === undefined || value === null) return "";
   if (typeof value === "string") return value;
 
   const content = textContent(value);
   if (content) return content;
+  const imageCount = imageContentBlocks(value).length;
+  if (imageCount > 0) return `已返回 ${imageCount} 张图片。`;
 
   if (isRecord(value)) {
     const streams = ["output", "stdout", "stderr"]
@@ -481,6 +490,29 @@ function ReadToolRenderer({ tool, outputLimit }: ToolRendererProps) {
   );
 }
 
+function ImageToolRenderer({ tool, outputLimit }: ToolRendererProps) {
+  const path = toolPath(tool);
+  const blocks = imageContentBlocks(tool.result);
+  const images: ImageAttachmentPayload[] = blocks.flatMap((block) => (
+    typeof block.data === "string" && typeof block.mime_type === "string"
+      ? [{ data: block.data, mime_type: block.mime_type }] : []
+  ));
+  // Image bytes belong only in the validated img source, never a JSON dump.
+  const text = typeof tool.result === "string" ? tool.result : textContent(tool.result);
+  return (
+    <div className="tool-card-view__body">
+      <div className="tool-card-view__resource-row">
+        <span>图片</span>
+        <code title={path}>{path ?? "未知路径"}</code>
+      </div>
+      {blocks.length > 0 && <p>已返回 {blocks.length} 张图片。</p>}
+      {images.length > 0 && <MessageImages images={images} />}
+      {text && <OutputBlock value={text} limit={outputLimit} />}
+      {!text && blocks.length === 0 && <div className="tool-card-view__empty">等待图片内容…</div>}
+    </div>
+  );
+}
+
 function DiffView({ preview }: { preview: DiffPreview }) {
   const lines = useMemo(() => parseUnifiedDiff(preview.text), [preview.text]);
   return (
@@ -551,6 +583,13 @@ function GenericToolRenderer({ tool, outputLimit }: ToolRendererProps) {
 }
 
 export const BUILTIN_TOOL_RENDERERS: readonly ToolRendererDefinition[] = [
+  {
+    id: "image",
+    category: "read",
+    matches: (name) => normalizeToolName(name) === "view_image",
+    component: ImageToolRenderer,
+    priority: 110,
+  },
   {
     id: "shell",
     category: "shell",

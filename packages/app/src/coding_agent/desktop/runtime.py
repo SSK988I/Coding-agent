@@ -11,7 +11,10 @@ import uuid
 
 from agent_core import BeforeToolCallContext, BeforeToolCallResult, SessionManager
 from agent_core.session.ids import is_valid_session_id
-from agent_llm import ThinkingLevel, create_models
+from agent_core.session.types import SessionMessageEntry
+from agent_llm import ImageContent, TextContent, ThinkingLevel, UserMessage, create_models
+from agent_llm.image_utils import ImageInputError, validate_image_messages
+from agent_llm.providers.deepseek_models import supports_native_web_search
 
 from coding_agent.cli.main import _resolve_api_key_for
 from coding_agent.core.agent_session import AgentSession, AgentSessionConfig
@@ -25,6 +28,10 @@ from coding_agent.core.settings import SettingsManager
 from coding_agent.core.slash_commands import get_active_commands
 from coding_agent.core.subagents import SubagentError
 from coding_agent.desktop.protocol import PROTOCOL_VERSION, RpcError, to_jsonable
+from coding_agent.desktop.attachments import (
+    StoredAttachments, parse_file_attachments, parse_image_attachments,
+    store_file_attachments, validate_attachment_budget,
+)
 from coding_agent.desktop.workbench import WorkspaceWorkbench
 from coding_agent.desktop.side_conversations import SideConversations
 from coding_agent.core.permissions import (
@@ -46,6 +53,65 @@ _DESKTOP_COMMANDS = {
     "execute-plan": ("执行计划", "执行最新的 Plan revision"),
     "memory": ("长期记忆", "查看和管理长期偏好、事实与项目经验"),
 }
+
+
+class _RunAttachmentPersistence:
+    """Keep this run's attachment messages until their entries are durable."""
+
+    def __init__(self, session: AgentSession, *, with_files: bool = False) -> None:
+        self._session = session
+        self._code = "ATTACHMENT_PERSISTENCE_FAILED" if with_files else "IMAGE_PERSISTENCE_FAILED"
+        self._messages: dict[int, Any] = {}
+        self._initial_messages = {id(message) for message in getattr(getattr(session, "state", None), "messages", [])}
+        self._initial_entries = {
+            entry.id for entry in getattr(getattr(session, "session_manager", None), "entries", [])
+        }
+        subscribe = getattr(session, "on_event", None)
+        self._unsubscribe = cast(Callable[[], None], subscribe(self._on_event)) if callable(subscribe) else None
+
+    def track(self, message: Any) -> None:
+        content = getattr(message, "content", None)
+        if (
+            getattr(message, "role", None) in {"user", "toolResult"}
+            and (getattr(message, "attachments", None)
+                 or (isinstance(content, list) and any(isinstance(block, ImageContent) for block in content)))
+        ):
+            self._messages[id(message)] = message
+
+    def _on_event(self, event: Any) -> None:
+        if not isinstance(event, dict):
+            return
+        if event.get("type") == "message_end":
+            self.track(event.get("message"))
+        elif event.get("type") == "turn_end":
+            for result in event.get("tool_results", []):
+                self.track(result)
+
+    def validate(self) -> None:
+        for message in getattr(getattr(self._session, "state", None), "messages", []):
+            if id(message) not in self._initial_messages:
+                self.track(message)
+        if not self._messages:
+            return
+        persisted_messages = {
+            id(getattr(entry, "message", None))
+            for entry in self._session.session_manager.entries if entry.id not in self._initial_entries
+        }
+        if not self._messages.keys() <= persisted_messages:
+            raise RpcError(
+                self._code,
+                "本轮附件消息未成功保存到会话记录，请检查磁盘空间和写入权限后重试；未自动重新请求模型。",
+            )
+        # Subscribers can swallow append errors, and compaction can replace
+        # live history. Check every retained message before forcing durability.
+        try:
+            self._session.session_manager.flush()
+        except OSError as exc:
+            raise RpcError(self._code, f"附件会话保存失败，请检查磁盘空间和写入权限后重试：{exc}") from exc
+
+    def close(self) -> None:
+        if self._unsubscribe is not None:
+            self._unsubscribe()
 
 
 class DesktopRuntime:
@@ -86,6 +152,7 @@ class DesktopRuntime:
             "session.archive": self._session_archive,
             "session.unarchive": self._session_unarchive,
             "session.snapshot": self._session_snapshot,
+            "session.usage": self._session_usage,
             "session.clear": self._session_clear,
             "command.list": self._command_list,
             "model.list": self._model_list,
@@ -259,6 +326,13 @@ class DesktopRuntime:
             return scope
         if params.get("sessionId") != workbench.session_id or params.get("workspacePath") != str(workbench.workspace):
             raise RpcError("STALE_WORKSPACE", "工作区或会话已经切换，请重新打开工具")
+        if method == "workbench.changes" and "runId" in params:
+            if params.get("source") != "turn":
+                raise RpcError("INVALID_PARAMS", "只有按轮次查看变更时可指定运行 ID")
+            review = await asyncio.to_thread(workbench.turn_review, params["runId"])
+            if review["entryId"] not in {entry.id for entry in session.session_manager.get_branch()}:
+                raise RpcError("TURN_NOT_IN_BRANCH", "该轮变更不属于当前会话分支")
+            return {**scope, **review}
         readers = {"workbench.files.list": workbench.list_files, "workbench.files.read": workbench.read_file, "workbench.changes": workbench.changes}
         if method in readers:
             result = await asyncio.to_thread(readers[method], params)
@@ -280,12 +354,91 @@ class DesktopRuntime:
             return side.resolve(params.get("conversationId"), params.get("approvalId"), params.get("allowed"))
         raise RpcError("METHOD_NOT_FOUND", f"未知工具栏方法：{method}")
 
-    async def _capture_workbench(self) -> None:
-        if self._workbench is not None:
+    async def _capture_workbench(self, session: AgentSession, run_id: str) -> tuple[WorkspaceWorkbench, dict[str, Any], set[str]] | None:
+        workbench = self._workbench
+        if workbench is not None and workbench.session_id == session.session_manager.header.id:
             try:
-                await self._workbench.capture()
+                initial_entries = {entry.id for entry in session.session_manager.entries}
+                return workbench, await workbench.capture(), initial_entries
             except Exception as exc:  # noqa: BLE001 - unavailable evidence must not stop the Agent
                 self._publish("workbench.baselineFailed", {"message": str(exc)})
+                self._publish("workbench.turnFailed", {"message": str(exc)}, run_id=run_id)
+        return None
+
+    @staticmethod
+    def _turn_message_indices(session: AgentSession) -> dict[str, int]:
+        branch = [entry for entry in session.session_manager.get_branch() if isinstance(entry, SessionMessageEntry)]
+        cursor = len(branch) - 1
+        result = {}
+        # Match the effective transcript backwards. This handles compaction and
+        # repeated equal messages/timestamps without assigning an old card to a
+        # newer message or displaying a card whose message is no longer shown.
+        for index in range(len(session.state.messages) - 1, -1, -1):
+            message = session.state.messages[index]
+            match = next((position for position in range(cursor, -1, -1) if branch[position].message is message), None)
+            if match is None:
+                match = next((position for position in range(cursor, -1, -1) if branch[position].message == message), None)
+            if match is not None:
+                result[branch[match].id] = index
+                cursor = match - 1
+        return result
+
+    def _turn_changes_payload(self, session: AgentSession) -> dict[str, Any]:
+        if self._workbench is None or self._workbench.session_id != session.session_manager.header.id:
+            return {"turnChanges": []}
+        try:
+            indices = self._turn_message_indices(session)
+            summaries = self._workbench.turn_summaries()
+            return {"turnChanges": [{**summary, "afterMessageIndex": indices[summary["entryId"]]}
+                                    for summary in summaries if summary.get("entryId") in indices]}
+        except Exception as exc:  # noqa: BLE001 - a damaged review must not hide the conversation
+            return {"turnChanges": [], "turnChangesError": str(exc)}
+
+    async def _finish_workbench_turn(
+        self, session: AgentSession, run_id: str,
+        captured: tuple[WorkspaceWorkbench, dict[str, Any], set[str]] | None,
+    ) -> None:
+        if captured is None:
+            return
+        workbench, baseline, initial_entries = captured
+        try:
+            anchor = next((entry for entry in reversed(session.session_manager.get_branch())
+                           if isinstance(entry, SessionMessageEntry) and entry.id not in initial_entries), None)
+            if anchor is None:
+                return
+            session.session_manager.flush()
+            summary = await workbench.finish_turn(run_id, baseline, anchor.id)
+            if summary is not None:
+                index = self._turn_message_indices(session).get(anchor.id)
+                if index is not None:
+                    summary = {**summary, "afterMessageIndex": index}
+                self._publish("workbench.turnChanged", {"change": summary}, run_id=run_id)
+        except Exception as exc:  # noqa: BLE001 - unavailable evidence must not change task outcome
+            self._publish("workbench.turnFailed", {"message": str(exc)}, run_id=run_id)
+
+    async def _finalize_run(
+        self, session: AgentSession, run_id: str,
+        captured: tuple[WorkspaceWorkbench, dict[str, Any], set[str]] | None,
+        terminal: tuple[str, dict[str, Any]] | None,
+    ) -> None:
+        # Cancellation has already stopped the Agent. Finish its bounded review
+        # before acknowledging shutdown or allowing navigation to another scope.
+        finishing = asyncio.create_task(self._finish_workbench_turn(session, run_id, captured))
+        try:
+            while True:
+                try:
+                    await asyncio.shield(finishing)
+                    break
+                except asyncio.CancelledError:
+                    if finishing.cancelled():
+                        self._publish("workbench.turnFailed", {"message": "本轮变更记录已中断"}, run_id=run_id)
+                        break
+        finally:
+            if terminal is not None:
+                self._publish(terminal[0], terminal[1], run_id=run_id)
+            if self._run_id == run_id:
+                self._run_id = None
+                self._run_task = None
 
     def _select_session_manager(
         self,
@@ -386,7 +539,19 @@ class DesktopRuntime:
             "planState": session.plan_state.to_payload(),
             "subagents": self._subagent_payload(session),
             "permissionMode": self._permission_mode,
+            "webSearch": self._web_search_payload(session),
+            **self._turn_changes_payload(session),
         }
+
+    async def _session_usage(self, params: dict[str, Any]) -> dict[str, Any]:
+        session_id = params.get("sessionId")
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise RpcError("INVALID_PARAMS", "session.usage 需要非空 sessionId")
+        session = self._require_session()
+        current_id = session.session_manager.header.id
+        if session_id != current_id:
+            raise RpcError("STALE_SESSION", "会话已经切换，请重新打开用量分析")
+        return {"sessionId": current_id, **to_jsonable(session.get_usage_analysis())}
 
     async def _session_clear(self, params: dict[str, Any]) -> dict[str, Any]:
         del params
@@ -427,6 +592,7 @@ class DesktopRuntime:
                 "id": model.id,
                 "name": model.name or model.id,
                 "provider": model.provider,
+                "input": list(model.input),
                 "current": (
                     model.id == session.model.id
                     and model.provider == session.model.provider
@@ -456,23 +622,63 @@ class DesktopRuntime:
             "id": chosen.id,
             "name": chosen.name or chosen.id,
             "provider": chosen.provider,
+            "input": list(chosen.input),
         }
         self._publish_stats()
+        self._publish("webSearch.changed", self._web_search_payload(self._require_session()))
         self._publish("model.changed", payload)
         return payload
 
     async def _run_start(self, params: dict[str, Any]) -> dict[str, Any]:
         session = self._require_session()
         text = params.get("text")
-        if not isinstance(text, str) or not text.strip():
-            raise RpcError("INVALID_PARAMS", "run.start 需要非空 text")
+        if not isinstance(text, str):
+            raise RpcError("INVALID_PARAMS", "run.start 需要字符串 text")
+        self._ensure_no_active_run("当前已有任务正在运行")
+        images = parse_image_attachments(params.get("images", []))
+        files = parse_file_attachments(params.get("files", []))
+        validate_attachment_budget(files, images)
+        if not text.strip() and not images and not files:
+            raise RpcError("INVALID_PARAMS", "run.start 需要文字或文件附件")
+        if images and "image" not in session.model.input:
+            raise RpcError("IMAGE_INPUT_UNSUPPORTED", "当前模型不支持图片输入，请切换视觉模型")
         if text.lstrip().startswith("/"):
             raise RpcError("SLASH_COMMAND", "斜杠命令需要由桌面端处理，不能作为提示词发送给模型")
-        self._ensure_no_active_run("当前已有任务正在运行")
+        # Reject invalid/oversized history synchronously so the renderer retains
+        # the unsent draft. Core repeats this gate at each actual model request.
+        history = getattr(getattr(session, "state", None), "messages", [])
+        pending = UserMessage(content=[*([TextContent(text=text)] if text.strip() else []), *images])
+        try:
+            validate_image_messages([*history, pending], session.model)
+        except ImageInputError as exc:
+            raise RpcError(exc.code, str(exc)) from exc
         run_id = uuid.uuid4().hex
+        stored = store_file_attachments(files, get_agent_dir() / "attachments", session.session_manager.header.id)
         self._run_id = run_id
-        self._run_task = asyncio.create_task(self._drive_run(session, text, run_id))
+        self._run_task = asyncio.create_task(self._drive_run(session, text, run_id, images=images, files=stored))
+        if stored is not None:
+            # A task cancelled before its coroutine first runs never enters its
+            # finally block. Release unreferenced copies at the task boundary.
+            self._run_task.add_done_callback(lambda _task: self._cleanup_unused_file_copies(session, stored))
         return {"accepted": True, "runId": run_id}
+
+    @staticmethod
+    def _cleanup_unused_file_copies(session: AgentSession, files: StoredAttachments) -> None:
+        # An early Plan gate can reject before accepting a user message. A saved
+        # or still-live message must retain its copies for restoration/recovery.
+        references = [
+            *getattr(getattr(session, "state", None), "messages", []),
+            *(getattr(entry, "message", None) for entry in session.session_manager.entries),
+        ]
+        kept = any(
+            any(item.get("path") == files.metadata[0]["path"] for item in getattr(message, "attachments", []))
+            for message in references
+        )
+        if not kept:
+            try:
+                files.cleanup()
+            except OSError:
+                pass
 
     async def _mode_enter_plan(self, params: dict[str, Any]) -> dict[str, Any]:
         del params
@@ -506,20 +712,25 @@ class DesktopRuntime:
         self, session: AgentSession, question_id: str, answer: str, run_id: str,
     ) -> None:
         self._publish("run.started", {"planAnswer": True}, run_id=run_id)
+        attachments = _RunAttachmentPersistence(session)
+        captured = None
+        terminal = None
         try:
+            captured = await self._capture_workbench(session, run_id)
             await session.answer_plan_question(question_id, answer)
+            if session.agent.last_run_status != "cancelled":
+                attachments.validate()
         except asyncio.CancelledError:
-            self._publish("run.cancelled", {}, run_id=run_id)
-        except PlanModeError as exc:
-            self._publish("run.failed", {"code": exc.code, "message": str(exc)}, run_id=run_id)
+            terminal = ("run.cancelled", {})
+        except (PlanModeError, RpcError) as exc:
+            terminal = ("run.failed", {"code": exc.code, "message": str(exc)})
         except Exception as exc:  # noqa: BLE001 - runtime boundary
-            self._publish("run.failed", {"message": str(exc)}, run_id=run_id)
+            terminal = ("run.failed", {"message": str(exc)})
         else:
-            self._publish_prompt_outcome(session, run_id)
+            terminal = self._prompt_outcome(session)
         finally:
-            if self._run_id == run_id:
-                self._run_id = None
-                self._run_task = None
+            attachments.close()
+            await self._finalize_run(session, run_id, captured, terminal)
 
     async def _plan_cancel(self, params: dict[str, Any]) -> dict[str, Any]:
         session = self._require_session()
@@ -599,53 +810,83 @@ class DesktopRuntime:
         digest: str, run_id: str,
     ) -> None:
         self._publish("run.started", {"planExecution": True}, run_id=run_id)
+        attachments = _RunAttachmentPersistence(session)
+        captured = None
+        terminal = None
         try:
-            await self._capture_workbench()
-            await session.execute_plan(plan_id, revision, digest, run_id=run_id)
-        except PlanModeError as exc:
-            self._publish("run.failed", {"code": exc.code, "message": str(exc)}, run_id=run_id)
+            captured = await self._capture_workbench(session, run_id)
+            await session.execute_plan(
+                plan_id, revision, digest, run_id=run_id, before_complete=attachments.validate,
+            )
+            if session.plan_state.phase == "failed":
+                attachments.validate()
+        except (PlanModeError, RpcError) as exc:
+            terminal = ("run.failed", {"code": exc.code, "message": str(exc)})
         except asyncio.CancelledError:
-            self._publish("run.cancelled", {}, run_id=run_id)
+            terminal = ("run.cancelled", {})
         except Exception as exc:  # noqa: BLE001 - runtime boundary
-            self._publish("run.failed", {"message": str(exc)}, run_id=run_id)
+            terminal = ("run.failed", {"message": str(exc)})
         else:
             if session.plan_state.phase == "aborted":
-                self._publish("run.cancelled", {}, run_id=run_id)
+                terminal = ("run.cancelled", {})
             elif session.plan_state.phase == "failed":
-                self._publish("run.failed", {"message": "计划执行失败"}, run_id=run_id)
+                terminal = ("run.failed", {"message": "计划执行失败"})
             else:
-                self._publish("run.completed", {"stats": to_jsonable(session.get_stats())}, run_id=run_id)
+                terminal = ("run.completed", {"stats": to_jsonable(session.get_stats())})
         finally:
-            if self._run_id == run_id:
-                self._run_id = None
-                self._run_task = None
+            attachments.close()
+            await self._finalize_run(session, run_id, captured, terminal)
 
-    async def _drive_run(self, session: AgentSession, text: str, run_id: str) -> None:
-        self._publish("run.started", {"text": text}, run_id=run_id)
+    async def _drive_run(
+        self, session: AgentSession, text: str, run_id: str,
+        *, images: list[ImageContent] | None = None, files: StoredAttachments | None = None,
+    ) -> None:
+        images = images or []
+        attachments = _RunAttachmentPersistence(session, with_files=files is not None)
+        captured = None
+        terminal = None
+
+        self._publish("run.started", {
+            "text": text,
+            "images": [{"data": image.data, "mime_type": image.mime_type} for image in images],
+            **({"files": files.metadata} if files is not None else {}),
+        }, run_id=run_id)
         try:
-            await self._capture_workbench()
-            await session.prompt(text)
+            captured = await self._capture_workbench(session, run_id)
+            message = (
+                UserMessage(content=[
+                    *([TextContent(text=text)] if text.strip() else []),
+                    *images,
+                    *(files.content if files is not None else []),
+                ], attachments=files.metadata if files is not None else [])
+                if images or files is not None else text
+            )
+            attachments.track(message)
+            await session.prompt(message)
+            if session.agent.last_run_status != "cancelled":
+                attachments.validate()
         except asyncio.CancelledError:
-            self._publish("run.cancelled", {}, run_id=run_id)
+            terminal = ("run.cancelled", {})
+        except (PlanModeError, RpcError) as exc:
+            terminal = ("run.failed", {"code": exc.code, "message": str(exc)})
         except Exception as exc:  # noqa: BLE001 - runtime boundary
-            self._publish("run.failed", {"message": str(exc)}, run_id=run_id)
+            terminal = ("run.failed", {"message": str(exc)})
         else:
-            self._publish_prompt_outcome(session, run_id)
+            terminal = self._prompt_outcome(session)
         finally:
-            if self._run_id == run_id:
-                self._run_id = None
-                self._run_task = None
+            attachments.close()
+            await self._finalize_run(session, run_id, captured, terminal)
 
-    def _publish_prompt_outcome(self, session: AgentSession, run_id: str) -> None:
+    @staticmethod
+    def _prompt_outcome(session: AgentSession) -> tuple[str, dict[str, Any]]:
         status = session.agent.last_run_status
         if status == "cancelled":
-            self._publish("run.cancelled", {}, run_id=run_id)
+            return "run.cancelled", {}
         elif status == "failed":
-            self._publish("run.failed", {
+            return "run.failed", {
                 "message": session.agent.state.error_message or "模型回合失败",
-            }, run_id=run_id)
-        else:
-            self._publish("run.completed", {"stats": to_jsonable(session.get_stats())}, run_id=run_id)
+            }
+        return "run.completed", {"stats": to_jsonable(session.get_stats())}
 
     async def _run_abort(self, params: dict[str, Any]) -> dict[str, Any]:
         del params
@@ -724,6 +965,9 @@ class DesktopRuntime:
         return payload
 
     async def _before_native_web_search(self, signal: asyncio.Event) -> bool:
+        session = self._session
+        if session is None or signal.is_set() or not session.web_search_available:
+            return False
         if self._permission_mode != "ask":
             return True
         run_id = self._run_id
@@ -735,6 +979,10 @@ class DesktopRuntime:
         allowed = decision is None
         if signal.is_set():
             raise asyncio.CancelledError
+        # Approval cleanup awaits. A stale approval cannot authorize a new
+        # session/run, a submitted Plan, or a search switch disabled meanwhile.
+        if self._session is not session or self._run_id != run_id or not session.web_search_available:
+            return False
         self._native_search_decision = (run_id, allowed)
         return allowed
 
@@ -977,14 +1225,22 @@ class DesktopRuntime:
 
     async def _web_search_status(self, params: dict[str, Any]) -> dict[str, Any]:
         del params
-        session = self._require_session()
-        native = bool(getattr(session, "native_web_search_enabled", False))
-        credential_provider = session.model.provider if native else "zai-coding-cn"
+        return self._web_search_payload(self._require_session())
+
+    def _web_search_payload(self, session: Any) -> dict[str, Any]:
+        # Availability is a capability/credential check, not the current enabled
+        # state. Otherwise disabling Pro search could make it impossible to enable.
+        native = supports_native_web_search(session.model)
+        credential_provider = getattr(
+            session, "web_search_credential_provider", session.model.provider if native else "zai-coding-cn",
+        )
         configured = bool(_resolve_api_key_for(credential_provider))
-        enabled = session.web_search_enabled
+        enabled = bool(getattr(session, "web_search_enabled", False))
+        session_config = getattr(session, "_config", None)
         return {
             "enabled": enabled,
-            "backend": session.web_search_backend_label,
+            "backend": getattr(session, "web_search_backend_label",
+                               getattr(session_config, "web_search_backend_name", "zhipu-mcp")),
             "available": configured,
             "status": "idle" if enabled and configured else "disabled" if not enabled else "unavailable",
             "errorCode": None if configured else "WEB_SEARCH_NOT_CONFIGURED",
@@ -1121,26 +1377,6 @@ class DesktopRuntime:
             "userId": getattr(getattr(session, "memory_identity", None), "user_id", None),
             "projectId": getattr(getattr(session, "memory_identity", None), "project_id", None),
         }
-        native_web_search = bool(getattr(session, "native_web_search_enabled", False))
-        credential_provider = session.model.provider if native_web_search else "zai-coding-cn"
-        web_search_available = bool(_resolve_api_key_for(credential_provider))
-        web_search_enabled = bool(getattr(session, "web_search_enabled", False))
-        session_config = getattr(session, "_config", None)
-        web_search = {
-            "enabled": web_search_enabled,
-            "backend": getattr(
-                session,
-                "web_search_backend_label",
-                getattr(session_config, "web_search_backend_name", "zhipu-mcp"),
-            ),
-            "available": web_search_available,
-            "status": (
-                "idle" if web_search_enabled and web_search_available
-                else "disabled" if not web_search_enabled
-                else "unavailable"
-            ),
-            "errorCode": None if web_search_available else "WEB_SEARCH_NOT_CONFIGURED",
-        }
         return {
             "path": str(self._require_workspace()),
             "sessionId": session.session_manager.header.id,
@@ -1153,9 +1389,10 @@ class DesktopRuntime:
             "planState": session.plan_state.to_payload(),
             "memory": memory,
             "subagents": self._subagent_payload(session),
-            "webSearch": web_search,
+            "webSearch": self._web_search_payload(session),
             "permissionMode": self._permission_mode,
             "stats": to_jsonable(session.get_stats()),
+            **self._turn_changes_payload(session),
         }
 
     async def _workspace_payload_with_memory(self) -> dict[str, Any]:

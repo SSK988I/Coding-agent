@@ -13,7 +13,7 @@ const stats = (cacheHit = 90, contextPercent = 82) => ({
 });
 const workspace = {
   path: "G:\\offline-usage-fixture", sessionId: "usage-1", permissionMode: "ask",
-  model: { id: "offline", name: "Offline metrics fixture", provider: "fixture" },
+  model: { id: "offline", name: "Offline metrics fixture", provider: "fixture", input: ["text"] },
   thinkingLevel: null, tools: [], messages: [], collaborationMode: "default",
   planState: { phase: "idle", activePlanId: null, latestRevision: null, pendingQuestion: null },
   memory: { enabled: false, userId: null, projectId: null }, stats: stats(),

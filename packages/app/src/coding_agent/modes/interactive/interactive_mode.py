@@ -193,14 +193,21 @@ class InteractiveMode:
         )
 
     async def _before_native_web_search(self, signal: asyncio.Event) -> bool:
+        session = self._session
+        if signal.is_set() or not session.web_search_available:
+            return False
         if self._prior_native_search_hook is not None and not await self._prior_native_search_hook(signal):
             return False
-        if self._session.permission_mode != "ask":
+        if self._session is not session or signal.is_set() or not session.web_search_available:
+            return False
+        if session.permission_mode != "ask":
             return True
-        run_signal = self._session.agent.signal or signal
+        run_signal = session.agent.signal or signal
         if self._permission_native_decision is not None and self._permission_native_decision[0] is run_signal:
             return self._permission_native_decision[1]
         allowed = await self._ask_permission("联网审批", "是否允许本次任务使用联网搜索？拒绝后继续处理已有内容。", signal)
+        if self._session is not session or signal.is_set() or not session.web_search_available:
+            return False
         self._permission_native_decision = (run_signal, allowed)
         return allowed
 

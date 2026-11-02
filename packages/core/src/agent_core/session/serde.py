@@ -133,6 +133,23 @@ def _decode_user_content(content: Any) -> Any:
     return content
 
 
+def _user_attachments(raw: Any) -> list[dict[str, Any]]:
+    """Keep display-only file metadata bounded to its known scalar fields."""
+    if not isinstance(raw, list):
+        return []
+    result = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        if not all(isinstance(item.get(key), str) and item[key] for key in ("name", "mime_type", "path")):
+            continue
+        size = item.get("size")
+        if isinstance(size, bool) or not isinstance(size, int) or not 0 <= size <= 2**53 - 1:
+            continue
+        result.append({key: item[key] for key in ("name", "mime_type", "size", "path")})
+    return result
+
+
 # ─── messages ───────────────────────────────────────
 
 def message_to_dict(message: Message) -> dict:
@@ -147,6 +164,7 @@ def message_to_dict(message: Message) -> dict:
             "role": "user",
             "content": _encode_user_content(message.content),
             "timestamp": getattr(message, "timestamp", None),
+            **({"attachments": _user_attachments(message.attachments)} if message.attachments else {}),
         }
     if role == "assistant":
         assert isinstance(message, AssistantMessage)
@@ -189,6 +207,7 @@ def dict_to_message(d: dict) -> Message:
         return UserMessage(
             content=_decode_user_content(d.get("content", "")),
             timestamp=float(d.get("timestamp") or 0.0),
+            attachments=_user_attachments(d.get("attachments")),
         )
     if role == "assistant":
         return AssistantMessage(

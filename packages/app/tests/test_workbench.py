@@ -11,6 +11,7 @@ import subprocess
 import pytest
 from agent_core import AgentContext, BeforeToolCallContext, SessionManager
 from agent_llm import AssistantMessage, AssistantMessageEventStream, Model, ModelCost, TextContent, ToolCall, UserMessage
+from agent_llm.providers.deepseek_models import DEEPSEEK_MODELS
 
 from coding_agent.core.agent_session import AgentSession, AgentSessionConfig
 from coding_agent.core.plan_mode import PlanState
@@ -694,11 +695,11 @@ def test_tracked_change_sources_keep_per_file_git_diff(tmp_path, monkeypatch, so
     assert "+staged change\n" in result["files"][0]["diff"]
 
 
-@pytest.mark.parametrize("scenario_name", ["allow", "deny", "plan_before", "plan_during", "stop"])
+@pytest.mark.parametrize("scenario_name", ["allow", "deny", "plan_before", "plan_during", "ready_before", "ready_during", "stop"])
 def test_native_side_search_obeys_own_approval_and_current_parent(tmp_path, monkeypatch, scenario_name):
     async def scenario():
         parent = AgentSession(AgentSessionConfig(
-            cwd=str(tmp_path), model=Model(id="test", provider="deepseek", cost=ModelCost(0, 0, 0, 0)),
+            cwd=str(tmp_path), model=DEEPSEEK_MODELS["deepseek-v4-pro"],
             session_manager=SessionManager.create(cwd=str(tmp_path), sessions_dir=tmp_path / "sessions"),
             web_search_enabled=True,
         ))
@@ -721,8 +722,11 @@ def test_native_side_search_obeys_own_approval_and_current_parent(tmp_path, monk
         try:
             if scenario_name == "plan_before":
                 parent.enter_plan_mode()
+            elif scenario_name == "ready_before":
+                parent._plan_state = PlanState(mode="plan", phase="ready")
+                parent._refresh_collaboration_runtime()
             side.send(identity, "research")
-            if scenario_name != "plan_before":
+            if scenario_name != "ready_before":
                 waiter = asyncio.create_task(waiting.wait())
                 await asyncio.wait({waiter, live.task}, timeout=2, return_when=asyncio.FIRST_COMPLETED)
                 assert waiting.is_set(), f"Native search started without a side approval: {live.status}, {live.error}, provider calls={len(captured)}"
@@ -735,11 +739,14 @@ def test_native_side_search_obeys_own_approval_and_current_parent(tmp_path, monk
                     return
                 if scenario_name == "plan_during":
                     parent.enter_plan_mode()
+                elif scenario_name == "ready_during":
+                    parent._plan_state = PlanState(mode="plan", phase="ready")
+                    parent._refresh_collaboration_runtime()
                 side.resolve(identity, approval["approvalId"], scenario_name != "deny")
             await asyncio.wait_for(live.task, 2)
-            assert bool(captured[0][1].get("web_search")) is (scenario_name == "allow")
+            assert bool(captured[0][1].get("web_search")) is (scenario_name in {"allow", "plan_before", "plan_during"})
             assert not any(tool.name == "web_search" for tool in (captured[0][0].tools or []))
-            if scenario_name == "plan_before":
+            if scenario_name == "ready_before":
                 assert approvals == []
         finally:
             if waiter is not None:
@@ -803,7 +810,7 @@ def test_all_diff_sources_share_utf8_response_budget(tmp_path, monkeypatch, sour
 def test_native_search_approval_is_once_per_side_run_not_shared_with_parent(tmp_path, monkeypatch):
     async def scenario():
         parent = AgentSession(AgentSessionConfig(
-            cwd=str(tmp_path), model=Model(id="test", provider="deepseek", cost=ModelCost(0, 0, 0, 0)),
+            cwd=str(tmp_path), model=DEEPSEEK_MODELS["deepseek-v4-pro"],
             web_search_enabled=True,
         ))
         (tmp_path / "sample.txt").write_text("sample", encoding="utf-8")
@@ -842,11 +849,11 @@ def test_native_search_approval_is_once_per_side_run_not_shared_with_parent(tmp_
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("transition", ["unchanged", "plan", "recovery_error", "tool_removed", "closed", "stop"])
+@pytest.mark.parametrize("transition", ["unchanged", "plan", "awaiting_answer", "ready", "recovery_error", "tool_removed", "closed", "stop"])
 def test_native_side_search_rechecks_parent_on_provider_retry(tmp_path, monkeypatch, transition):
     async def scenario():
         parent = AgentSession(AgentSessionConfig(
-            cwd=str(tmp_path), model=Model(id="test", provider="deepseek", cost=ModelCost(0, 0, 0, 0)),
+            cwd=str(tmp_path), model=DEEPSEEK_MODELS["deepseek-v4-pro"],
             web_search_enabled=True,
             retry_policy=RetryPolicy(max_retries=1, initial_delay=0, max_delay=0),
         ))
@@ -884,6 +891,9 @@ def test_native_side_search_rechecks_parent_on_provider_retry(tmp_path, monkeypa
             retries.append(event)
             if transition == "plan":
                 parent.enter_plan_mode()
+            elif transition in {"awaiting_answer", "ready"}:
+                parent._plan_state = PlanState(mode="plan", phase=transition)
+                parent._refresh_collaboration_runtime()
             elif transition == "recovery_error":
                 parent._plan_state = PlanState(mode="default", phase="recovery_error")
                 parent._refresh_collaboration_runtime()
@@ -906,7 +916,7 @@ def test_native_side_search_rechecks_parent_on_provider_retry(tmp_path, monkeypa
                 assert len(captured) == 1
                 return
             assert len(captured) == 2
-            allowed = transition == "unchanged"
+            allowed = transition in {"unchanged", "plan"}
             assert bool(captured[1][1].get("web_search")) is allowed
             assert checks == [True, allowed], "Every actual Provider attempt must recheck the parent"
             for context, options, _mode in captured:

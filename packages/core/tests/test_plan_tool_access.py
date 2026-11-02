@@ -17,6 +17,7 @@ from agent_core.tools import (
     GrepTool,
     LsTool,
     ReadTool,
+    ViewImageTool,
     WriteTool,
 )
 
@@ -25,6 +26,7 @@ from agent_core.tools import (
     ("tool_type", "expected"),
     [
         (ReadTool, "observe"),
+        (ViewImageTool, "observe"),
         (GrepTool, "observe"),
         (FindTool, "observe"),
         (LsTool, "observe"),

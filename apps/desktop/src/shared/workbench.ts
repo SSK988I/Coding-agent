@@ -4,7 +4,19 @@ export interface WorkbenchScope { workspacePath: string; sessionId: string }
 export type WorkbenchTool = "chat" | "changes" | "terminal" | "browser" | "files";
 export type ChangeSource = "unstaged" | "staged" | "branch" | "session" | "turn";
 export interface ChangedFile { path: string; status: string; additions: number; deletions: number; binary: boolean; diff: string; truncated?: boolean }
+export interface TurnChangesSummary {
+  runId: string;
+  entryId: string;
+  afterMessageIndex: number;
+  timestamp: number;
+  files: Omit<ChangedFile, "diff">[];
+  additions: number;
+  deletions: number;
+  truncated: boolean;
+}
+export interface ChangeReviewRequest { runId: string; path?: string; serial: number }
 export interface ChangesSnapshot extends WorkbenchScope {
+  runId?: string;
   source: ChangeSource; files: ChangedFile[]; additions: number; deletions: number;
   branch: string; branches: string[]; baseRef: string | null; truncated: boolean;
 }
@@ -12,6 +24,7 @@ export interface FileEntry { name: string; path: string; kind: "directory" | "fi
 export interface FileListing extends WorkbenchScope { path: string; entries: FileEntry[]; truncated: boolean }
 export interface FilePreview extends WorkbenchScope { path: string; size: number; mime: string; text: string | null; image: string | null; binary: boolean; truncated: boolean }
 export interface SideConversationSnapshot {
+  title?: string;
   conversationId: string; messages: AgentMessage[]; streaming: string;
   status: "idle" | "running" | "settled" | "failed" | "cancelled" | "uncertain";
   error: string | null; approval: { approvalId: string; toolName: string; args: Record<string, unknown> } | null;

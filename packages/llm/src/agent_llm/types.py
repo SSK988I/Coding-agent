@@ -148,6 +148,10 @@ class UserMessage:
     role: Literal["user"] = "user"
     content: Union[str, list[UserContentBlock]] = ""
     timestamp: float = field(default_factory=_now_ms)
+    # Application display metadata only. Providers receive text/image content;
+    # binary files are referenced by ordinary TextContent blocks, not uploaded
+    # through a provider-specific file API.
+    attachments: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass

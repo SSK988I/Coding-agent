@@ -435,9 +435,15 @@ def main(argv: list[str] | None = None) -> int:
     # returning the launch-time provider's key. The ``args.api_key`` override
     # (if set via --api-key) pins a single key for all providers for this run.
     override_key = args.api_key
+    override_provider = model.provider
 
     def _get_api_key(provider_id: str) -> str | None:
         return _resolve_api_key_for(provider_id, override=override_key)
+
+    def _get_search_api_key(provider_id: str) -> str | None:
+        return _resolve_api_key_for(
+            provider_id, override=override_key if provider_id == override_provider else None,
+        )
 
     # ── Thinking level ───────────────────────────────────────────────────
     reasoning: ThinkingLevel | None = None
@@ -522,9 +528,9 @@ def main(argv: list[str] | None = None) -> int:
         web_search_enabled=(
             args.web_search if args.web_search is not None else settings.web_search_enabled
         ),
-        # --api-key is a model-provider override and must never be forwarded
-        # to a different service. Search always resolves its own Zhipu key.
-        web_search_credential_resolver=lambda provider_id: _resolve_api_key_for(provider_id),
+        # Reuse --api-key for search only when its provider matches the model
+        # selected at launch; fallback services resolve their own credentials.
+        web_search_credential_resolver=_get_search_api_key,
         web_search_backend_name=settings.web_search_backend,
         web_search_max_results=settings.web_search_max_results,
         web_search_timeout_seconds=settings.web_search_timeout_seconds,

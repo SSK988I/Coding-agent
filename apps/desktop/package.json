@@ -12,11 +12,18 @@
     "typecheck": "tsc -p tsconfig.electron.json --noEmit && tsc -p tsconfig.renderer.json --noEmit",
     "test": "vitest run",
     "test:smoke": "pnpm build && electron tests/electron.smoke.cjs",
+    "test:usage-analysis": "pnpm build && electron tests/usage-analysis.smoke.cjs",
+    "test:turn-changes": "pnpm build && electron tests/turn-changes.smoke.cjs",
+    "test:side-chat": "pnpm build && cross-env CODING_AGENT_SIDE_CHAT_SMOKE_ONLY=1 electron tests/workbench.smoke.cjs",
+    "test:vision": "pnpm build && electron tests/vision.smoke.cjs",
+    "test:clipboard": "pnpm build && node tests/clipboard.smoke.cjs",
     "test:workbench": "pnpm build && electron tests/workbench.smoke.cjs"
   },
   "dependencies": {
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
+    "antd": "6.6.8",
+    "echarts": "6.1.0",
     "node-pty": "^1.1.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",

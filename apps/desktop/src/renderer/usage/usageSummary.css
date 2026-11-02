@@ -1,0 +1,31 @@
+.usage-analysis-kpis { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.usage-analysis-kpi { min-width: 0; padding: 16px; border: 1px solid transparent; border-radius: 10px; background: var(--sidebar, #f4f3f0); }
+.usage-analysis-kpi > span { display: block; color: var(--text-secondary, #65625d); font-size: 12px; line-height: 1.5; }
+.usage-analysis-kpi > strong { display: block; margin: 8px 0 5px; color: var(--text, #242321); font-size: 26px; font-weight: 600; line-height: 1.2; font-variant-numeric: tabular-nums; letter-spacing: -.035em; overflow-wrap: anywhere; }
+.usage-analysis-kpi > small { display: block; color: #716b62; font-size: 11px; line-height: 1.55; text-wrap: balance; }
+.usage-analysis-context { margin: 14px 0 20px; padding: 14px 16px 13px; border: 1px solid var(--line, #e7e5e0); border-radius: 10px; background: var(--surface, #fff); }
+.usage-analysis-context > div:first-child { display: flex; justify-content: space-between; gap: 12px; align-items: center; margin-bottom: 8px; }
+.usage-analysis-context > div:first-child > span { flex-shrink: 0; font-size: 12px; color: var(--text-secondary, #65625d); }
+.usage-analysis-context strong { display: flex; flex-wrap: wrap; justify-content: flex-end; column-gap: 4px; row-gap: 3px; min-width: 0; color: #514e47; font-size: 13px; font-weight: 550; font-variant-numeric: tabular-nums; }
+.usage-analysis-context strong > span { font-weight: 400; color: #777168; }
+.usage-analysis-context b { margin-left: 8px; font-size: 13px; font-weight: 600; color: #5d775f; }
+.usage-analysis-context.warning b { color: #957039; }
+.usage-analysis-context.critical b { color: #ac574c; }
+.usage-analysis-context p { margin: 7px 0 0; color: #777168; font-size: 11px; line-height: 1.55; }
+.usage-analysis-context-track { height: 6px; overflow: hidden; border-radius: 100px; background: #e9e7e2; }
+.usage-analysis-context-track > span { display: block; height: 100%; border-radius: inherit; background: #7c9080; }
+.usage-analysis-context.warning .usage-analysis-context-track > span { background: #b39154; }
+.usage-analysis-context.critical .usage-analysis-context-track > span { background: #ba685c; }
+@media (max-width: 640px) {
+  .usage-analysis-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .usage-analysis-kpi { padding: 13px; }
+  .usage-analysis-kpi > strong { margin-top: 6px; font-size: 25px; }
+  .usage-analysis-context { padding: 13px; }
+  .usage-analysis-context > div:first-child { align-items: flex-start; flex-direction: column; gap: 7px; }
+  .usage-analysis-context strong { justify-content: flex-start; }
+}
+@media (max-height: 700px) {
+  .usage-analysis-kpi { padding: 12px 14px; }
+  .usage-analysis-kpi > strong { margin-top: 6px; font-size: 24px; }
+  .usage-analysis-context { margin-block: 12px 16px; padding-block: 12px; }
+}

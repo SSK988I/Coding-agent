@@ -12,14 +12,20 @@ import type {
   SubagentTaskPayload,
   PermissionMode,
   PermissionModePayload,
+  WebSearchStatePayload,
   SessionStats,
 } from "../shared/types";
 import { PermissionPicker } from "./components/PermissionPicker";
-import { UsageMetrics } from "./components/UsageMetrics";
+import { UsageAnalysisLauncher } from "./usage/UsageAnalysisLauncher";
 import { ArchiveIcon, SessionList } from "./components/SessionList";
+import { AttachmentPicker, MessageFiles, MessageImages } from "./attachments/ImageAttachmentPicker";
+import { useAttachments } from "./attachments/useImageAttachments";
+import { clipboardAttachmentFiles, type PendingAttachment } from "./attachments/imageAttachments";
 import { SubagentPanel } from "./components/SubagentPanel";
 import { ToolCard } from "./components/tool-card";
 import { Workbench } from "./workbench/Workbench";
+import type { ChangeReviewRequest } from "../shared/workbench";
+import { TurnChangesCard } from "./components/TurnChangesCard";
 import {
   createTimelineState,
   createTimelineStateFromMessages,
@@ -42,6 +48,7 @@ interface ModelOption {
   name: string;
   provider: string;
   current: boolean;
+  input?: string[];
 }
 
 interface CommandOption {
@@ -55,6 +62,14 @@ type PendingPlanAction = "execute" | "handoff" | "submit" | null;
 interface PlanSubmission {
   sessionId: string;
   runId: string | null;
+}
+
+interface AttachmentRunDraft {
+  sessionId: string;
+  input: string;
+  items: PendingAttachment[];
+  runId: string | null;
+  failed: boolean;
 }
 
 const COMMAND_ICONS: Record<string, string> = {
@@ -97,6 +112,8 @@ const TimelineMessageCard = memo(function TimelineMessageCard({
     <article className={`message ${message.role}`}>
       <div className="message-avatar">{message.role === "user" ? "你" : "AI"}</div>
       <div className="message-body">
+        {message.images?.length ? <MessageImages images={message.images} /> : null}
+        {message.files?.length ? <MessageFiles files={message.files} /> : null}
         {message.thinking && (
           <details className="thinking-block">
             <summary>思考过程</summary>
@@ -239,7 +256,9 @@ function updateTimelineItem(
 
 export function App() {
   const [workbenchOpen, setWorkbenchOpen] = useState(false);
+  const [requestedChange, setRequestedChange] = useState<ChangeReviewRequest | null>(null);
   const [workbenchWidth, setWorkbenchWidth] = useState(480);
+  const [usageAnalysisOpen, setUsageAnalysisOpen] = useState(false);
   const closeWorkbench = useCallback(() => setWorkbenchOpen(false), []);
   const [sidecarStatus, setSidecarStatus] = useState("starting");
   const [workspace, setWorkspace] = useState<WorkspacePayload | null>(null);
@@ -267,6 +286,10 @@ export function App() {
   const sessionNavigationRef = useRef(false);
   const sessionNavigating = pendingSessionNavigation !== null;
   const [error, setError] = useState<string | null>(null);
+  const supportsImages = workspace?.model.input?.includes("image") ?? false;
+  const attachments = useAttachments(workspace ? JSON.stringify([workspace.path, workspace.sessionId]) : null, supportsImages, setError);
+  const submittingRef = useRef(false);
+  const imageRunDraftRef = useRef<AttachmentRunDraft | null>(null);
   const [pendingPermissionChange, setPendingPermissionChange] = useState(false);
   const [networkApproval, setNetworkApproval] = useState<{ approvalId: string; message: string } | null>(null);
   const [pendingNetworkDecision, setPendingNetworkDecision] = useState(false);
@@ -378,11 +401,14 @@ export function App() {
     }
     if (workspaceSessionIdRef.current !== payload.sessionId) {
       setInput("");
+      attachments.clear();
+      imageRunDraftRef.current = null;
     }
     workspaceSessionIdRef.current = payload.sessionId;
     setWorkspace(payload);
     if (restoreTimeline) {
-      setTimelineState(createTimelineStateFromMessages(payload.messages, payload.sessionId));
+      setRequestedChange(null);
+      setTimelineState(createTimelineStateFromMessages(payload.messages, payload.sessionId, payload.turnChanges));
     }
     setCommandMenuOpen(false);
     setModelPickerOpen(false);
@@ -398,7 +424,7 @@ export function App() {
     compactingRef.current = false;
     setCompacting(false);
     setIsAtBottom(true);
-    setError(null);
+    setError(payload.turnChangesError ? `历史变更记录暂不可用：${payload.turnChangesError}` : null);
     void refreshSessions();
     void refreshCommands();
   };
@@ -413,11 +439,15 @@ export function App() {
         collaborationMode: snapshot.collaborationMode,
         planState: snapshot.planState,
         messages: snapshot.messages,
+        turnChanges: snapshot.turnChanges,
         permissionMode: snapshot.permissionMode ?? current.permissionMode,
+        webSearch: snapshot.webSearch,
         stats: snapshot.stats,
       };
     });
-    setTimelineState(createTimelineStateFromMessages(snapshot.messages, snapshot.sessionId));
+    setRequestedChange(null);
+    setTimelineState(createTimelineStateFromMessages(snapshot.messages, snapshot.sessionId, snapshot.turnChanges));
+    if (snapshot.turnChangesError) setError(`历史变更记录暂不可用：${snapshot.turnChangesError}`);
   };
 
   const refreshSessionSnapshot = async () => {
@@ -519,7 +549,7 @@ export function App() {
   useEffect(() => {
     const unsubscribeStatus = window.agent.onStatus(setSidecarStatus);
     const unsubscribeEvents = window.agent.onEvent((event) => {
-      if (event.event.type.startsWith("workbench.")) return;
+      if (event.event.type.startsWith("workbench.") && !["workbench.turnChanged", "workbench.turnFailed"].includes(event.event.type)) return;
       rafQueue.current.push(event);
       if (rafId.current !== null) return;
       rafId.current = requestAnimationFrame(() => {
@@ -538,13 +568,19 @@ export function App() {
         if (sessionChangeIndex >= 0) {
           const changed = events[sessionChangeIndex];
           const snapshot = changed.event.payload as unknown as WorkspacePayload;
-          setTimelineState(createTimelineStateFromMessages(snapshot.messages, snapshot.sessionId));
-          const trailingEvents = events.slice(sessionChangeIndex + 1);
+          setRequestedChange(null);
+          setTimelineState(createTimelineStateFromMessages(snapshot.messages, snapshot.sessionId, snapshot.turnChanges));
+          const trailingEvents = events.slice(sessionChangeIndex + 1).filter((event) => (
+            !event.sessionId || event.sessionId === snapshot.sessionId
+          ));
           if (trailingEvents.length) {
             setTimelineState((current) => reduceRuntimeEventBatch(current, trailingEvents));
           }
         } else {
-          setTimelineState((current) => reduceRuntimeEventBatch(current, events));
+          const currentEvents = events.filter((event) => (
+            !event.sessionId || event.sessionId === workspaceSessionIdRef.current
+          ));
+          setTimelineState((current) => reduceRuntimeEventBatch(current, currentEvents));
         }
         for (const item of events) handleRuntimeSideEffects(item);
       });
@@ -572,6 +608,10 @@ export function App() {
     }
     if (type !== "session.changed" && envelope.sessionId
       && envelope.sessionId !== workspaceSessionIdRef.current) return;
+    if (type === "workbench.turnFailed") {
+      setError(`本轮变更记录暂不可用：${String(payload.message ?? "请稍后重试")}`);
+      return;
+    }
     const activeSubmission = planSubmissionRef.current;
     if (type.startsWith("run.") && activeSubmission?.runId
       && envelope.runId !== activeSubmission.runId) return;
@@ -583,6 +623,8 @@ export function App() {
         ? { ...current, stats: payload.stats as SessionStats } : current);
     }
     if (type === "run.started") {
+      const imageDraft = imageRunDraftRef.current;
+      if (imageDraft && !imageDraft.runId) imageDraft.runId = envelope.runId;
       const submission = planSubmissionRef.current;
       if (submission && !submission.runId) submission.runId = envelope.runId;
       setRunning(true);
@@ -593,6 +635,15 @@ export function App() {
     }
     if (type === "run.completed" || type === "run.cancelled" || type === "run.failed") {
       setRunning(false);
+      const imageDraft = imageRunDraftRef.current;
+      if (imageDraft && (!imageDraft.runId || imageDraft.runId === envelope.runId)) {
+        if (type === "run.failed") {
+          imageDraft.failed = true;
+          attachments.restore(imageDraft.items);
+          setInput((current) => current || imageDraft.input);
+        }
+        imageRunDraftRef.current = null;
+      }
       const submission = planSubmissionRef.current;
       if (submission && (!submission.runId || submission.runId === envelope.runId)) {
         void finishPlanSubmission(submission, type);
@@ -630,6 +681,10 @@ export function App() {
     if (type === "model.changed") {
       const model = payload as unknown as WorkspacePayload["model"];
       setWorkspace((current) => current ? { ...current, model } : current);
+    }
+    if (type === "webSearch.changed") {
+      const state = payload as unknown as WebSearchStatePayload;
+      setWorkspace((current) => current ? { ...current, webSearch: state } : current);
     }
     if (type === "permission.changed") {
       const state = payload as unknown as PermissionModePayload;
@@ -987,38 +1042,52 @@ export function App() {
   const submit = async (event?: FormEvent) => {
     event?.preventDefault();
     const text = input.trim();
-    if (!text || !workspace || running || compacting || planSubmissionRef.current
+    if ((!text && !attachments.items.length) || !workspace || running || compacting
+      || composerBlocked || attachments.reading || submittingRef.current || planSubmissionRef.current
       || sessionNavigationRef.current || sessionArchiveRef.current || workspace.archived) return;
+    if (attachments.images.length && !supportsImages) {
+      setError("当前模型不支持图片输入，请先切换到支持视觉的模型，或移除附件。");
+      return;
+    }
     if (text.startsWith("/")) {
+      if (attachments.items.length) {
+        setError("附件不能随斜杠命令发送，请移除附件或改为普通消息。");
+        return;
+      }
       const [rawName, ...rest] = text.slice(1).split(/\s+/);
       const command = commandOptions.find((item) => item.name === rawName.toLocaleLowerCase());
       if (command) await executeSlashCommand(command.name, rest.join(" "));
       else setError(`未知命令：/${rawName}`);
       return;
     }
-    setInput("");
     setError(null);
-    const timestamp = Date.now();
-    const id = `user-${timestamp}-${++localItemSequence.current}`;
-    setTimelineState((current) => appendTimelineItem(current, (order): TimelineMessageItem => ({
-      id,
-      kind: "message",
-      order,
-      revision: 0,
-      sessionId: workspace.sessionId,
-      runId: null,
-      createdAt: timestamp,
-      updatedAt: timestamp,
-      role: "user",
-      text,
-      thinking: "",
-    })));
+    const sessionId = workspace.sessionId;
+    const originalInput = input;
+    const imageDraft: AttachmentRunDraft | null = attachments.items.length ? {
+      sessionId, input: originalInput, items: [...attachments.items], runId: null, failed: false,
+    } : null;
+    imageRunDraftRef.current = imageDraft;
+    const images = attachments.images.map(({ data, mime_type }) => ({ data, mime_type }));
+    const files = attachments.files.map(({ name, data, mime_type }) => ({ name, data, mime_type }));
+    submittingRef.current = true;
     setRunning(true);
     try {
-      await window.agent.request("run.start", { text });
+      const result = await window.agent.request<{ runId: string }>("run.start", {
+        text, ...(images.length ? { images } : {}), ...(files.length ? { files } : {}),
+      });
+      if (imageDraft) imageDraft.runId = result.runId;
+      if (workspaceSessionIdRef.current === sessionId && !imageDraft?.failed) {
+        setInput((current) => current === originalInput ? "" : current);
+        attachments.clear();
+      }
     } catch (reason) {
-      setRunning(false);
-      setError(reason instanceof Error ? reason.message : String(reason));
+      if (workspaceSessionIdRef.current === sessionId) {
+        setRunning(false);
+        setError(reason instanceof Error ? reason.message : String(reason));
+      }
+      if (imageRunDraftRef.current === imageDraft) imageRunDraftRef.current = null;
+    } finally {
+      submittingRef.current = false;
     }
   };
 
@@ -1227,21 +1296,6 @@ export function App() {
     setPlanSubmissionNotice(null);
     setInput("");
     setError(null);
-    const timestamp = Date.now();
-    const id = `user-${timestamp}-${++localItemSequence.current}`;
-    setTimelineState((current) => appendTimelineItem(current, (order): TimelineMessageItem => ({
-      id,
-      kind: "message",
-      order,
-      revision: 0,
-      sessionId: workspace.sessionId,
-      runId: null,
-      createdAt: timestamp,
-      updatedAt: timestamp,
-      role: "user",
-      text,
-      thinking: "",
-    })));
     setRunning(true);
     setPendingPlanAction("submit");
     try {
@@ -1256,16 +1310,21 @@ export function App() {
   };
 
   const selectModel = async (model: ModelOption) => {
+    const sessionId = workspaceSessionIdRef.current;
+    if (!sessionId) return;
     try {
       const selected = await window.agent.request<WorkspacePayload["model"]>("model.select", {
         modelId: model.id,
         provider: model.provider,
       });
+      if (workspaceSessionIdRef.current !== sessionId) return;
       setWorkspace((current) => current ? { ...current, model: selected } : current);
       setModelPickerOpen(false);
       setModelOptions([]);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      if (workspaceSessionIdRef.current === sessionId) {
+        setError(reason instanceof Error ? reason.message : String(reason));
+      }
     }
   };
 
@@ -1294,6 +1353,10 @@ export function App() {
   };
 
   const onInputKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === "v"
+      && !event.repeat && !composerBlocked && !running && !compacting) {
+      attachments.prepareClipboardPaste();
+    }
     if (commandMenuOpen) {
       if (event.key === "ArrowDown") {
         event.preventDefault();
@@ -1443,6 +1506,10 @@ export function App() {
       </div>
     ),
   }), []);
+  const viewTurnChanges = useCallback((runId: string, path?: string) => {
+    setRequestedChange((current) => ({ runId, ...(path ? { path } : {}), serial: (current?.serial ?? 0) + 1 }));
+    setWorkbenchOpen(true);
+  }, []);
   const renderTimelineItem = useCallback((_index: number, item: RenderTimelineItem) => {
     if (item.kind === "plan") {
       return (
@@ -1465,6 +1532,9 @@ export function App() {
         </div>
       );
     }
+    if (item.kind === "changes") {
+      return <div className="timeline-row"><TurnChangesCard change={item.change} onView={viewTurnChanges} /></div>;
+    }
     return (
       <div className="timeline-row">
         <ToolCard
@@ -1474,7 +1544,7 @@ export function App() {
         />
       </div>
     );
-  }, [resolveApproval, workspace?.path, planBadgeLabel]);
+  }, [resolveApproval, workspace?.path, planBadgeLabel, viewTurnChanges]);
   const lastTimelineSignature = (() => {
     const last = renderTimelineItems.at(-1);
     if (!last) return "empty";
@@ -1789,7 +1859,7 @@ export function App() {
                       className={model.current ? "active" : ""}
                       onClick={() => void selectModel(model)}
                     >
-                      <span><strong>{model.name}</strong><small>{model.id}</small></span>
+                      <span><strong>{model.name}</strong><small>{model.id}{model.input?.includes("image") ? " · 支持图片" : ""}</small></span>
                       <em>{model.provider}{model.current ? " · 当前" : ""}</em>
                     </button>
                   ))}
@@ -1808,7 +1878,27 @@ export function App() {
                 </div>
               </section>
             )}
-            <form className={`composer ${workspace?.collaborationMode === "plan" ? "plan-mode" : ""}`} onSubmit={submit}>
+            <form className={`composer ${workspace?.collaborationMode === "plan" ? "plan-mode" : ""}`} onSubmit={submit}
+              onDragOver={(event) => { if (event.dataTransfer.types.includes("Files")) event.preventDefault(); }}
+              onDrop={(event) => {
+                if (!event.dataTransfer.files.length) return;
+                event.preventDefault();
+                if (!composerBlocked && !running) void attachments.addFiles(Array.from(event.dataTransfer.files));
+              }}
+              onPaste={(event) => {
+                const files = clipboardAttachmentFiles(event.clipboardData);
+                if (!files.length) {
+                  // Ordinary text paste must retain the browser's default action
+                  // and must not prompt for an unrelated clipboard read.
+                  if (event.clipboardData.types.includes("text/plain")) attachments.cancelClipboardFallback();
+                  return;
+                }
+                event.preventDefault();
+                if (!composerBlocked && !running) attachments.addPastedFiles(files);
+              }}>
+              <AttachmentPicker items={attachments.items} disabled={composerBlocked || running}
+                supported={supportsImages} reading={attachments.reading}
+                onFiles={(files) => { void attachments.addFiles(files); }} onRemove={attachments.remove} />
               <textarea
                 ref={composerRef}
                 value={input}
@@ -1859,14 +1949,20 @@ export function App() {
                     void window.agent.request("run.abort").catch((reason) => setError(String(reason)));
                   }}>■ 停止压缩</button>
                 ) : (
-                  <button type="submit" className="send-button" disabled={composerBlocked || !input.trim()}>发送 ↑</button>
+                  <button type="submit" className="send-button" disabled={composerBlocked || attachments.reading
+                    || (!input.trim() && !attachments.items.length)
+                    || (attachments.images.length > 0 && !supportsImages)}>发送 ↑</button>
                 )}
               </div>
             </form>
-            <UsageMetrics stats={workspace?.stats} />
+            <UsageAnalysisLauncher key={JSON.stringify([workspace?.path, workspace?.sessionId])}
+              sessionId={workspace?.sessionId} workspacePath={workspace?.path} stats={workspace?.stats}
+              onOpenChange={setUsageAnalysisOpen} />
           </div>
         </main>
-        {workspace && <Workbench key={workspace.sessionId} workspace={workspace} open={workbenchOpen} onClose={closeWorkbench} width={workbenchWidth} onWidth={setWorkbenchWidth} sidebarOpen={sidebarOpen} />}
+        {workspace && <Workbench key={JSON.stringify([workspace.path, workspace.sessionId])} workspace={workspace} open={workbenchOpen}
+          onClose={closeWorkbench} width={workbenchWidth} onWidth={setWorkbenchWidth} sidebarOpen={sidebarOpen}
+          suspended={usageAnalysisOpen} requestedChange={requestedChange} />}
       </div>
     </div>
   );
