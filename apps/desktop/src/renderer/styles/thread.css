@@ -1,0 +1,215 @@
+/* ============================================================================
+   Vertical Guide-Line Execution Tree ("带线条的形式")
+   Whisper-quiet monochrome icons + centered 1px vertical rails + airy 14px
+   rounded bordered content boxes + </> raw-argument inspection toggles.
+   ============================================================================ */
+
+.thread-node {
+  position: relative;
+  min-width: 0;
+}
+
+.thread-node--chained-prev::before {
+  content: "";
+  position: absolute;
+  top: -10px;
+  left: 9.5px;
+  width: 1px;
+  height: 12px;
+  background: var(--rail-line);
+  pointer-events: none;
+}
+
+.thread-node--chained-next::after {
+  content: "";
+  position: absolute;
+  bottom: -10px;
+  left: 9.5px;
+  width: 1px;
+  height: 12px;
+  background: var(--rail-line);
+  pointer-events: none;
+}
+
+.thread-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  padding: 3px 8px 3px 0;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.45;
+  text-align: left;
+  cursor: pointer;
+  transition: color 0.14s ease;
+}
+
+.thread-trigger:hover {
+  color: var(--text);
+}
+
+.thread-trigger__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+  color: var(--muted);
+}
+
+.thread-trigger:hover .thread-trigger__icon {
+  color: var(--text-secondary);
+}
+
+.thread-trigger__title {
+  font-weight: 500;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.thread-trigger__label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 450;
+  color: var(--text-secondary);
+}
+
+.thread-trigger:hover .thread-trigger__title,
+.thread-trigger:hover .thread-trigger__label {
+  color: var(--text);
+}
+
+.thread-group {
+  margin: 6px 0 8px;
+}
+
+.thread-group__header {
+  display: flex;
+  align-items: center;
+}
+
+.thread-group__toggle {
+  max-width: 100%;
+}
+
+.thread-group__count {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.thread-rail--l1 {
+  gap: 8px;
+  margin-top: 7px;
+  padding-bottom: 4px;
+}
+
+.thread-group__echo {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding-top: 2px;
+  color: var(--muted);
+  font-size: 13px;
+  user-select: none;
+}
+
+.thread-trigger__summary {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 12px;
+  font-family: "Cascadia Code", ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.thread-trigger__chevron {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  color: var(--muted);
+  transition: transform 0.14s ease;
+}
+
+.thread-rail {
+  margin-left: 9.5px;
+  padding-left: 18px;
+  margin-top: 6px;
+  padding-bottom: 2px;
+  border-left: 1px solid var(--rail-line);
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.thread-rail--warn {
+  border-left-color: var(--rail-line-warn);
+}
+
+.thread-rail--err {
+  border-left-color: var(--rail-line-err);
+}
+
+.thread-box {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface);
+  padding: 12px 15px;
+  overflow: hidden;
+}
+
+.thread-box--subtle {
+  background: var(--surface-subtle);
+}
+
+.thread-code-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  width: fit-content;
+  padding: 2px 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  font-family: "Cascadia Code", ui-monospace, SFMono-Regular, Consolas, monospace;
+  cursor: pointer;
+  transition: color 0.14s ease, background 0.14s ease;
+}
+
+.thread-code-toggle:hover {
+  color: var(--text);
+  background: var(--accent-soft);
+}
+
+.status-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  flex-shrink: 0;
+  background: var(--muted);
+}
+
+.status-dot--ok { background: var(--tone-ok); }
+.status-dot--warn { background: var(--tone-warn); }
+.status-dot--err { background: var(--tone-err); }
+
+@media (prefers-reduced-motion: no-preference) {
+  .status-dot--pulse {
+    animation: thread-dot-pulse 1.4s ease-in-out infinite;
+  }
+}
+
+@keyframes thread-dot-pulse {
+  50% { opacity: 0.3; }
+}
