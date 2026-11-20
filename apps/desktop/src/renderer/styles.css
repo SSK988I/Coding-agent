@@ -722,15 +722,16 @@ button:focus-visible, textarea:focus-visible, input:focus-visible, select:focus-
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 5px;
+  gap: 6px;
   border: 1px solid var(--line);
   border-radius: 8px;
-  padding: 4px 6px;
-  font-size: 11px;
-  font-weight: 500;
+  padding: 5px 8px;
+  font-size: 11.5px;
+  font-weight: 450;
   cursor: pointer;
-  color: var(--text-secondary);
+  color: var(--muted);
   background: var(--canvas);
+  white-space: nowrap;
   transition: border-color 0.14s ease, background 0.14s ease, color 0.14s ease;
 }
 
@@ -740,7 +741,7 @@ button:focus-visible, textarea:focus-visible, input:focus-visible, select:focus-
 }
 
 .memory-toggle.on {
-  color: var(--tone-ok);
+  color: var(--text);
   border-color: var(--line);
   background: var(--surface);
 }
@@ -774,6 +775,45 @@ button:focus-visible, textarea:focus-visible, input:focus-visible, select:focus-
   min-height: 0;
   overflow: hidden;
   background: var(--canvas);
+}
+
+.floating-toast {
+  position: absolute;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 30;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: min(420px, calc(100% - 32px));
+  padding: 6px 13px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: nowrap;
+  box-shadow: var(--shadow-md);
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .floating-toast {
+    animation: floating-toast-in 0.18s ease-out;
+  }
+}
+
+@keyframes floating-toast-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -6px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
 }
 
 .timeline {
@@ -887,46 +927,65 @@ button:focus-visible, textarea:focus-visible, input:focus-visible, select:focus-
   background: var(--surface);
 }
 
-.message-body > :first-child { margin-top: 0; }
-.message-body > :last-child { margin-bottom: 0; }
-.message-body p, .plan-markdown p { margin: 0 0 11px; }
-.message-body h1, .plan-markdown h1 { font-size: 1.3em; font-weight: 650; margin: 16px 0 8px; }
-.message-body h2, .plan-markdown h2 { font-size: 1.15em; font-weight: 650; margin: 14px 0 8px; }
-.message-body h3, .plan-markdown h3 { font-size: 1.05em; font-weight: 600; margin: 12px 0 6px; }
-.message-body ul, .plan-markdown ul { list-style: disc; padding-left: 20px; margin: 0 0 11px; }
-.message-body ol, .plan-markdown ol { list-style: decimal; padding-left: 20px; margin: 0 0 11px; }
-.message-body li, .plan-markdown li { margin: 3px 0; }
-.message-body blockquote, .plan-markdown blockquote {
+.message-body > :first-child,
+.plan-markdown > :first-child,
+.workbench-markdown > :first-child { margin-top: 0; }
+.message-body > :last-child,
+.plan-markdown > :last-child,
+.workbench-markdown > :last-child,
+.side-chat-message > :last-child { margin-bottom: 0; }
+.message-body p, .plan-markdown p, .workbench-markdown p { margin: 0 0 11px; }
+.message-body h1, .plan-markdown h1, .workbench-markdown h1, .side-chat-message h1 { font-size: 1.3em; font-weight: 650; margin: 16px 0 8px; }
+.message-body h2, .plan-markdown h2, .workbench-markdown h2, .side-chat-message h2 { font-size: 1.15em; font-weight: 650; margin: 14px 0 8px; }
+.message-body h3, .plan-markdown h3, .workbench-markdown h3, .side-chat-message h3 { font-size: 1.05em; font-weight: 600; margin: 12px 0 6px; }
+.message-body h4, .plan-markdown h4, .workbench-markdown h4, .side-chat-message h4 { font-size: 1em; font-weight: 600; margin: 10px 0 6px; }
+.message-body ul, .plan-markdown ul, .workbench-markdown ul, .side-chat-message ul { list-style: disc; padding-left: 20px; margin: 0 0 11px; }
+.message-body ol, .plan-markdown ol, .workbench-markdown ol, .side-chat-message ol { list-style: decimal; padding-left: 20px; margin: 0 0 11px; }
+.message-body li, .plan-markdown li, .workbench-markdown li, .side-chat-message li { margin: 3px 0; }
+.message-body :is(ul, ol) :is(ul, ol),
+.plan-markdown :is(ul, ol) :is(ul, ol),
+.workbench-markdown :is(ul, ol) :is(ul, ol),
+.side-chat-message :is(ul, ol) :is(ul, ol) { margin: 3px 0; }
+.message-body blockquote, .plan-markdown blockquote, .workbench-markdown blockquote, .side-chat-message blockquote {
   margin: 10px 0;
   padding: 2px 0 2px 12px;
   border-left: 2px solid var(--line-strong);
   color: var(--text-secondary);
 }
 
-.message-body a, .plan-markdown a {
+.message-body a, .plan-markdown a, .workbench-markdown a, .side-chat-message a {
   color: var(--text);
   text-decoration: underline;
   text-decoration-color: var(--line-strong);
   text-underline-offset: 2px;
 }
 
-.message-body table, .plan-markdown table {
+.message-body table, .plan-markdown table, .workbench-markdown table, .side-chat-message table {
   width: 100%;
   border-collapse: collapse;
   margin: 12px 0;
   font-size: 12.5px;
 }
 
-.message-body th, .message-body td, .plan-markdown th, .plan-markdown td {
+.message-body th, .message-body td,
+.plan-markdown th, .plan-markdown td,
+.workbench-markdown th, .workbench-markdown td,
+.side-chat-message th, .side-chat-message td {
   border-bottom: 1px solid var(--line);
   padding: 7px 9px;
   text-align: left;
 }
 
-.message-body th, .plan-markdown th {
+.message-body th, .plan-markdown th, .workbench-markdown th, .side-chat-message th {
   color: var(--text-secondary);
   background: var(--surface-subtle);
   font-weight: 600;
+}
+
+.message-body hr, .plan-markdown hr, .workbench-markdown hr, .side-chat-message hr {
+  border: 0;
+  border-top: 1px solid var(--line);
+  margin: 14px 0;
 }
 
 .message-body pre, .plan-markdown pre {
@@ -940,7 +999,7 @@ button:focus-visible, textarea:focus-visible, input:focus-visible, select:focus-
   font: 12.5px/1.6 "Cascadia Code", ui-monospace, SFMono-Regular, Consolas, monospace;
 }
 
-.message-body code, .plan-markdown code {
+.message-body code, .plan-markdown code, .workbench-markdown code, .side-chat-message code {
   font-family: "Cascadia Code", ui-monospace, SFMono-Regular, Consolas, monospace;
   font-size: 0.9em;
   padding: 1px 5px;
@@ -949,7 +1008,7 @@ button:focus-visible, textarea:focus-visible, input:focus-visible, select:focus-
   color: var(--code-text);
 }
 
-.message-body pre code, .plan-markdown pre code {
+.message-body pre code, .plan-markdown pre code, .workbench-markdown pre code, .side-chat-message pre code {
   padding: 0;
   background: transparent;
   color: inherit;
@@ -958,6 +1017,53 @@ button:focus-visible, textarea:focus-visible, input:focus-visible, select:focus-
 
 /* Thinking block using vertical guide-line rail */
 .thinking-block { margin: 8px 0 2px; }
+
+.working-indicator {
+  padding: 12px 0 6px;
+}
+
+.working-indicator--inline {
+  padding: 0;
+}
+
+.working-shimmer {
+  display: inline-block;
+  font-size: 13.5px;
+  font-weight: 450;
+  line-height: 1.5;
+  letter-spacing: 0.01em;
+  color: var(--muted);
+  user-select: none;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .working-shimmer,
+  .thinking-block__label--streaming {
+    color: transparent;
+    background-image: linear-gradient(
+      90deg,
+      var(--muted) 0%,
+      var(--muted) 32%,
+      var(--text) 50%,
+      var(--muted) 68%,
+      var(--muted) 100%
+    );
+    background-size: 260% 100%;
+    background-position: 100% 0;
+    -webkit-background-clip: text;
+    background-clip: text;
+    animation: text-shimmer-sweep 1.65s linear infinite;
+  }
+}
+
+@keyframes text-shimmer-sweep {
+  0% {
+    background-position: 100% 0;
+  }
+  100% {
+    background-position: 0% 0;
+  }
+}
 .thinking-block:first-child { margin-top: 0; }
 .thinking-block__summary { list-style: none; }
 .thinking-block__summary::-webkit-details-marker { display: none; }
@@ -2048,7 +2154,7 @@ button:focus-visible, textarea:focus-visible, input:focus-visible, select:focus-
 
 .drawer-backdrop {
   position: fixed;
-  inset: 0;
+  inset: 48px 0 0 0;
   z-index: 60;
   display: flex;
   justify-content: flex-end;
@@ -2229,6 +2335,13 @@ button:focus-visible, textarea:focus-visible, input:focus-visible, select:focus-
   color: var(--muted);
 }
 
+.memory-drawer__card-meta-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
 .memory-drawer__card-meta code {
   font-family: "Cascadia Code", ui-monospace, Consolas, monospace;
   color: var(--text-secondary);
@@ -2294,6 +2407,48 @@ button:focus-visible, textarea:focus-visible, input:focus-visible, select:focus-
   background: var(--surface);
   font-size: 12px;
   color: var(--text);
+}
+
+.memory-drawer__candidate small {
+  color: var(--muted);
+  font-size: 11px;
+  flex-shrink: 0;
+}
+
+.memory-drawer__conflict-confirm {
+  margin-top: 4px;
+  padding: 9px 10px;
+  border: 1px solid var(--rail-line-err);
+  border-radius: 8px;
+  background: var(--diff-del-bg);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--text);
+}
+
+.memory-drawer__conflict-confirm p {
+  margin: 0;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.memory-drawer__conflict-confirm code {
+  font-family: "Cascadia Code", ui-monospace, Consolas, monospace;
+  color: var(--text);
+}
+
+.memory-drawer__conflict-confirm ul {
+  margin: 0;
+  padding-left: 18px;
+  list-style: disc;
+  color: var(--text);
+}
+
+.memory-drawer__conflict-confirm li {
+  margin: 2px 0;
+  overflow-wrap: anywhere;
 }
 
 .memory-drawer__footer {

@@ -166,7 +166,25 @@ function createWindow(): void {
       sandbox: true,
     },
   });
+    if (!app.isPackaged) {
+    const wc = mainWindow.webContents;
+    wc.openDevTools({ mode: "detach" });
 
+    wc.on("context-menu", (_, params) => {
+      wc.inspectElement(params.x, params.y);
+    });
+
+    wc.on("before-input-event", (event, input) => {
+      if (input.type !== "keyDown") return;
+      const isToggleShortcut =
+        input.key === "F12" ||
+        ((input.control || input.meta) && input.shift && input.key.toLowerCase() === "i");
+      if (isToggleShortcut) {
+        wc.toggleDevTools();
+        event.preventDefault();
+      }
+    });
+  }
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   workbench = new NativeWorkbench(mainWindow, requestSidecar);
   mainWindow.webContents.on("will-navigate", (event, url) => {

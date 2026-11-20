@@ -3,6 +3,7 @@ import { Archive, CornerDownLeft, X } from "lucide-react";
 import type { PermissionMode, PlanRevisionPayload, WorkspacePayload } from "../../../shared/types";
 import { AttachmentPicker } from "../../attachments/ImageAttachmentPicker";
 import { clipboardAttachmentFiles, type PendingAttachment } from "../../attachments/imageAttachments";
+import type { PendingPlanAction } from "../../utils/format";
 import { PermissionPicker } from "../PermissionPicker";
 
 export type QueueDeliveryMode = "steer" | "followUp";
@@ -12,10 +13,13 @@ export interface ComposerProps {
   composerRef: RefObject<HTMLTextAreaElement | null>;
   input: string;
   running: boolean;
+  canQueueWhileRunning: boolean;
+  queuing: boolean;
   compacting: boolean;
   sessionNavigating: boolean;
   composerBlocked: boolean;
   conversationReadOnly: boolean;
+  commandMenuOpen: boolean;
   supportsImages: boolean;
   attachments: {
     items: readonly PendingAttachment[];
@@ -30,6 +34,7 @@ export interface ComposerProps {
   canHandoffPlan: boolean;
   awaitingPlanDecision: boolean;
   planCommandMenuOpen: boolean;
+  pendingPlanAction: PendingPlanAction;
   planStatusMessage: string | null;
   planBadgeLabel: string;
   supplementingPlanDigest: string | null;
@@ -60,16 +65,20 @@ export function Composer({
   composerRef,
   input,
   running,
+  canQueueWhileRunning,
+  queuing,
   compacting,
   sessionNavigating,
   composerBlocked,
   conversationReadOnly,
+  commandMenuOpen,
   supportsImages,
   attachments,
   readyPlan,
   canHandoffPlan,
   awaitingPlanDecision,
   planCommandMenuOpen,
+  pendingPlanAction,
   planStatusMessage,
   planBadgeLabel,
   supplementingPlanDigest,
@@ -94,9 +103,7 @@ export function Composer({
   onAbortCompaction,
   onDismissError,
 }: ComposerProps) {
-  const canQueueWhileRunning = Boolean(
-    workspace && running && !compacting && !composerBlocked && !workspace.archived,
-  );
+  const textareaDisabled = composerBlocked || (running && !canQueueWhileRunning);
 
   const placeholder = compacting
     ? "正在压缩上下文，请稍候…"
@@ -108,9 +115,13 @@ export function Composer({
           ? "请先选择 Plan 操作"
           : awaitingPlanDecision
             ? canHandoffPlan ? "请先选择执行、新会话复核或继续修改" : "请先选择执行或继续修改"
-            : running
-              ? (queueMode === "steer" ? "输入转向指令（立即引导当前运行）…" : "输入后续指令（当前运行结束后执行）…")
-              : "描述你想完成的任务…";
+            : pendingPlanAction === "submit"
+              ? "正在整理并提交计划，请稍候…"
+              : canQueueWhileRunning
+                ? (queueMode === "steer" ? "输入转向指令（立即引导当前运行）…" : "输入后续指令（当前运行结束后执行）…")
+                : running
+                  ? "正在处理中，请稍候…"
+                  : "描述你想完成的任务…";
 
   return (
     <>
@@ -219,7 +230,7 @@ export function Composer({
           onChange={(event) => onInputChange(event.target.value)}
           onKeyDown={onInputKeyDown}
           placeholder={placeholder}
-          disabled={composerBlocked}
+          disabled={textareaDisabled}
           rows={2}
         />
 
@@ -276,6 +287,7 @@ export function Composer({
               className="composer-slash-btn"
               onClick={onOpenCommands}
               disabled={!workspace || running || compacting || composerBlocked}
+              aria-expanded={commandMenuOpen}
               title="打开斜杠命令菜单 (/)"
               aria-label="打开命令菜单"
             >
@@ -290,10 +302,11 @@ export function Composer({
               <button
                 type="button"
                 className="ghost-button composer-queue-send"
+                disabled={queuing}
                 onClick={onSendQueued}
               >
                 <CornerDownLeft size={12} strokeWidth={1.7} aria-hidden="true" />
-                {queueMode === "steer" ? "发送转向" : "加入队列"}
+                {queuing ? "发送中…" : (queueMode === "steer" ? "发送转向" : "加入队列")}
               </button>
             )}
 

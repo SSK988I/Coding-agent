@@ -95,6 +95,24 @@
   align-items: center;
 }
 
+.thread-group-row {
+  min-width: 0;
+}
+
+.thread-group-row--header {
+  display: flex;
+  align-items: center;
+  padding: 6px 0 8px;
+}
+
+.thread-group-row--header.thread-group-row--open {
+  padding: 6px 0 4px;
+}
+
+.thread-group-row--footer {
+  padding-bottom: 8px;
+}
+
 .thread-group__toggle {
   max-width: 100%;
 }
@@ -108,6 +126,23 @@
 .thread-rail--l1 {
   gap: 8px;
   margin-top: 7px;
+  padding-bottom: 4px;
+}
+
+.thread-rail-segment {
+  margin-left: 9.5px;
+  padding-left: 18px;
+  padding-top: 3px;
+  padding-bottom: 5px;
+  border-left: 1px solid var(--rail-line);
+}
+
+.thread-group-row--first .thread-rail-segment {
+  padding-top: 4px;
+}
+
+.thread-group-row--footer .thread-rail-segment {
+  padding-top: 3px;
   padding-bottom: 4px;
 }
 

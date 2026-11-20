@@ -11,7 +11,11 @@ import { PlanControls } from "./components/plan/PlanControls";
 import { TimelineCompactionCard } from "./components/timeline/TimelineCompaction";
 import { TimelineMessageCard } from "./components/timeline/TimelineMessage";
 import { TimelinePlanCard } from "./components/timeline/TimelinePlanCard";
-import { TimelineToolGroup } from "./components/timeline/TimelineToolGroup";
+import {
+  TimelineToolGroupEntry,
+  TimelineToolGroupFooter,
+  TimelineToolGroupHeader,
+} from "./components/timeline/TimelineToolGroup";
 import { TurnChangesCard } from "./components/TurnChangesCard";
 import { useDesktopSession, type RenderTimelineItem } from "./hooks/useDesktopSession";
 import { useTheme } from "./hooks/useTheme";
@@ -30,6 +34,7 @@ export function App() {
     isAtBottom,
     setIsAtBottom,
     resolveApproval,
+    toggleToolGroup,
     planBadgeLabel,
     viewTurnChanges,
     setInput,
@@ -62,6 +67,15 @@ export function App() {
   }), [setInput]);
 
   const renderTimelineItem = useCallback((_index: number, item: RenderTimelineItem) => {
+    if (item.kind === "working") {
+      return (
+        <div className="timeline-row">
+          <div className="working-indicator" data-testid="working-indicator" aria-live="polite">
+            <span className="working-shimmer">Working</span>
+          </div>
+        </div>
+      );
+    }
     if (item.kind === "plan") {
       return (
         <div className="timeline-row">
@@ -90,16 +104,45 @@ export function App() {
         </div>
       );
     }
+    if (item.kind === "tool-group-header") {
+      return (
+        <div className="timeline-row">
+          <TimelineToolGroupHeader
+            groupId={item.groupId}
+            label={item.label}
+            toolCount={item.toolCount}
+            hasApproval={item.hasApproval}
+            hasRunning={item.hasRunning}
+            hasError={item.hasError}
+            errorCount={item.errorCount}
+            isOpen={item.isOpen}
+            onToggle={toggleToolGroup}
+          />
+        </div>
+      );
+    }
+    if (item.kind === "tool-group-footer") {
+      return (
+        <div className="timeline-row">
+          <TimelineToolGroupFooter
+            label={item.label}
+            railToneClass={item.railToneClass}
+          />
+        </div>
+      );
+    }
     return (
       <div className="timeline-row">
-        <TimelineToolGroup
-          tools={item.tools}
+        <TimelineToolGroupEntry
+          tool={item.tool}
+          railToneClass={item.railToneClass}
+          isFirst={item.isFirst}
           cwd={workspace?.path}
           onResolveApproval={resolveApproval}
         />
       </div>
     );
-  }, [resolveApproval, workspace?.path, planBadgeLabel, viewTurnChanges]);
+  }, [resolveApproval, toggleToolGroup, workspace?.path, planBadgeLabel, viewTurnChanges]);
 
   useEffect(() => {
     if (!isAtBottom || renderTimelineItems.length === 0) return;
@@ -131,10 +174,9 @@ export function App() {
     return match ? (match.name || match.first_message || null) : null;
   }, [session.sessions, workspace]);
 
-  const openCommandPalette = useCallback(() => {
-    session.onInputChange("/");
-    requestAnimationFrame(() => session.composerRef.current?.focus());
-  }, [session]);
+  const memoryWorkspaceKey = workspace
+    ? JSON.stringify([workspace.path, workspace.memory.projectId ?? null])
+    : "";
 
   return (
     <div className="app-shell">
@@ -206,6 +248,22 @@ export function App() {
         />
 
         <main className="conversation" aria-busy={session.sessionNavigating} inert={session.sessionNavigating}>
+          {session.toast && (
+            <div
+              key={session.toast.id}
+              className="floating-toast"
+              role="status"
+              aria-live="polite"
+              data-testid="floating-toast"
+            >
+              <span
+                className={`status-dot ${session.toast.tone === "ok" ? "status-dot--ok" : ""}`.trim()}
+                aria-hidden="true"
+              />
+              <span>{session.toast.text}</span>
+            </div>
+          )}
+
           <Virtuoso
             ref={virtuosoRef}
             className="timeline"
@@ -290,16 +348,20 @@ export function App() {
               composerRef={session.composerRef}
               input={session.input}
               running={session.running}
+              canQueueWhileRunning={session.canQueueWhileRunning}
+              queuing={session.queuing}
               compacting={session.compacting}
               sessionNavigating={session.sessionNavigating}
               composerBlocked={session.composerBlocked}
               conversationReadOnly={session.conversationReadOnly}
+              commandMenuOpen={session.commandMenuOpen}
               supportsImages={session.supportsImages}
               attachments={session.attachments}
               readyPlan={session.readyPlan}
               canHandoffPlan={session.canHandoffPlan}
               awaitingPlanDecision={session.awaitingPlanDecision}
               planCommandMenuOpen={session.planCommandMenuOpen}
+              pendingPlanAction={session.pendingPlanAction}
               planStatusMessage={session.planStatusMessage}
               planBadgeLabel={planBadgeLabel}
               supplementingPlanDigest={session.supplementingPlanDigest}
@@ -312,7 +374,7 @@ export function App() {
               onQueueModeChange={session.setQueueMode}
               onInputChange={session.onInputChange}
               onInputKeyDown={session.onInputKeyDown}
-              onOpenCommands={openCommandPalette}
+              onOpenCommands={session.toggleCommandMenu}
               onSubmit={session.submit}
               onSendQueued={() => void session.sendQueuedMessage()}
               onEnterPlanMode={() => void session.enterPlanMode()}
@@ -352,6 +414,8 @@ export function App() {
 
       {workspace && (
         <MemoryDrawer
+          key={memoryWorkspaceKey}
+          workspaceKey={memoryWorkspaceKey}
           open={session.memoryDrawerOpen}
           memory={workspace.memory}
           disabled={session.running || session.compacting || session.sessionNavigating}

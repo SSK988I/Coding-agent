@@ -17,6 +17,7 @@ import type { ChangeReviewRequest } from "../../shared/workbench";
 import type { PendingAttachment } from "../attachments/imageAttachments";
 import { useAttachments } from "../attachments/useImageAttachments";
 import type { QueueDeliveryMode } from "../components/composer/Composer";
+import { inferGroupLabel, isToolErrorStatus } from "../components/timeline/TimelineToolGroup";
 import {
   createTimelineState,
   createTimelineStateFromMessages,
@@ -49,17 +50,61 @@ export interface PlanTimelineItem {
   plan: PlanRevisionPayload;
 }
 
-export interface ToolGroupTimelineItem {
+export interface ToolGroupHeaderTimelineItem {
   id: string;
-  kind: "tool-group";
+  kind: "tool-group-header";
+  groupId: string;
   order: number;
   revision: number;
-  tools: TimelineToolItem[];
+  label: string;
+  toolCount: number;
+  hasApproval: boolean;
+  hasRunning: boolean;
+  hasError: boolean;
+  errorCount: number;
+  isOpen: boolean;
+}
+
+export interface ToolGroupEntryTimelineItem {
+  id: string;
+  kind: "tool-group-item";
+  groupId: string;
+  order: number;
+  revision: number;
+  tool: TimelineToolItem;
+  railToneClass: string;
+  isFirst: boolean;
+}
+
+export interface ToolGroupFooterTimelineItem {
+  id: string;
+  kind: "tool-group-footer";
+  groupId: string;
+  order: number;
+  revision: number;
+  label: string;
+  railToneClass: string;
+}
+
+export interface FloatingToast {
+  id: number;
+  text: string;
+  tone: "ok" | "neutral";
+}
+
+export interface WorkingTimelineItem {
+  id: string;
+  kind: "working";
+  order: number;
+  revision: number;
 }
 
 export type RenderTimelineItem =
   | Exclude<TimelineItem, TimelineToolItem>
-  | ToolGroupTimelineItem
+  | ToolGroupHeaderTimelineItem
+  | ToolGroupEntryTimelineItem
+  | ToolGroupFooterTimelineItem
+  | WorkingTimelineItem
   | PlanTimelineItem;
 
 interface PlanSubmission {
@@ -142,12 +187,45 @@ export function useDesktopSession() {
   const [modelQuery, setModelQuery] = useState("");
   const [input, setInput] = useState("");
   const [queueMode, setQueueMode] = useState<QueueDeliveryMode>("steer");
+  const [queuing, setQueuing] = useState(false);
+  const queuingRef = useRef(false);
+  const queueRequestIdRef = useRef(0);
   const [running, setRunning] = useState(false);
+  const [startingRun, setStartingRun] = useState(false);
   const [compacting, setCompacting] = useState(false);
   const [pendingSessionNavigation, setPendingSessionNavigation] = useState<string | null>(null);
   const sessionNavigationRef = useRef(false);
   const sessionNavigating = pendingSessionNavigation !== null;
   const [error, setError] = useState<string | null>(null);
+  const [toast, setToast] = useState<FloatingToast | null>(null);
+  const toastTimerRef = useRef<number | null>(null);
+  const toastSeqRef = useRef(0);
+
+  const clearToast = useCallback(() => {
+    if (toastTimerRef.current !== null) {
+      window.clearTimeout(toastTimerRef.current);
+      toastTimerRef.current = null;
+    }
+    setToast(null);
+  }, []);
+
+  const showToast = useCallback((text: string, tone: "ok" | "neutral" = "neutral") => {
+    if (toastTimerRef.current !== null) {
+      window.clearTimeout(toastTimerRef.current);
+    }
+    setToast({ id: ++toastSeqRef.current, text, tone });
+    toastTimerRef.current = window.setTimeout(() => {
+      toastTimerRef.current = null;
+      setToast(null);
+    }, 2600);
+  }, []);
+
+  useEffect(() => () => {
+    if (toastTimerRef.current !== null) {
+      window.clearTimeout(toastTimerRef.current);
+      toastTimerRef.current = null;
+    }
+  }, []);
   const supportsImages = workspace?.model.input?.includes("image") ?? false;
   const attachments = useAttachments(
     workspace ? JSON.stringify([workspace.path, workspace.sessionId]) : null,
@@ -157,6 +235,8 @@ export function useDesktopSession() {
   const submittingRef = useRef(false);
   const imageRunDraftRef = useRef<AttachmentRunDraft | null>(null);
   const activeRunIdRef = useRef<string | null>(null);
+  const [collapsedToolGroups, setCollapsedToolGroups] = useState<ReadonlySet<string>>(() => new Set());
+  const autoExpandedErrorGroupsRef = useRef<Set<string>>(new Set());
   const [pendingPermissionChange, setPendingPermissionChange] = useState(false);
   const [networkApproval, setNetworkApproval] = useState<{ approvalId: string; message: string } | null>(null);
   const [pendingNetworkDecision, setPendingNetworkDecision] = useState(false);
@@ -177,6 +257,44 @@ export function useDesktopSession() {
   const compactingRef = useRef(false);
   const workspaceSessionIdRef = useRef<string | null>(null);
   const workspaceGenerationRef = useRef(0);
+
+  const readyPlan = workspace?.planState.phase === "ready"
+    ? workspace.planState.latestRevision
+    : null;
+  const canHandoffPlan = Boolean(readyPlan && (
+    workspace?.planState.canHandoff
+    ?? !(workspace?.planState.handoffSourceSessionId || readyPlan.originSessionId)
+  ));
+  const reviewingPlan = Boolean(
+    workspace?.planState.handoffSourceSessionId || readyPlan?.originSessionId,
+  );
+  const visiblePlan = workspace?.planState.latestRevision ?? null;
+  const awaitingPlanDecision = Boolean(
+    readyPlan && supplementingPlanDigest !== readyPlan.digest,
+  );
+  const planStatusPhase = workspace?.planState.phase;
+  const planStatusMessage = planStatusPhase === "uncertain"
+    ? "上一次执行没有可靠的终态记录，无法判断是否完成。请先检查工作区和运行记录，再决定是否重新规划或执行。"
+    : planStatusPhase === "recovery_error"
+      ? "Plan 状态记录校验失败。为避免执行错误或被篡改的 revision，当前计划已被锁定。"
+      : null;
+  const planBadgeLabel = planStatusPhase === "ready" ? "PLAN READY"
+    : planStatusPhase === "uncertain" ? "PLAN UNCERTAIN"
+      : planStatusPhase === "recovery_error" ? "PLAN RECOVERY" : "PLAN";
+  const conversationReadOnly = Boolean(workspace?.archived) || Boolean(pendingSessionArchive);
+  const composerBlocked = !workspace || awaitingPlanDecision || planCommandMenuOpen
+    || compacting || sessionNavigating || Boolean(planStatusMessage) || conversationReadOnly;
+  const canQueueWhileRunning = Boolean(
+    workspace
+    && running
+    && !compacting
+    && !composerBlocked
+    && !workspace.archived
+    && !startingRun
+    && pendingPlanAction === null
+    && !sessionNavigating
+    && !pendingSessionArchive,
+  );
 
   const setMemoryState = useCallback((memory: MemoryStatePayload) => {
     setWorkspace((current) => (current ? { ...current, memory: { ...current.memory, ...memory } } : current));
@@ -259,6 +377,7 @@ export function useDesktopSession() {
       archivedViewRef.current = false;
       setShowArchivedSessions(false);
       setSessions([]);
+      setMemoryDrawerOpen(false);
     }
     workspacePathRef.current = payload.path;
     if (restoreTimeline) {
@@ -275,15 +394,24 @@ export function useDesktopSession() {
       attachments.clear();
       imageRunDraftRef.current = null;
       activeRunIdRef.current = null;
+      queueRequestIdRef.current += 1;
+      queuingRef.current = false;
+      setQueuing(false);
+      setStartingRun(false);
+      setCollapsedToolGroups(new Set());
+      autoExpandedErrorGroupsRef.current = new Set();
     }
     workspaceSessionIdRef.current = payload.sessionId;
     setWorkspace(payload);
     if (restoreTimeline) {
       setRequestedChange(null);
+      setCollapsedToolGroups(new Set());
+      autoExpandedErrorGroupsRef.current = new Set();
       setTimelineState(createTimelineStateFromMessages(payload.messages, payload.sessionId, payload.turnChanges));
     }
     setCommandMenuOpen(false);
     setModelPickerOpen(false);
+    clearToast();
     setNetworkApproval(null);
     setCustomPlanAnswer("");
     setSupplementingPlanDigest(null);
@@ -648,9 +776,19 @@ export function useDesktopSession() {
   };
 
   const openModelPicker = async (query = "") => {
+    const sessionId = workspaceSessionIdRef.current;
+    setError(null);
     setModelQuery(query);
-    setModelOptions(await window.agent.request<ModelOption[]>("model.list"));
-    setModelPickerOpen(true);
+    try {
+      const models = await window.agent.request<ModelOption[]>("model.list");
+      if (sessionId && workspaceSessionIdRef.current !== sessionId) return;
+      setModelOptions(models);
+      setModelPickerOpen(true);
+    } catch (reason) {
+      if (sessionId && workspaceSessionIdRef.current !== sessionId) return;
+      setModelPickerOpen(false);
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
   };
 
   const manageSubagents = async (action: string, value = "") => {
@@ -694,7 +832,7 @@ export function useDesktopSession() {
 
   const executeSlashCommand = async (name: string, args = "") => {
     if (sessionNavigationRef.current) return;
-    setInput("");
+    setInput((current) => (current.trimStart().startsWith("/") ? "" : current));
     setCommandMenuOpen(false);
     setError(null);
     try {
@@ -791,7 +929,7 @@ export function useDesktopSession() {
             enabled: action === "on",
           });
           setWorkspace((current) => current ? { ...current, memory } : current);
-          addNotice(`长期记忆已${action === "on" ? "开启" : "关闭"}。`);
+          showToast(`长期记忆已${action === "on" ? "开启" : "关闭"}。`, action === "on" ? "ok" : "neutral");
           return;
         }
         if (action === "auto") {
@@ -804,7 +942,7 @@ export function useDesktopSession() {
             enabled: enabled === "on",
           });
           setWorkspace((current) => current ? { ...current, memory } : current);
-          addNotice(`长期记忆自动提取已${enabled === "on" ? "开启" : "关闭"}。`);
+          showToast(`长期记忆自动提取已${enabled === "on" ? "开启" : "关闭"}。`, enabled === "on" ? "ok" : "neutral");
           return;
         }
         if (action === "status") {
@@ -914,18 +1052,19 @@ export function useDesktopSession() {
     if (
       !text
       || !workspace
-      || !running
-      || compacting
-      || composerBlocked
+      || !canQueueWhileRunning
+      || queuingRef.current
       || submittingRef.current
       || planSubmissionRef.current
       || sessionNavigationRef.current
       || sessionArchiveRef.current
-      || workspace.archived
     ) return;
     const sessionId = workspace.sessionId;
     const originalInput = input;
     const method = queueMode === "steer" ? "run.steer" : "run.followUp";
+    const requestId = ++queueRequestIdRef.current;
+    queuingRef.current = true;
+    setQueuing(true);
     setError(null);
     try {
       await window.agent.request(method, {
@@ -933,12 +1072,17 @@ export function useDesktopSession() {
         sessionId,
         ...(activeRunIdRef.current ? { runId: activeRunIdRef.current } : {}),
       });
-      if (workspaceSessionIdRef.current === sessionId) {
+      if (workspaceSessionIdRef.current === sessionId && queueRequestIdRef.current === requestId) {
         setInput((current) => current === originalInput ? "" : current);
       }
     } catch (reason) {
-      if (workspaceSessionIdRef.current === sessionId) {
+      if (workspaceSessionIdRef.current === sessionId && queueRequestIdRef.current === requestId) {
         setError(reason instanceof Error ? reason.message : String(reason));
+      }
+    } finally {
+      if (queueRequestIdRef.current === requestId) {
+        queuingRef.current = false;
+        setQueuing(false);
       }
     }
   };
@@ -974,6 +1118,7 @@ export function useDesktopSession() {
     const images = attachments.images.map(({ data, mime_type }) => ({ data, mime_type }));
     const files = attachments.files.map(({ name, data, mime_type }) => ({ name, data, mime_type }));
     submittingRef.current = true;
+    setStartingRun(true);
     setRunning(true);
     try {
       const result = await window.agent.request<{ runId: string }>("run.start", {
@@ -993,6 +1138,7 @@ export function useDesktopSession() {
       if (imageRunDraftRef.current === imageDraft) imageRunDraftRef.current = null;
     } finally {
       submittingRef.current = false;
+      setStartingRun(false);
     }
   };
 
@@ -1093,14 +1239,6 @@ export function useDesktopSession() {
       setError(reason instanceof Error ? reason.message : String(reason));
     }
   };
-
-  const readyPlan = workspace?.planState.phase === "ready"
-    ? workspace.planState.latestRevision
-    : null;
-  const canHandoffPlan = Boolean(readyPlan && (
-    workspace?.planState.canHandoff
-    ?? !(workspace?.planState.handoffSourceSessionId || readyPlan.originSessionId)
-  ));
 
   const handoffPlan = async () => {
     const plan = workspace?.planState.latestRevision;
@@ -1246,6 +1384,26 @@ export function useDesktopSession() {
     || command.label.toLocaleLowerCase().includes(commandQuery),
   );
 
+  const toggleCommandMenu = useCallback(() => {
+    if (!workspace || running || compacting || composerBlocked || workspace.archived) return;
+    setModelPickerOpen(false);
+    setSelectedCommandIndex(0);
+    setCommandMenuOpen((open) => !open);
+    requestAnimationFrame(() => composerRef.current?.focus());
+  }, [workspace, running, compacting, composerBlocked]);
+
+  useEffect(() => {
+    if (!commandMenuOpen) return;
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setCommandMenuOpen(false);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [commandMenuOpen]);
+
   const onInputChange = (value: string) => {
     setInput(value);
     const isCommandSearch = Boolean(workspace)
@@ -1293,7 +1451,7 @@ export function useDesktopSession() {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       if (running) {
-        void sendQueuedMessage();
+        if (canQueueWhileRunning) void sendQueuedMessage();
       } else {
         void submit();
       }
@@ -1358,41 +1516,51 @@ export function useDesktopSession() {
     return sidecarStatus.startsWith("error:") ? "运行时异常" : "运行时已断开";
   }, [sidecarStatus]);
 
-  const reviewingPlan = Boolean(
-    workspace?.planState.handoffSourceSessionId || readyPlan?.originSessionId,
-  );
-  const visiblePlan = workspace?.planState.latestRevision ?? null;
-  const awaitingPlanDecision = Boolean(
-    readyPlan && supplementingPlanDigest !== readyPlan.digest,
-  );
-  const planStatusPhase = workspace?.planState.phase;
-  const planStatusMessage = planStatusPhase === "uncertain"
-    ? "上一次执行没有可靠的终态记录，无法判断是否完成。请先检查工作区和运行记录，再决定是否重新规划或执行。"
-    : planStatusPhase === "recovery_error"
-      ? "Plan 状态记录校验失败。为避免执行错误或被篡改的 revision，当前计划已被锁定。"
-      : null;
-  const planBadgeLabel = planStatusPhase === "ready" ? "PLAN READY"
-    : planStatusPhase === "uncertain" ? "PLAN UNCERTAIN"
-      : planStatusPhase === "recovery_error" ? "PLAN RECOVERY" : "PLAN";
-  const conversationReadOnly = Boolean(workspace?.archived) || Boolean(pendingSessionArchive);
-  const composerBlocked = !workspace || awaitingPlanDecision || planCommandMenuOpen
-    || compacting || sessionNavigating || Boolean(planStatusMessage) || conversationReadOnly;
+  const toggleToolGroup = useCallback((groupId: string) => {
+    setCollapsedToolGroups((current) => {
+      const next = new Set(current);
+      if (next.has(groupId)) next.delete(groupId);
+      else next.add(groupId);
+      return next;
+    });
+  }, []);
 
   const timelineItems = useMemo(() => selectTimelineItems(timelineState), [timelineState]);
   const renderedPlan = ["ready", "uncertain", "recovery_error"].includes(planStatusPhase ?? "")
     ? visiblePlan : null;
-  const renderTimelineItems = useMemo<RenderTimelineItem[]>(() => {
-    const grouped: RenderTimelineItem[] = [];
+
+  const groupedTimelineEntries = useMemo(() => {
+    type GroupedEntry =
+      | { kind: "item"; item: Exclude<TimelineItem, TimelineToolItem> }
+      | {
+          kind: "group";
+          groupId: string;
+          order: number;
+          revision: number;
+          tools: TimelineToolItem[];
+          label: string;
+          hasApproval: boolean;
+          hasRunning: boolean;
+          hasError: boolean;
+          errorCount: number;
+          railToneClass: string;
+        };
+
+    const raw: Array<
+      | { kind: "item"; item: Exclude<TimelineItem, TimelineToolItem> }
+      | { kind: "tools"; groupId: string; order: number; revision: number; tools: TimelineToolItem[] }
+    > = [];
+
     for (const item of timelineItems) {
       if (item.kind === "tool") {
-        const previous = grouped[grouped.length - 1];
-        if (previous && previous.kind === "tool-group") {
+        const previous = raw[raw.length - 1];
+        if (previous && previous.kind === "tools") {
           previous.tools.push(item);
           previous.revision += item.revision + 1;
         } else {
-          grouped.push({
-            id: `tool-group:${item.id}`,
-            kind: "tool-group",
+          raw.push({
+            kind: "tools",
+            groupId: `tool-group:${item.id}`,
             order: item.order,
             revision: item.revision + 1,
             tools: [item],
@@ -1400,18 +1568,138 @@ export function useDesktopSession() {
         }
         continue;
       }
-      grouped.push(item);
+      raw.push({ kind: "item", item });
+    }
+
+    return raw.map<GroupedEntry>((entry) => {
+      if (entry.kind === "item") return entry;
+      const hasApproval = entry.tools.some((tool) => Boolean(tool.approval) || tool.status === "approval");
+      const hasRunning = entry.tools.some((tool) => tool.status === "running" || tool.status === "pending");
+      const errorCount = entry.tools.filter((tool) => isToolErrorStatus(tool.status)).length;
+      const hasError = errorCount > 0;
+      return {
+        kind: "group",
+        groupId: entry.groupId,
+        order: entry.order,
+        revision: entry.revision,
+        tools: entry.tools,
+        label: inferGroupLabel(entry.tools),
+        hasApproval,
+        hasRunning,
+        hasError,
+        errorCount,
+        railToneClass: hasApproval ? "thread-rail--warn" : hasError ? "thread-rail--err" : "",
+      };
+    });
+  }, [timelineItems]);
+
+  useEffect(() => {
+    const newlyFailedGroupIds: string[] = [];
+    for (const entry of groupedTimelineEntries) {
+      if (entry.kind === "group" && entry.hasError && !autoExpandedErrorGroupsRef.current.has(entry.groupId)) {
+        autoExpandedErrorGroupsRef.current.add(entry.groupId);
+        newlyFailedGroupIds.push(entry.groupId);
+      }
+    }
+    if (!newlyFailedGroupIds.length) return;
+    setCollapsedToolGroups((current) => {
+      if (!newlyFailedGroupIds.some((id) => current.has(id))) return current;
+      const next = new Set(current);
+      for (const id of newlyFailedGroupIds) next.delete(id);
+      return next;
+    });
+  }, [groupedTimelineEntries]);
+
+  const showWorkingIndicator = useMemo(() => {
+    if (
+      !running
+      || compacting
+      || pendingPlanAction !== null
+      || Boolean(networkApproval)
+      || Boolean(workspace?.planState.pendingQuestion)
+    ) {
+      return false;
+    }
+    const hasActiveOrApprovalTool = timelineItems.some((item) => (
+      item.kind === "tool" && (
+        Boolean(item.approval)
+        || item.status === "approval"
+        || item.status === "running"
+        || item.status === "pending"
+      )
+    ));
+    if (hasActiveOrApprovalTool) return false;
+    const last = timelineItems.at(-1);
+    if (last?.kind === "message" && last.role === "assistant" && last.status === "streaming") {
+      return false;
+    }
+    return true;
+  }, [compacting, networkApproval, pendingPlanAction, running, timelineItems, workspace?.planState.pendingQuestion]);
+
+  const renderTimelineItems = useMemo<RenderTimelineItem[]>(() => {
+    const flattened: RenderTimelineItem[] = [];
+    for (const entry of groupedTimelineEntries) {
+      if (entry.kind === "item") {
+        flattened.push(entry.item);
+        continue;
+      }
+      const isOpen = !collapsedToolGroups.has(entry.groupId) || entry.hasApproval;
+      flattened.push({
+        id: `tool-group-header:${entry.groupId}`,
+        kind: "tool-group-header",
+        groupId: entry.groupId,
+        order: entry.order,
+        revision: entry.revision,
+        label: entry.label,
+        toolCount: entry.tools.length,
+        hasApproval: entry.hasApproval,
+        hasRunning: entry.hasRunning,
+        hasError: entry.hasError,
+        errorCount: entry.errorCount,
+        isOpen,
+      });
+      if (isOpen) {
+        entry.tools.forEach((tool, index) => {
+          flattened.push({
+            id: tool.id,
+            kind: "tool-group-item",
+            groupId: entry.groupId,
+            order: tool.order,
+            revision: tool.revision,
+            tool,
+            railToneClass: entry.railToneClass,
+            isFirst: index === 0,
+          });
+        });
+        flattened.push({
+          id: `tool-group-footer:${entry.groupId}`,
+          kind: "tool-group-footer",
+          groupId: entry.groupId,
+          order: entry.tools[entry.tools.length - 1]?.order ?? entry.order,
+          revision: entry.revision,
+          label: entry.label,
+          railToneClass: entry.railToneClass,
+        });
+      }
+    }
+    if (showWorkingIndicator) {
+      flattened.push({
+        id: "working-indicator",
+        kind: "working",
+        order: timelineState.lastOrder + 0.5,
+        revision: 0,
+      });
     }
     if (renderedPlan) {
-      grouped.push({
+      flattened.push({
         id: `plan:${renderedPlan.planId}:${renderedPlan.revision}:${renderedPlan.digest}`,
         kind: "plan",
         order: timelineState.lastOrder + 1,
         plan: renderedPlan,
       });
     }
-    return grouped;
-  }, [renderedPlan, timelineItems, timelineState.lastOrder]);
+    return flattened;
+  }, [collapsedToolGroups, groupedTimelineEntries, renderedPlan, showWorkingIndicator, timelineState.lastOrder]);
 
   const viewTurnChanges = useCallback((runId: string, path?: string) => {
     setRequestedChange((current) => ({ runId, ...(path ? { path } : {}), serial: (current?.serial ?? 0) + 1 }));
@@ -1457,11 +1745,13 @@ export function useDesktopSession() {
     compacting,
     error,
     setError,
+    toast,
 
     // Timeline
     renderTimelineItems,
     lastTimelineSignature,
     resolveApproval,
+    toggleToolGroup,
     viewTurnChanges,
 
     // Composer & attachments
@@ -1470,6 +1760,8 @@ export function useDesktopSession() {
     setInput,
     queueMode,
     setQueueMode,
+    queuing,
+    canQueueWhileRunning,
     supportsImages,
     attachments,
     composerBlocked,
@@ -1488,6 +1780,7 @@ export function useDesktopSession() {
 
     // Command palette & Model picker
     commandMenuOpen,
+    toggleCommandMenu,
     selectedCommandIndex,
     setSelectedCommandIndex,
     visibleCommands,

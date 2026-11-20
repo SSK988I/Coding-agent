@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { RefreshCw, Trash2, X } from "lucide-react";
 import type { MemoryStatePayload } from "../../../shared/types";
 
@@ -25,19 +25,42 @@ interface MemoryConflictItem {
 
 type MemoryTab = "all" | "global" | "project" | "conflicts";
 
+interface PendingRecordForget {
+  workspaceKey: string;
+  id: string;
+}
+
+interface PendingConflictForget {
+  workspaceKey: string;
+  scope: string;
+  key: string;
+}
+
+interface PendingClearState {
+  workspaceKey: string;
+  target: "project" | "all";
+}
+
+function formatMemoryValue(value: unknown): string {
+  return typeof value === "string" ? value : JSON.stringify(value);
+}
+
 export function MemoryDrawer({
   open,
+  workspaceKey,
   memory,
   disabled,
   onClose,
   onMemoryChange,
 }: {
   open: boolean;
+  workspaceKey?: string;
   memory: MemoryStatePayload;
   disabled: boolean;
   onClose: () => void;
   onMemoryChange: (next: MemoryStatePayload) => void;
 }) {
+  const activeWorkspaceKey = workspaceKey ?? JSON.stringify([memory.projectId ?? null, memory.userId ?? null]);
   const [tab, setTab] = useState<MemoryTab>("all");
   const [records, setRecords] = useState<MemoryListItem[]>([]);
   const [conflicts, setConflicts] = useState<MemoryConflictItem[]>([]);
@@ -45,11 +68,30 @@ export function MemoryDrawer({
   const [error, setError] = useState<string | null>(null);
   const [rememberText, setRememberText] = useState("");
   const [rememberScope, setRememberScope] = useState<"project" | "global">("project");
-  const [pendingForgetId, setPendingForgetId] = useState<string | null>(null);
-  const [pendingClear, setPendingClear] = useState<"project" | "all" | null>(null);
+  const [pendingForget, setPendingForget] = useState<PendingRecordForget | null>(null);
+  const [pendingConflictForget, setPendingConflictForget] = useState<PendingConflictForget | null>(null);
+  const [pendingClear, setPendingClear] = useState<PendingClearState | null>(null);
   const [busyAction, setBusyAction] = useState(false);
 
+  const mountedRef = useRef(true);
+  const openRef = useRef(open);
+  const workspaceKeyRef = useRef(activeWorkspaceKey);
+  const loadGenerationRef = useRef(0);
+
+  openRef.current = open;
+  workspaceKeyRef.current = activeWorkspaceKey;
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      loadGenerationRef.current += 1;
+    };
+  }, []);
+
   const loadAll = useCallback(async () => {
+    const generation = ++loadGenerationRef.current;
+    const targetWorkspaceKey = workspaceKeyRef.current;
     setLoading(true);
     setError(null);
     try {
@@ -58,20 +100,64 @@ export function MemoryDrawer({
         window.agent.request<MemoryListItem[]>("memory.list", {}),
         window.agent.request<MemoryConflictItem[]>("memory.conflicts", {}),
       ]);
+      if (
+        !mountedRef.current
+        || !openRef.current
+        || workspaceKeyRef.current !== targetWorkspaceKey
+        || loadGenerationRef.current !== generation
+      ) {
+        return;
+      }
       onMemoryChange(status);
       setRecords(Array.isArray(list) ? list : []);
       setConflicts(Array.isArray(conflictList) ? conflictList : []);
     } catch (reason) {
+      if (
+        !mountedRef.current
+        || !openRef.current
+        || workspaceKeyRef.current !== targetWorkspaceKey
+        || loadGenerationRef.current !== generation
+      ) {
+        return;
+      }
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
-      setLoading(false);
+      if (
+        mountedRef.current
+        && workspaceKeyRef.current === targetWorkspaceKey
+        && loadGenerationRef.current === generation
+      ) {
+        setLoading(false);
+      }
     }
   }, [onMemoryChange]);
 
   useEffect(() => {
-    if (!open) return;
+    loadGenerationRef.current += 1;
+    setTab("all");
+    setRecords([]);
+    setConflicts([]);
+    setLoading(false);
+    setError(null);
+    setRememberText("");
+    setPendingForget(null);
+    setPendingConflictForget(null);
+    setPendingClear(null);
+    setBusyAction(false);
+  }, [activeWorkspaceKey]);
+
+  useEffect(() => {
+    if (!open) {
+      loadGenerationRef.current += 1;
+      setLoading(false);
+      setError(null);
+      setPendingForget(null);
+      setPendingConflictForget(null);
+      setPendingClear(null);
+      return;
+    }
     void loadAll();
-  }, [open, loadAll]);
+  }, [open, activeWorkspaceKey, loadAll]);
 
   useEffect(() => {
     if (!open) return;
@@ -84,35 +170,47 @@ export function MemoryDrawer({
 
   if (!open) return null;
 
+  const isCurrentWorkspace = (targetKey: string) => (
+    mountedRef.current && workspaceKeyRef.current === targetKey
+  );
+
   const toggleEnabled = async () => {
     if (disabled || busyAction) return;
+    const targetWorkspaceKey = workspaceKeyRef.current;
     setBusyAction(true);
     setError(null);
     try {
       const next = await window.agent.request<MemoryStatePayload>("memory.setEnabled", {
         enabled: !memory.enabled,
       });
+      if (!isCurrentWorkspace(targetWorkspaceKey)) return;
       onMemoryChange(next);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      if (isCurrentWorkspace(targetWorkspaceKey)) {
+        setError(reason instanceof Error ? reason.message : String(reason));
+      }
     } finally {
-      setBusyAction(false);
+      if (isCurrentWorkspace(targetWorkspaceKey)) setBusyAction(false);
     }
   };
 
   const toggleAutoExtract = async () => {
     if (disabled || busyAction || !memory.enabled) return;
+    const targetWorkspaceKey = workspaceKeyRef.current;
     setBusyAction(true);
     setError(null);
     try {
       const next = await window.agent.request<MemoryStatePayload>("memory.setAutoExtract", {
         enabled: memory.autoExtractEnabled === false,
       });
+      if (!isCurrentWorkspace(targetWorkspaceKey)) return;
       onMemoryChange(next);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      if (isCurrentWorkspace(targetWorkspaceKey)) {
+        setError(reason instanceof Error ? reason.message : String(reason));
+      }
     } finally {
-      setBusyAction(false);
+      if (isCurrentWorkspace(targetWorkspaceKey)) setBusyAction(false);
     }
   };
 
@@ -120,6 +218,7 @@ export function MemoryDrawer({
     event.preventDefault();
     const content = rememberText.trim();
     if (!content || disabled || busyAction) return;
+    const targetWorkspaceKey = workspaceKeyRef.current;
     setBusyAction(true);
     setError(null);
     try {
@@ -127,38 +226,90 @@ export function MemoryDrawer({
         content,
         scope: rememberScope,
       });
+      if (!isCurrentWorkspace(targetWorkspaceKey)) return;
       if (result.memory) onMemoryChange(result.memory);
       setRememberText("");
       await loadAll();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      if (isCurrentWorkspace(targetWorkspaceKey)) {
+        setError(reason instanceof Error ? reason.message : String(reason));
+      }
     } finally {
-      setBusyAction(false);
+      if (isCurrentWorkspace(targetWorkspaceKey)) setBusyAction(false);
     }
   };
 
-  const handleForget = async (keyOrId: string, scope?: string) => {
-    if (disabled || busyAction) return;
+  const handleForgetRecord = async (item: MemoryListItem) => {
+    if (
+      disabled
+      || busyAction
+      || !pendingForget
+      || pendingForget.workspaceKey !== workspaceKeyRef.current
+      || pendingForget.id !== item.record.id
+    ) {
+      return;
+    }
+    const targetWorkspaceKey = pendingForget.workspaceKey;
     setBusyAction(true);
     setError(null);
     try {
       const result = await window.agent.request<{ memory: MemoryStatePayload }>("memory.forget", {
-        key: keyOrId,
-        scope: scope === "global" || scope === "project" ? scope : undefined,
+        key: item.record.id,
+        scope: item.scope === "global" || item.scope === "project" ? item.scope : undefined,
         confirmed: true,
       });
+      if (!isCurrentWorkspace(targetWorkspaceKey)) return;
       if (result.memory) onMemoryChange(result.memory);
-      setPendingForgetId(null);
+      setPendingForget(null);
       await loadAll();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      if (isCurrentWorkspace(targetWorkspaceKey)) {
+        setError(reason instanceof Error ? reason.message : String(reason));
+      }
     } finally {
-      setBusyAction(false);
+      if (isCurrentWorkspace(targetWorkspaceKey)) setBusyAction(false);
     }
   };
 
-  const handleClear = async (allScopes: boolean) => {
-    if (disabled || busyAction) return;
+  const handleForgetConflict = async (item: MemoryConflictItem) => {
+    if (
+      disabled
+      || busyAction
+      || !pendingConflictForget
+      || pendingConflictForget.workspaceKey !== workspaceKeyRef.current
+      || pendingConflictForget.scope !== item.scope
+      || pendingConflictForget.key !== item.conflict.key
+    ) {
+      return;
+    }
+    const targetWorkspaceKey = pendingConflictForget.workspaceKey;
+    setBusyAction(true);
+    setError(null);
+    try {
+      const result = await window.agent.request<{ memory: MemoryStatePayload }>("memory.forget", {
+        key: item.conflict.key,
+        scope: item.scope === "global" || item.scope === "project" ? item.scope : undefined,
+        confirmed: true,
+      });
+      if (!isCurrentWorkspace(targetWorkspaceKey)) return;
+      if (result.memory) onMemoryChange(result.memory);
+      setPendingConflictForget(null);
+      await loadAll();
+    } catch (reason) {
+      if (isCurrentWorkspace(targetWorkspaceKey)) {
+        setError(reason instanceof Error ? reason.message : String(reason));
+      }
+    } finally {
+      if (isCurrentWorkspace(targetWorkspaceKey)) setBusyAction(false);
+    }
+  };
+
+  const handleClear = async () => {
+    if (disabled || busyAction || !pendingClear || pendingClear.workspaceKey !== workspaceKeyRef.current) {
+      return;
+    }
+    const targetWorkspaceKey = pendingClear.workspaceKey;
+    const allScopes = pendingClear.target === "all";
     setBusyAction(true);
     setError(null);
     try {
@@ -166,16 +317,20 @@ export function MemoryDrawer({
         allScopes,
         confirmed: true,
       });
+      if (!isCurrentWorkspace(targetWorkspaceKey)) return;
       if (result.memory) onMemoryChange(result.memory);
       setPendingClear(null);
       await loadAll();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      if (isCurrentWorkspace(targetWorkspaceKey)) {
+        setError(reason instanceof Error ? reason.message : String(reason));
+      }
     } finally {
-      setBusyAction(false);
+      if (isCurrentWorkspace(targetWorkspaceKey)) setBusyAction(false);
     }
   };
 
+  const activePendingClear = pendingClear?.workspaceKey === activeWorkspaceKey ? pendingClear : null;
   const visibleRecords = records.filter((item) => tab === "all" || item.scope === tab);
   const globalCount = records.filter((item) => item.scope === "global").length;
   const projectCount = records.filter((item) => item.scope === "project").length;
@@ -311,78 +466,132 @@ export function MemoryDrawer({
           {loading && !records.length && <p className="memory-drawer__empty">正在加载长期记忆…</p>}
 
           {tab === "conflicts" ? (
-            conflicts.length ? conflicts.map((item) => (
-              <div className="memory-drawer__card memory-drawer__card--conflict" key={`${item.scope}:${item.conflict.key}`}>
-                <div className="memory-drawer__card-meta">
-                  <code>{item.conflict.key}</code>
-                  <span>{item.scope === "project" ? "项目" : "全局"} · 冲突未注入</span>
+            conflicts.length ? conflicts.map((item) => {
+              const isPendingConflict = pendingConflictForget?.workspaceKey === activeWorkspaceKey
+                && pendingConflictForget.scope === item.scope
+                && pendingConflictForget.key === item.conflict.key;
+              return (
+                <div className="memory-drawer__card memory-drawer__card--conflict" key={`${item.scope}:${item.conflict.key}`}>
+                  <div className="memory-drawer__card-meta">
+                    <code>{item.conflict.key}</code>
+                    <span className="memory-drawer__card-meta-actions">
+                      <span>{item.scope === "project" ? "项目" : "全局"} · 冲突未注入</span>
+                      {!isPendingConflict && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setPendingForget(null);
+                            setPendingClear(null);
+                            setPendingConflictForget({
+                              workspaceKey: activeWorkspaceKey,
+                              scope: item.scope,
+                              key: item.conflict.key,
+                            });
+                          }}
+                          disabled={disabled || busyAction}
+                        >
+                          遗忘整组冲突
+                        </button>
+                      )}
+                    </span>
+                  </div>
+                  <div className="memory-drawer__candidates">
+                    {item.conflict.candidates.map((candidate) => (
+                      <div className="memory-drawer__candidate" key={candidate.id}>
+                        <span>{formatMemoryValue(candidate.value)}</span>
+                        {candidate.authority && <small>{candidate.authority}</small>}
+                      </div>
+                    ))}
+                  </div>
+                  {isPendingConflict && (
+                    <div
+                      className="memory-drawer__conflict-confirm"
+                      role="region"
+                      aria-label={`确认遗忘冲突组 ${item.conflict.key}`}
+                    >
+                      <p>
+                        遗忘冲突键 <code>{item.conflict.key}</code> 将同时删除以下全部{" "}
+                        {item.conflict.candidates.length} 个候选值并写入墓碑：
+                      </p>
+                      <ul>
+                        {item.conflict.candidates.map((candidate) => (
+                          <li key={candidate.id}>{formatMemoryValue(candidate.value)}</li>
+                        ))}
+                      </ul>
+                      <div className="memory-drawer__confirm-row">
+                        <button
+                          type="button"
+                          className="danger"
+                          onClick={() => void handleForgetConflict(item)}
+                          disabled={disabled || busyAction}
+                        >
+                          确认遗忘整组
+                        </button>
+                        <button type="button" onClick={() => setPendingConflictForget(null)}>取消</button>
+                      </div>
+                    </div>
+                  )}
                 </div>
-                <div className="memory-drawer__candidates">
-                  {item.conflict.candidates.map((candidate) => (
-                    <div className="memory-drawer__candidate" key={candidate.id}>
-                      <span>{typeof candidate.value === "string" ? candidate.value : JSON.stringify(candidate.value)}</span>
+              );
+            }) : <p className="memory-drawer__empty">当前没有待解决的记忆冲突。</p>
+          ) : (
+            visibleRecords.length ? visibleRecords.map((item) => {
+              const isPendingRecord = pendingForget?.workspaceKey === activeWorkspaceKey
+                && pendingForget.id === item.record.id;
+              return (
+                <div className="memory-drawer__card" key={item.record.id}>
+                  <div className="memory-drawer__card-meta">
+                    <span>{item.scope === "project" ? "项目" : "全局"} · {item.record.kind}</span>
+                    {isPendingRecord ? (
+                      <span className="memory-drawer__confirm-row">
+                        <button
+                          type="button"
+                          className="danger"
+                          onClick={() => void handleForgetRecord(item)}
+                          disabled={disabled || busyAction}
+                        >
+                          确认遗忘
+                        </button>
+                        <button type="button" onClick={() => setPendingForget(null)}>取消</button>
+                      </span>
+                    ) : (
                       <button
                         type="button"
-                        onClick={() => void handleForget(candidate.id, item.scope)}
+                        onClick={() => {
+                          setPendingConflictForget(null);
+                          setPendingClear(null);
+                          setPendingForget({ workspaceKey: activeWorkspaceKey, id: item.record.id });
+                        }}
                         disabled={disabled || busyAction}
                       >
                         遗忘
                       </button>
-                    </div>
-                  ))}
+                    )}
+                  </div>
+                  <div className="memory-drawer__card-value">
+                    {formatMemoryValue(item.record.value)}
+                  </div>
+                  <div className="memory-drawer__card-foot">
+                    <code>{item.record.key}</code>
+                    <span>{item.record.updated_at}</span>
+                  </div>
                 </div>
-              </div>
-            )) : <p className="memory-drawer__empty">当前没有待解决的记忆冲突。</p>
-          ) : (
-            visibleRecords.length ? visibleRecords.map((item) => (
-              <div className="memory-drawer__card" key={item.record.id}>
-                <div className="memory-drawer__card-meta">
-                  <span>{item.scope === "project" ? "项目" : "全局"} · {item.record.kind}</span>
-                  {pendingForgetId === item.record.id ? (
-                    <span className="memory-drawer__confirm-row">
-                      <button
-                        type="button"
-                        className="danger"
-                        onClick={() => void handleForget(item.record.id, item.scope)}
-                        disabled={disabled || busyAction}
-                      >
-                        确认遗忘
-                      </button>
-                      <button type="button" onClick={() => setPendingForgetId(null)}>取消</button>
-                    </span>
-                  ) : (
-                    <button
-                      type="button"
-                      onClick={() => setPendingForgetId(item.record.id)}
-                      disabled={disabled || busyAction}
-                    >
-                      遗忘
-                    </button>
-                  )}
-                </div>
-                <div className="memory-drawer__card-value">
-                  {typeof item.record.value === "string" ? item.record.value : JSON.stringify(item.record.value)}
-                </div>
-                <div className="memory-drawer__card-foot">
-                  <code>{item.record.key}</code>
-                  <span>{item.record.updated_at}</span>
-                </div>
-              </div>
-            )) : !loading && <p className="memory-drawer__empty">暂无匹配的长期记忆。</p>
+              );
+            }) : !loading && <p className="memory-drawer__empty">暂无匹配的长期记忆。</p>
           )}
         </div>
 
         <footer className="memory-drawer__footer">
           <span>遗忘会写入墓碑，防止旧会话重放恢复</span>
-          {pendingClear ? (
+          {activePendingClear ? (
             <div className="memory-drawer__confirm-row">
               <button
                 type="button"
                 className="danger"
-                onClick={() => void handleClear(pendingClear === "all")}
+                onClick={() => void handleClear()}
                 disabled={disabled || busyAction}
               >
-                确认清空{pendingClear === "all" ? "全部" : "项目"}
+                确认清空{activePendingClear.target === "all" ? "全部" : "项目"}
               </button>
               <button type="button" onClick={() => setPendingClear(null)}>取消</button>
             </div>
@@ -390,7 +599,11 @@ export function MemoryDrawer({
             <button
               type="button"
               className="memory-drawer__clear-btn"
-              onClick={() => setPendingClear("project")}
+              onClick={() => {
+                setPendingForget(null);
+                setPendingConflictForget(null);
+                setPendingClear({ workspaceKey: activeWorkspaceKey, target: "project" });
+              }}
               disabled={disabled || busyAction}
             >
               <Trash2 size={12} strokeWidth={1.6} aria-hidden="true" />

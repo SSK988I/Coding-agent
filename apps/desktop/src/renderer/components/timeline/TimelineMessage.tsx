@@ -44,17 +44,22 @@ export const TimelineMessageCard = memo(function TimelineMessageCard({
     );
   }
 
-  const markdownText = message.text || (message.status === "streaming" && !message.thinking ? "正在思考…" : "");
-  const thinkingOnly = Boolean(message.thinking) && !markdownText;
+  const isWaitingForFirstToken = message.status === "streaming" && !message.text && !message.thinking;
+  const isStreamingThinking = message.status === "streaming" && !message.text && Boolean(message.thinking);
+  const thinkingOnly = Boolean(message.thinking) && !message.text;
 
   return (
     <article className={`message assistant ${thinkingOnly ? "message--thinking-only" : ""}`.trim()}>
       <div className="message-body">
         {message.images?.length ? <MessageImages images={message.images} /> : null}
         {message.files?.length ? <MessageFiles files={message.files} /> : null}
-        {markdownText && (
-          <Markdown remarkPlugins={markdownPlugins}>{markdownText}</Markdown>
-        )}
+        {message.text ? (
+          <Markdown remarkPlugins={markdownPlugins}>{message.text}</Markdown>
+        ) : isWaitingForFirstToken ? (
+          <div className="working-indicator working-indicator--inline" data-testid="working-indicator" aria-live="polite">
+            <span className="working-shimmer">Working</span>
+          </div>
+        ) : null}
         {message.thinking && (
           <details
             className="thinking-block"
@@ -65,8 +70,8 @@ export const TimelineMessageCard = memo(function TimelineMessageCard({
               <span className="thread-trigger__icon" aria-hidden="true">
                 <Sparkles size={14} strokeWidth={1.55} />
               </span>
-              <span className="thread-trigger__label">
-                {message.status === "streaming" && !message.text ? "正在思考…" : "思考过程"}
+              <span className={`thread-trigger__label ${isStreamingThinking ? "thinking-block__label--streaming" : ""}`.trim()}>
+                {isStreamingThinking ? "正在思考…" : "思考过程"}
               </span>
               <span className="thread-trigger__chevron" aria-hidden="true">
                 {thinkingOpen ? <ChevronDown size={14} strokeWidth={1.5} /> : <ChevronRight size={14} strokeWidth={1.5} />}

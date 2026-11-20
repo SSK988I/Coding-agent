@@ -140,16 +140,23 @@ export function Sidebar({
               className={`memory-toggle ${workspace.memory.enabled ? "on" : "off"}`}
               onClick={onToggleMemory}
               disabled={running || compacting || sessionNavigating}
+              aria-pressed={workspace.memory.enabled}
             >
-              {workspace.memory.enabled ? "已开启" : "已关闭"}
+              <span className={`status-dot ${workspace.memory.enabled ? "status-dot--ok" : ""}`.trim()} aria-hidden="true" />
+              <span>{workspace.memory.enabled ? "已开启" : "已关闭"}</span>
             </button>
             <button
               type="button"
-              className={`memory-toggle ${workspace.memory.autoExtractEnabled === false ? "off" : "on"}`}
+              className={`memory-toggle ${workspace.memory.enabled && workspace.memory.autoExtractEnabled !== false ? "on" : "off"}`}
               onClick={onToggleAutoExtract}
               disabled={running || compacting || sessionNavigating || !workspace.memory.enabled}
+              aria-pressed={workspace.memory.enabled && workspace.memory.autoExtractEnabled !== false}
             >
-              {workspace.memory.autoExtractEnabled === false ? "自动提取关闭" : "自动提取开启"}
+              <span
+                className={`status-dot ${workspace.memory.enabled && workspace.memory.autoExtractEnabled !== false ? "status-dot--ok" : ""}`.trim()}
+                aria-hidden="true"
+              />
+              <span>{workspace.memory.autoExtractEnabled === false ? "自动提取关闭" : "自动提取开启"}</span>
             </button>
           </div>
 
