@@ -276,6 +276,7 @@ export interface DesktopBridge {
 export interface DesktopShell {
   workbenchRequest?<T = unknown>(method: string, params: Record<string, unknown>): Promise<T>;
   onWorkbenchEvent?(listener: (event: import("./workbench").WorkbenchNativeEvent) => void): () => void;
+  setTheme?(theme: "light" | "dark"): Promise<void>;
   chooseWorkspace(): Promise<string | null>;
   getBootstrap(): Promise<BootstrapInfo>;
 }

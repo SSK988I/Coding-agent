@@ -525,6 +525,56 @@ describe("timeline state", () => {
 
     expect(completed.activeMessageIdsByRun).toEqual({});
     expect(afterLateDelta).toBe(completed);
-    expect((selectTimelineItems(completed)[0] as TimelineMessageItem).text).toBe("");
+    expect(selectTimelineItems(completed)).toEqual([]);
+  });
+
+  it("removes empty streaming placeholders and finalizes partial assistant text on run failure or cancellation", () => {
+    const emptyFailed = reduceRuntimeEventBatch(createTimelineState(), [
+      runtimeEvent(1, "run.started"),
+      runtimeEvent(2, "message_start", { message: assistant("") }),
+      runtimeEvent(3, "run.failed", { message: "stream dropped" }),
+    ]);
+    expect(emptyFailed.running).toBe(false);
+    expect(selectTimelineItems(emptyFailed)).toEqual([]);
+
+    const partialCancelled = reduceRuntimeEventBatch(createTimelineState(), [
+      runtimeEvent(1, "run.started"),
+      runtimeEvent(2, "message_start", { message: assistant("") }),
+      runtimeEvent(3, "message_update", { kind: "text_delta", delta: "已收到的部分输出" }),
+      runtimeEvent(4, "run.cancelled"),
+    ]);
+    expect(partialCancelled.running).toBe(false);
+    expect(selectTimelineItems(partialCancelled)).toMatchObject([
+      { kind: "message", role: "assistant", text: "已收到的部分输出", status: "cancelled" },
+    ]);
+  });
+
+  it("displays delivered steer/follow-up user messages live while deduplicating the initial prompt from run.started", () => {
+    const state = reduceRuntimeEventBatch(createTimelineState(), [
+      runtimeEvent(1, "run.started", { text: "原提问" }),
+      // Initial prompt echoed by agent_loop must deduplicate with run.started.
+      runtimeEvent(2, "message_start", { message: { role: "user", content: "原提问" } }),
+      runtimeEvent(3, "message_end", { message: { role: "user", content: "原提问" } }),
+      runtimeEvent(4, "message_start", { message: assistant("") }),
+      runtimeEvent(5, "message_end", { message: assistant("回复一", { stop_reason: "end_turn" }) }),
+      // Delivered steer/follow-up message in the same run must appear between replies.
+      runtimeEvent(6, "message_start", { message: { role: "user", content: "补充指令" } }),
+      runtimeEvent(7, "message_end", { message: { role: "user", content: "补充指令" } }),
+      runtimeEvent(8, "message_start", { message: assistant("") }),
+      runtimeEvent(9, "message_end", { message: assistant("回复二", { stop_reason: "end_turn" }) }),
+      // Even a later follow-up with the same text as the initial prompt must still appear.
+      runtimeEvent(10, "message_start", { message: { role: "user", content: "原提问" } }),
+      runtimeEvent(11, "message_end", { message: { role: "user", content: "原提问" } }),
+      runtimeEvent(12, "run.completed"),
+    ]);
+
+    const items = selectTimelineItems(state) as TimelineMessageItem[];
+    expect(items.map((item) => [item.role, item.text])).toEqual([
+      ["user", "原提问"],
+      ["assistant", "回复一"],
+      ["user", "补充指令"],
+      ["assistant", "回复二"],
+      ["user", "原提问"],
+    ]);
   });
 });

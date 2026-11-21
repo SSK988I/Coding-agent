@@ -257,6 +257,61 @@ describe("ToolCard", () => {
     expect(onResolveApproval).toHaveBeenNthCalledWith(1, approval, false);
     expect(onResolveApproval).toHaveBeenNthCalledWith(2, approval, true);
   });
+
+  it("collapses into a compact thread header with summary hint and expands again", () => {
+    render(<ToolCard tool={tool({ name: "read", args: { path: "src/app.ts" }, result: "export const ok = true;" })} />);
+
+    expect(screen.getByText("export const ok = true;")).toBeInTheDocument();
+    const toggle = screen.getByRole("button", { name: /read/ });
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("export const ok = true;")).not.toBeInTheDocument();
+    expect(screen.getByText("src/app.ts")).toBeInTheDocument();
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("export const ok = true;")).toBeInTheDocument();
+  });
+
+  it("toggles raw tool arguments inspection via the </> control", () => {
+    render(<ToolCard tool={tool({ name: "bash", args: { command: "echo hi", timeout: 30 }, result: "hi" })} />);
+
+    const rawToggle = screen.getByTitle("查看原始工具参数");
+    expect(rawToggle).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(rawToggle);
+    expect(rawToggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText(/"timeout": 30/)).toBeInTheDocument();
+  });
+
+  it("renders specialized web_search results with query and links", () => {
+    const { container } = render(<ToolCard tool={tool({
+      name: "web_search",
+      args: { query: "electron titlebar overlay" },
+      result: {
+        results: [
+          { title: "Electron Docs", url: "https://www.electronjs.org/docs", snippet: "Window Controls Overlay API" },
+        ],
+      },
+    })} />);
+
+    expect(container.querySelector("[data-tool-category=search]")).toBeInTheDocument();
+    expect(screen.getByText("electron titlebar overlay")).toBeInTheDocument();
+    expect(screen.getByText("Electron Docs")).toBeInTheDocument();
+    expect(screen.getByText("Window Controls Overlay API")).toBeInTheDocument();
+  });
+
+  it("renders specialized git_diff output with diff lines", () => {
+    const { container } = render(<ToolCard tool={tool({
+      name: "git_diff",
+      args: { path: "src/index.ts" },
+      result: "--- a/src/index.ts\n+++ b/src/index.ts\n@@ -1 +1 @@\n-old\n+new",
+    })} />);
+
+    expect(container.querySelector("[data-tool-category=read]")).toBeInTheDocument();
+    expect(screen.getByText("Git")).toBeInTheDocument();
+    expect(container.querySelector(".tool-card-view__diff-line--deletion")).toHaveTextContent("-old");
+    expect(container.querySelector(".tool-card-view__diff-line--addition")).toHaveTextContent("+new");
+  });
 });
 
 describe("parseUnifiedDiff", () => {

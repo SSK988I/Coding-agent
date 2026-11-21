@@ -84,6 +84,7 @@ export interface TimelineState {
   orderedIds: readonly string[];
   activeMessageIdsByRun: Readonly<Record<string, string>>;
   messageIdsByRoute: Readonly<Record<string, string>>;
+  initialUserMatchedByRun: Readonly<Record<string, boolean>>;
   activeCompactionId: string | null;
   lastOrder: number;
   assistantSequence: number;
@@ -122,6 +123,7 @@ export function createTimelineState(items: readonly TimelineItem[] = []): Timeli
     orderedIds,
     activeMessageIdsByRun: {},
     messageIdsByRoute: {},
+    initialUserMatchedByRun: {},
     activeCompactionId: null,
     lastOrder,
     assistantSequence,
@@ -298,6 +300,7 @@ export function reduceRuntimeEventBatch(
   let orderedIds: string[] | undefined;
   const activeMessageIdsByRun: Record<string, string> = { ...state.activeMessageIdsByRun };
   const messageIdsByRoute: Record<string, string> = { ...state.messageIdsByRoute };
+  const initialUserMatchedByRun: Record<string, boolean> = { ...state.initialUserMatchedByRun };
   let activeCompactionId = state.activeCompactionId;
   let lastOrder = state.lastOrder;
   let assistantSequence = state.assistantSequence;
@@ -417,19 +420,54 @@ export function reduceRuntimeEventBatch(
       continue;
     }
     if (type === "run.completed" || type === "run.cancelled" || type === "run.failed") {
+      const terminalStatus = type === "run.completed"
+        ? "end_turn"
+        : type === "run.cancelled"
+          ? "cancelled"
+          : "error";
+
       for (const [id, item] of Object.entries(entities)) {
-        if (item.kind !== "tool" || item.sessionId !== envelope.sessionId
-          || item.runId !== envelope.runId || !isToolActive(item.status)) continue;
-        pendingToolUpdates.delete(id);
-        entities[id] = {
-          ...item, approval: undefined, status: "uncertain",
-          result: item.result ?? "运行已结束，但未收到工具终态。", revision: item.revision + 1,
-          updatedAt: envelope.timestamp, lastSeq: envelope.seq,
-        };
-        changed = true;
+        if (item.sessionId !== envelope.sessionId || item.runId !== envelope.runId) continue;
+
+        if (item.kind === "tool" && isToolActive(item.status)) {
+          pendingToolUpdates.delete(id);
+          entities[id] = {
+            ...item,
+            approval: undefined,
+            status: "uncertain",
+            result: item.result ?? "运行已结束，但未收到工具终态。",
+            revision: item.revision + 1,
+            updatedAt: envelope.timestamp,
+            lastSeq: envelope.seq,
+          };
+          changed = true;
+          continue;
+        }
+
+        if (item.kind === "message" && item.role === "assistant" && item.status === "streaming") {
+          applyPendingDelta(id);
+          const current = entities[id];
+          if (!current || current.kind !== "message") continue;
+          if (!current.text && !current.thinking && !current.images?.length && !current.files?.length) {
+            remove(id);
+          } else {
+            entities[id] = {
+              ...current,
+              status: terminalStatus,
+              revision: current.revision + 1,
+              updatedAt: envelope.timestamp,
+              lastSeq: envelope.seq,
+            };
+            changed = true;
+          }
+        }
       }
       if (running) {
         running = false;
+        changed = true;
+      }
+      if (initialUserMatchedByRun[runKey]) {
+        delete initialUserMatchedByRun[runKey];
         changed = true;
       }
       clearMessageRoutes(runKey);
@@ -505,7 +543,56 @@ export function reduceRuntimeEventBatch(
     }
     if (type === "message_end") {
       const raw = agentMessage(payload.message);
-      if (raw?.role !== "assistant") continue;
+      if (!raw) continue;
+      if (raw.role === "user") {
+        const content = readAgentMessageContent(raw);
+        if (!content.text && !content.images?.length && !content.files?.length) continue;
+        const initialId = `user:${encodeURIComponent(runKey)}`;
+        const initialItem = entities[initialId];
+        if (
+          initialItem?.kind === "message"
+          && initialItem.role === "user"
+          && !initialUserMatchedByRun[runKey]
+          && initialItem.text === content.text
+          && (initialItem.images?.length ?? 0) === (content.images?.length ?? 0)
+          && (initialItem.files?.length ?? 0) === (content.files?.length ?? 0)
+        ) {
+          const hasSubsequentRunActivity = Object.values(entities).some((candidate) => (
+            candidate.id !== initialId
+            && candidate.sessionId === envelope.sessionId
+            && candidate.runId === envelope.runId
+            && candidate.order > initialItem.order
+          ));
+          if (!hasSubsequentRunActivity) {
+            initialUserMatchedByRun[runKey] = true;
+            changed = true;
+            continue;
+          }
+        }
+        const protocolMessageId = protocolMessageIdFromPayload(payload);
+        const id = protocolMessageId
+          ? `user:${encodeURIComponent(runKey)}:${encodeURIComponent(protocolMessageId)}`
+          : `user:${encodeURIComponent(runKey)}:${envelope.seq}`;
+        if (entities[id]) continue;
+        insert({
+          id,
+          kind: "message",
+          order: nextOrder(),
+          revision: 0,
+          sessionId: envelope.sessionId,
+          runId: envelope.runId,
+          createdAt: envelope.timestamp,
+          updatedAt: envelope.timestamp,
+          lastSeq: envelope.seq,
+          role: "user",
+          text: content.text,
+          thinking: "",
+          ...(content.images?.length ? { images: content.images } : {}),
+          ...(content.files?.length ? { files: content.files } : {}),
+        });
+        continue;
+      }
+      if (raw.role !== "assistant") continue;
       const id = resolveMessageId(
         activeMessageIdsByRun,
         messageIdsByRoute,
@@ -717,6 +804,7 @@ export function reduceRuntimeEventBatch(
     orderedIds: orderedIds ?? state.orderedIds,
     activeMessageIdsByRun,
     messageIdsByRoute,
+    initialUserMatchedByRun,
     activeCompactionId,
     lastOrder,
     assistantSequence,

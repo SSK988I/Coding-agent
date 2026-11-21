@@ -1144,8 +1144,25 @@ class DesktopRuntime:
             for scope, conflict in conflicts
         ]
 
+    def _ensure_memory_scope(self, params: dict[str, Any]) -> None:
+        session = self._require_session()
+        expected_workspace = params.get("workspacePath")
+        expected_session = params.get("sessionId")
+        if expected_workspace is not None:
+            if not isinstance(expected_workspace, str) or not expected_workspace.strip():
+                raise RpcError("INVALID_PARAMS", "workspacePath 必须是非空字符串")
+            workspace = self._require_workspace()
+            if expected_workspace != str(workspace):
+                raise RpcError("STALE_WORKSPACE", "当前工作区已切换，请重新确认后再操作长期记忆")
+        if expected_session is not None:
+            if not isinstance(expected_session, str) or not expected_session.strip():
+                raise RpcError("INVALID_PARAMS", "sessionId 必须是非空字符串")
+            if expected_session != session.session_manager.header.id:
+                raise RpcError("STALE_WORKSPACE", "当前会话已切换，请重新确认后再操作长期记忆")
+
     async def _memory_forget(self, params: dict[str, Any]) -> dict[str, Any]:
         self._ensure_no_active_run("任务运行时不能修改长期记忆")
+        self._ensure_memory_scope(params)
         key = params.get("key")
         scope = params.get("scope")
         confirmed = params.get("confirmed")
@@ -1163,6 +1180,7 @@ class DesktopRuntime:
 
     async def _memory_remember(self, params: dict[str, Any]) -> dict[str, Any]:
         self._ensure_no_active_run("任务运行时不能修改长期记忆")
+        self._ensure_memory_scope(params)
         content = params.get("content")
         scope = params.get("scope", "global")
         if not isinstance(content, str) or not content.strip():
@@ -1181,6 +1199,7 @@ class DesktopRuntime:
 
     async def _memory_clear(self, params: dict[str, Any]) -> dict[str, Any]:
         self._ensure_no_active_run("任务运行时不能清空长期记忆")
+        self._ensure_memory_scope(params)
         all_scopes = params.get("allScopes")
         if not isinstance(all_scopes, bool) or params.get("confirmed") is not True:
             raise RpcError("CONFIRMATION_REQUIRED", "清空记忆需要范围和显式确认")
@@ -1191,6 +1210,7 @@ class DesktopRuntime:
 
     async def _memory_set_enabled(self, params: dict[str, Any]) -> dict[str, Any]:
         self._ensure_no_active_run("任务运行时不能切换长期记忆")
+        self._ensure_memory_scope(params)
         enabled = params.get("enabled")
         if not isinstance(enabled, bool):
             raise RpcError("INVALID_PARAMS", "memory.setEnabled 需要 enabled")
@@ -1208,6 +1228,7 @@ class DesktopRuntime:
 
     async def _memory_set_auto_extract(self, params: dict[str, Any]) -> dict[str, Any]:
         self._ensure_no_active_run("任务运行时不能切换自动提取")
+        self._ensure_memory_scope(params)
         enabled = params.get("enabled")
         if not isinstance(enabled, bool):
             raise RpcError("INVALID_PARAMS", "memory.setAutoExtract 需要 enabled")
