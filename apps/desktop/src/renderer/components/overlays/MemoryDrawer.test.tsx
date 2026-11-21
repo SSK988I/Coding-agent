@@ -318,4 +318,29 @@ describe("MemoryDrawer", () => {
     expect(backdropBlock).not.toBeNull();
     expect(backdropBlock?.[0]).toMatch(/inset:\s*48px\s+0\s+0\s+0\s*;/);
   });
+
+  it("includes workspacePath and sessionId on memory write RPCs", async () => {
+    render(
+      <MemoryDrawer
+        open
+        workspaceKey={JSON.stringify(["E:\\code\\project-a", "project-a"])}
+        workspacePath={"E:\\code\\project-a"}
+        sessionId="session-a"
+        memory={baseMemory()}
+        disabled={false}
+        onClose={onClose}
+        onMemoryChange={onMemoryChange}
+      />,
+    );
+    await screen.findByText("使用简洁中文回复");
+
+    fireEvent.click(screen.getByRole("button", { name: /清空项目记忆/ }));
+    fireEvent.click(screen.getByRole("button", { name: "确认清空项目" }));
+    await waitFor(() => expect(request).toHaveBeenCalledWith("memory.clear", {
+      allScopes: false,
+      confirmed: true,
+      workspacePath: "E:\\code\\project-a",
+      sessionId: "session-a",
+    }));
+  });
 });

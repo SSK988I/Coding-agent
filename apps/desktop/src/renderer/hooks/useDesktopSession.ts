@@ -197,6 +197,8 @@ export function useDesktopSession() {
   const [compacting, setCompacting] = useState(false);
   const [workspaceSwitching, setWorkspaceSwitching] = useState(false);
   const workspaceSwitchingRef = useRef(false);
+  const [workspaceSyncUncertain, setWorkspaceSyncUncertain] = useState(false);
+  const workspaceSyncUncertainRef = useRef(false);
   const [pendingSessionNavigation, setPendingSessionNavigation] = useState<string | null>(null);
   const sessionNavigationRef = useRef(false);
   const sessionNavigating = pendingSessionNavigation !== null;
@@ -303,12 +305,12 @@ export function useDesktopSession() {
   );
 
   const openMemoryDrawer = useCallback(() => {
-    if (workspaceSwitchingRef.current) return;
+    if (workspaceSwitchingRef.current || workspaceSyncUncertainRef.current) return;
     setMemoryDrawerOpen(true);
   }, []);
 
   const toggleMemoryDrawer = useCallback(() => {
-    if (workspaceSwitchingRef.current) return;
+    if (workspaceSwitchingRef.current || workspaceSyncUncertainRef.current) return;
     setMemoryDrawerOpen((value) => !value);
   }, []);
 
@@ -420,6 +422,8 @@ export function useDesktopSession() {
       autoExpandedErrorGroupsRef.current = new Set();
     }
     workspaceSessionIdRef.current = payload.sessionId;
+    workspaceSyncUncertainRef.current = false;
+    setWorkspaceSyncUncertain(false);
     setWorkspace(payload);
     if (restoreTimeline) {
       setRequestedChange(null);
@@ -589,7 +593,29 @@ export function useDesktopSession() {
       setSidecarStatus("ready");
       applyWorkspace(result);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      const detail = reason instanceof Error ? reason.message : String(reason);
+      const previousPath = workspacePathRef.current;
+      const previousSessionId = workspaceSessionIdRef.current;
+      if (previousPath && previousSessionId) {
+        workspaceSyncUncertainRef.current = true;
+        setWorkspaceSyncUncertain(true);
+        try {
+          const scope = await window.agent.request<{ workspacePath?: string; sessionId?: string }>("workbench.scope");
+          if (scope?.workspacePath === previousPath && scope?.sessionId === previousSessionId) {
+            workspaceSyncUncertainRef.current = false;
+            setWorkspaceSyncUncertain(false);
+            setError(detail);
+          } else if (scope?.workspacePath && scope.workspacePath !== previousPath) {
+            setError(`打开工作区失败（${detail}），后端当前活动工作区已切换到 ${scope.workspacePath}；已锁定记忆写入，请重新打开工作区以同步。`);
+          } else {
+            setError(`打开工作区失败（${detail}），无法确认后端当前工作区；已锁定记忆写入，请重新打开工作区。`);
+          }
+        } catch {
+          setError(`打开工作区失败（${detail}），无法确认后端当前工作区；已锁定记忆写入，请重新打开工作区。`);
+        }
+      } else {
+        setError(detail);
+      }
     } finally {
       if (!alreadyLocked) {
         workspaceSwitchingRef.current = false;
@@ -879,9 +905,13 @@ export function useDesktopSession() {
     }
   };
 
-  const executeSlashCommand = async (name: string, args = "") => {
+  const executeSlashCommand = async (
+    name: string,
+    args = "",
+    options?: { consumeInput?: boolean },
+  ) => {
     if (sessionNavigationRef.current || workspaceSwitchingRef.current) return;
-    setInput((current) => (current.trimStart().startsWith("/") ? "" : current));
+    if (options?.consumeInput) setInput("");
     setCommandMenuMode(null);
     setCommandPaletteQuery("");
     setError(null);
@@ -974,9 +1004,18 @@ export function useDesktopSession() {
       if (name === "memory") {
         const parts = tokenizeCommandArguments(args);
         const action = parts[0]?.toLocaleLowerCase() || "status";
+        const memoryWriteActions = new Set(["on", "off", "auto", "remember", "forget", "clear"]);
+        if (workspaceSyncUncertainRef.current && memoryWriteActions.has(action)) {
+          setError("当前工作区状态尚未确认同步，已锁定长期记忆写入，请先重新打开工作区。");
+          return;
+        }
+        const scopeParams = workspace
+          ? { workspacePath: workspace.path, sessionId: workspace.sessionId }
+          : {};
         if (action === "on" || action === "off") {
           const memory = await window.agent.request<WorkspacePayload["memory"]>("memory.setEnabled", {
             enabled: action === "on",
+            ...scopeParams,
           });
           setWorkspace((current) => current ? { ...current, memory } : current);
           showToast(`长期记忆已${action === "on" ? "开启" : "关闭"}。`, action === "on" ? "ok" : "neutral");
@@ -990,6 +1029,7 @@ export function useDesktopSession() {
           }
           const memory = await window.agent.request<WorkspacePayload["memory"]>("memory.setAutoExtract", {
             enabled: enabled === "on",
+            ...scopeParams,
           });
           setWorkspace((current) => current ? { ...current, memory } : current);
           showToast(`长期记忆自动提取已${enabled === "on" ? "开启" : "关闭"}。`, enabled === "on" ? "ok" : "neutral");
@@ -1010,7 +1050,7 @@ export function useDesktopSession() {
           const result = await window.agent.request<{
             record: Record<string, unknown> | null;
             memory: WorkspacePayload["memory"];
-          }>("memory.remember", parsed);
+          }>("memory.remember", { ...parsed, ...scopeParams });
           setWorkspace((current) => current ? { ...current, memory: result.memory } : current);
           addNotice(result.record
             ? `已记住（${parsed.scope}）：\`${String(result.record.id)}\`。可用 \`/memory forget ${String(result.record.id)}\` 遗忘。`
@@ -1066,6 +1106,7 @@ export function useDesktopSession() {
             key,
             scope,
             confirmed: true,
+            ...scopeParams,
           });
           setWorkspace((current) => current ? { ...current, memory: result.memory } : current);
           addNotice(result.removed ? "记忆已遗忘并写入墓碑。" : "未找到该记忆。");
@@ -1083,6 +1124,7 @@ export function useDesktopSession() {
           }>("memory.clear", {
             allScopes,
             confirmed: true,
+            ...scopeParams,
           });
           setWorkspace((current) => current ? { ...current, memory: result.memory } : current);
           addNotice(`已遗忘 ${result.count} 条记忆，并保留墓碑记录。`);
@@ -1154,7 +1196,7 @@ export function useDesktopSession() {
       }
       const [rawName, ...rest] = text.slice(1).split(/\s+/);
       const command = commandOptions.find((item) => item.name === rawName.toLocaleLowerCase());
-      if (command) await executeSlashCommand(command.name, rest.join(" "));
+      if (command) await executeSlashCommand(command.name, rest.join(" "), { consumeInput: true });
       else setError(`未知命令：/${rawName}`);
       return;
     }
@@ -1518,10 +1560,10 @@ export function useDesktopSession() {
         closeCommandMenu();
         return;
       }
-      if ((event.key === "Enter" || event.key === "Tab") && visibleCommands.length) {
+      if ((event.key === "Enter" || (event.key === "Tab" && !event.shiftKey)) && visibleCommands.length) {
         event.preventDefault();
         const command = visibleCommands[Math.min(selectedCommandIndex, visibleCommands.length - 1)];
-        void executeSlashCommand(command.name);
+        void executeSlashCommand(command.name, "", { consumeInput: commandMenuMode === "inline" });
         return;
       }
     }
@@ -1829,6 +1871,7 @@ export function useDesktopSession() {
     statusLabel,
     workspace,
     workspaceSwitching,
+    workspaceSyncUncertain,
     sessions,
     showArchivedSessions,
     sessionsLoading,

@@ -75,7 +75,7 @@ export function CommandPalette({
       onClose?.();
       return;
     }
-    if ((event.key === "Enter" || event.key === "Tab") && commands.length) {
+    if (event.key === "Enter" && commands.length) {
       event.preventDefault();
       const command = commands[Math.min(selectedIndex, commands.length - 1)];
       onExecute(command.name);

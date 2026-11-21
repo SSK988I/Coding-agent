@@ -707,4 +707,122 @@ describe("desktop frontend refactor capabilities", () => {
     expect(screen.getByText("半截回答")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "复制回复" })).toBeInTheDocument();
   });
+
+  it("locks memory writes after workspace.open fails with drifted backend scope until re-synced", async () => {
+    const projectA: WorkspacePayload = {
+      ...makeWorkspace(),
+      path: "E:\\code\\project-a",
+      sessionId: "session-a",
+      memory: { ...makeWorkspace().memory, projectId: "project-a", projectCount: 1 },
+    };
+    const projectB: WorkspacePayload = {
+      ...makeWorkspace(),
+      path: "E:\\code\\project-b",
+      sessionId: "session-b",
+      memory: { ...makeWorkspace().memory, projectId: "project-b", projectCount: 1 },
+    };
+
+    let openBAttempts = 0;
+    let backendScope = { workspacePath: projectA.path, sessionId: projectA.sessionId };
+    window.desktop.chooseWorkspace = async () => projectB.path;
+    request.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+      if (method === "workspace.open") {
+        if (params?.path === projectB.path) {
+          openBAttempts += 1;
+          backendScope = { workspacePath: projectB.path, sessionId: projectB.sessionId };
+          if (openBAttempts === 1) {
+            throw new Error("memory snapshot failed");
+          }
+          return projectB;
+        }
+        return projectA;
+      }
+      if (method === "workbench.scope") return backendScope;
+      if (method === "session.list" || method === "command.list") return [];
+      if (method === "memory.status") return projectB.memory;
+      if (method === "memory.list" || method === "memory.conflicts") return [];
+      if (method === "memory.clear") return { count: 1, memory: projectB.memory };
+      return {};
+    });
+
+    mount();
+    await screen.findByText("Claude Sonnet");
+
+    // Attempt to open Project B -> backend switches to B but snapshot throws.
+    fireEvent.click(screen.getByRole("button", { name: "打开项目" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(/已切换到 E:\\code\\project-b.*已锁定记忆写入/);
+
+    // Memory drawer and toggles remain locked so Project A UI cannot clear Project B's memories.
+    expect(screen.getByRole("button", { name: "管理长期记忆" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "已开启" })).toBeDisabled();
+    expect(request).not.toHaveBeenCalledWith("memory.clear", expect.anything());
+
+    // Re-opening Project B succeeds -> lock clears and subsequent clear carries Project B's scope.
+    fireEvent.click(screen.getByRole("button", { name: "打开项目" }));
+    const memoryBtn = await screen.findByRole("button", { name: "管理长期记忆" });
+    await waitFor(() => expect(memoryBtn).toBeEnabled());
+    fireEvent.click(memoryBtn);
+    await screen.findByRole("dialog", { name: "长期记忆管理" });
+    fireEvent.click(screen.getByRole("button", { name: /清空项目记忆/ }));
+    fireEvent.click(screen.getByRole("button", { name: "确认清空项目" }));
+    await waitFor(() => expect(request).toHaveBeenCalledWith("memory.clear", {
+      allScopes: false,
+      confirmed: true,
+      workspacePath: projectB.path,
+      sessionId: projectB.sessionId,
+    }));
+  });
+
+  it("keeps Shift+Tab/Tab navigation inert in toolbar command search and preserves /-prefixed chat drafts", async () => {
+    request.mockImplementation(async (method: string) => {
+      if (method === "workspace.open") return makeWorkspace();
+      if (method === "session.list") return [];
+      if (method === "command.list") {
+        return [
+          { name: "clear", label: "清空会话", description: "重置当前对话" },
+          { name: "help", label: "帮助", description: "显示可用命令" },
+        ];
+      }
+      return {};
+    });
+
+    mount();
+    await screen.findByText("Claude Sonnet");
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "/memory remember 以后用 pnpm --project" } });
+
+    // Open toolbar command palette and filter for "clear", then press Shift+Tab and Tab -> must NOT execute session.clear!
+    fireEvent.click(screen.getByRole("button", { name: "打开命令菜单" }));
+    const search = await screen.findByRole("searchbox", { name: "筛选命令" });
+    fireEvent.change(search, { target: { value: "clear" } });
+    fireEvent.keyDown(search, { key: "Tab", shiftKey: true });
+    fireEvent.keyDown(search, { key: "Tab" });
+    expect(request).not.toHaveBeenCalledWith("session.clear");
+
+    // Execute /help from toolbar palette -> must NOT erase the /-prefixed draft in composer!
+    fireEvent.change(search, { target: { value: "help" } });
+    fireEvent.keyDown(search, { key: "Enter" });
+    expect(await screen.findByText("可用命令")).toBeInTheDocument();
+    expect(textarea).toHaveValue("/memory remember 以后用 pnpm --project");
+  });
+
+  it("renders delivered steer/follow-up user messages live between assistant turns without duplicating the initial prompt", async () => {
+    mount();
+    await screen.findByText("Claude Sonnet");
+
+    await emit("run.started", { text: "原提问" }, "run-live-1");
+    await emit("message_start", { message: { role: "user", content: "原提问" } }, "run-live-1");
+    await emit("message_end", { message: { role: "user", content: "原提问" } }, "run-live-1");
+    await emit("message_start", { message: { role: "assistant", content: "" } }, "run-live-1");
+    await emit("message_end", { message: { role: "assistant", content: "回复一", stop_reason: "end_turn" } }, "run-live-1");
+    await emit("message_start", { message: { role: "user", content: "补充转向指令" } }, "run-live-1");
+    await emit("message_end", { message: { role: "user", content: "补充转向指令" } }, "run-live-1");
+    await emit("message_start", { message: { role: "assistant", content: "" } }, "run-live-1");
+    await emit("message_end", { message: { role: "assistant", content: "回复二", stop_reason: "end_turn" } }, "run-live-1");
+    await emit("run.completed", {}, "run-live-1");
+
+    expect(screen.getAllByText("原提问")).toHaveLength(1);
+    const messages = Array.from(document.querySelectorAll(".message .message-body")).map((node) => node.textContent?.trim());
+    expect(messages).toEqual(["原提问", "回复一复制", "补充转向指令", "回复二复制"]);
+  });
 });

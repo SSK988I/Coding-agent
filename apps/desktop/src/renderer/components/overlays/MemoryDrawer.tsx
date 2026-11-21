@@ -48,6 +48,8 @@ function formatMemoryValue(value: unknown): string {
 export function MemoryDrawer({
   open,
   workspaceKey,
+  workspacePath,
+  sessionId,
   memory,
   disabled,
   onClose,
@@ -55,12 +57,18 @@ export function MemoryDrawer({
 }: {
   open: boolean;
   workspaceKey?: string;
+  workspacePath?: string;
+  sessionId?: string;
   memory: MemoryStatePayload;
   disabled: boolean;
   onClose: () => void;
   onMemoryChange: (next: MemoryStatePayload) => void;
 }) {
   const activeWorkspaceKey = workspaceKey ?? JSON.stringify([memory.projectId ?? null, memory.userId ?? null]);
+  const scopeParams = {
+    ...(workspacePath ? { workspacePath } : {}),
+    ...(sessionId ? { sessionId } : {}),
+  };
   const [tab, setTab] = useState<MemoryTab>("all");
   const [records, setRecords] = useState<MemoryListItem[]>([]);
   const [conflicts, setConflicts] = useState<MemoryConflictItem[]>([]);
@@ -182,6 +190,7 @@ export function MemoryDrawer({
     try {
       const next = await window.agent.request<MemoryStatePayload>("memory.setEnabled", {
         enabled: !memory.enabled,
+        ...scopeParams,
       });
       if (!isCurrentWorkspace(targetWorkspaceKey)) return;
       onMemoryChange(next);
@@ -202,6 +211,7 @@ export function MemoryDrawer({
     try {
       const next = await window.agent.request<MemoryStatePayload>("memory.setAutoExtract", {
         enabled: memory.autoExtractEnabled === false,
+        ...scopeParams,
       });
       if (!isCurrentWorkspace(targetWorkspaceKey)) return;
       onMemoryChange(next);
@@ -225,6 +235,7 @@ export function MemoryDrawer({
       const result = await window.agent.request<{ memory: MemoryStatePayload }>("memory.remember", {
         content,
         scope: rememberScope,
+        ...scopeParams,
       });
       if (!isCurrentWorkspace(targetWorkspaceKey)) return;
       if (result.memory) onMemoryChange(result.memory);
@@ -257,6 +268,7 @@ export function MemoryDrawer({
         key: item.record.id,
         scope: item.scope === "global" || item.scope === "project" ? item.scope : undefined,
         confirmed: true,
+        ...scopeParams,
       });
       if (!isCurrentWorkspace(targetWorkspaceKey)) return;
       if (result.memory) onMemoryChange(result.memory);
@@ -290,6 +302,7 @@ export function MemoryDrawer({
         key: item.conflict.key,
         scope: item.scope === "global" || item.scope === "project" ? item.scope : undefined,
         confirmed: true,
+        ...scopeParams,
       });
       if (!isCurrentWorkspace(targetWorkspaceKey)) return;
       if (result.memory) onMemoryChange(result.memory);
@@ -316,6 +329,7 @@ export function MemoryDrawer({
       const result = await window.agent.request<{ memory: MemoryStatePayload }>("memory.clear", {
         allScopes,
         confirmed: true,
+        ...scopeParams,
       });
       if (!isCurrentWorkspace(targetWorkspaceKey)) return;
       if (result.memory) onMemoryChange(result.memory);

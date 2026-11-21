@@ -192,7 +192,7 @@ export function App() {
         planStatusActive={Boolean(session.planStatusMessage)}
         theme={theme}
         busyWorkspaceActions={session.running || session.compacting || session.sessionNavigating || session.workspaceSwitching}
-        workspaceSwitching={session.workspaceSwitching}
+        memoryLocked={session.workspaceSwitching || session.workspaceSyncUncertain}
         onToggleSidebar={toggleSidebar}
         onToggleWorkbench={toggleWorkbench}
         onToggleMemoryDrawer={toggleMemoryDrawer}
@@ -227,6 +227,7 @@ export function App() {
             || session.sessionNavigating
             || session.workspaceSwitching
           }
+          memoryLocked={session.workspaceSwitching || session.workspaceSyncUncertain}
           running={session.running}
           compacting={session.compacting}
           sessionNavigating={session.sessionNavigating}
@@ -335,7 +336,9 @@ export function App() {
                 query={session.commandPaletteQuery}
                 onQueryChange={session.onCommandPaletteQueryChange}
                 onSelectIndex={session.setSelectedCommandIndex}
-                onExecute={(name) => void session.executeSlashCommand(name)}
+                onExecute={(name) => void session.executeSlashCommand(name, "", {
+                  consumeInput: session.commandMenuMode === "inline",
+                })}
                 onClose={session.closeCommandMenu}
               />
             )}
@@ -423,9 +426,17 @@ export function App() {
         <MemoryDrawer
           key={memoryWorkspaceKey}
           workspaceKey={memoryWorkspaceKey}
+          workspacePath={workspace.path}
+          sessionId={workspace.sessionId}
           open={session.memoryDrawerOpen}
           memory={workspace.memory}
-          disabled={session.running || session.compacting || session.sessionNavigating || session.workspaceSwitching}
+          disabled={
+            session.running
+            || session.compacting
+            || session.sessionNavigating
+            || session.workspaceSwitching
+            || session.workspaceSyncUncertain
+          }
           onClose={session.closeMemoryDrawer}
           onMemoryChange={session.setMemoryState}
         />

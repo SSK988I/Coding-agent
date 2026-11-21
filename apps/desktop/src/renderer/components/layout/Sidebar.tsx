@@ -13,6 +13,7 @@ export interface SidebarProps {
   pendingSessionArchive: string | null;
   disabledSessions: boolean;
   disabledWorkspaceControls: boolean;
+  memoryLocked?: boolean;
   running: boolean;
   compacting: boolean;
   sessionNavigating: boolean;
@@ -40,6 +41,7 @@ export function Sidebar({
   pendingSessionArchive,
   disabledSessions,
   disabledWorkspaceControls,
+  memoryLocked = false,
   running,
   compacting,
   sessionNavigating,
@@ -127,7 +129,7 @@ export function Sidebar({
               type="button"
               className="workspace-quick-tile"
               onClick={onOpenMemoryDrawer}
-              disabled={disabledWorkspaceControls && !running}
+              disabled={memoryLocked || (disabledWorkspaceControls && !running)}
               title="打开记忆详情与冲突管理"
             >
               <span className="workspace-quick-tile__label">记忆</span>
@@ -140,7 +142,7 @@ export function Sidebar({
               type="button"
               className={`memory-toggle ${workspace.memory.enabled ? "on" : "off"}`}
               onClick={onToggleMemory}
-              disabled={disabledWorkspaceControls}
+              disabled={disabledWorkspaceControls || memoryLocked}
               aria-pressed={workspace.memory.enabled}
             >
               <span className={`status-dot ${workspace.memory.enabled ? "status-dot--ok" : ""}`.trim()} aria-hidden="true" />
@@ -150,7 +152,7 @@ export function Sidebar({
               type="button"
               className={`memory-toggle ${workspace.memory.enabled && workspace.memory.autoExtractEnabled !== false ? "on" : "off"}`}
               onClick={onToggleAutoExtract}
-              disabled={disabledWorkspaceControls || !workspace.memory.enabled}
+              disabled={disabledWorkspaceControls || memoryLocked || !workspace.memory.enabled}
               aria-pressed={workspace.memory.enabled && workspace.memory.autoExtractEnabled !== false}
             >
               <span
