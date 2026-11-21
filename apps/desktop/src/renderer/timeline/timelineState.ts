@@ -417,16 +417,47 @@ export function reduceRuntimeEventBatch(
       continue;
     }
     if (type === "run.completed" || type === "run.cancelled" || type === "run.failed") {
+      const terminalStatus = type === "run.completed"
+        ? "end_turn"
+        : type === "run.cancelled"
+          ? "cancelled"
+          : "error";
+
       for (const [id, item] of Object.entries(entities)) {
-        if (item.kind !== "tool" || item.sessionId !== envelope.sessionId
-          || item.runId !== envelope.runId || !isToolActive(item.status)) continue;
-        pendingToolUpdates.delete(id);
-        entities[id] = {
-          ...item, approval: undefined, status: "uncertain",
-          result: item.result ?? "运行已结束，但未收到工具终态。", revision: item.revision + 1,
-          updatedAt: envelope.timestamp, lastSeq: envelope.seq,
-        };
-        changed = true;
+        if (item.sessionId !== envelope.sessionId || item.runId !== envelope.runId) continue;
+
+        if (item.kind === "tool" && isToolActive(item.status)) {
+          pendingToolUpdates.delete(id);
+          entities[id] = {
+            ...item,
+            approval: undefined,
+            status: "uncertain",
+            result: item.result ?? "运行已结束，但未收到工具终态。",
+            revision: item.revision + 1,
+            updatedAt: envelope.timestamp,
+            lastSeq: envelope.seq,
+          };
+          changed = true;
+          continue;
+        }
+
+        if (item.kind === "message" && item.role === "assistant" && item.status === "streaming") {
+          applyPendingDelta(id);
+          const current = entities[id];
+          if (!current || current.kind !== "message") continue;
+          if (!current.text && !current.thinking && !current.images?.length && !current.files?.length) {
+            remove(id);
+          } else {
+            entities[id] = {
+              ...current,
+              status: terminalStatus,
+              revision: current.revision + 1,
+              updatedAt: envelope.timestamp,
+              lastSeq: envelope.seq,
+            };
+            changed = true;
+          }
+        }
       }
       if (running) {
         running = false;

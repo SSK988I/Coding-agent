@@ -205,7 +205,7 @@ describe("desktop frontend refactor capabilities", () => {
     expect(screen.getByTestId("tool-group")).toHaveTextContent("检查工作区并应用修改");
   });
 
-  it("resets MemoryDrawer clear confirmation when switching from Project A to Project B", async () => {
+  it("locks and closes MemoryDrawer immediately during a delayed Project A to Project B switch", async () => {
     const projectA: WorkspacePayload = {
       ...makeWorkspace(),
       path: "E:\\code\\project-a",
@@ -220,40 +220,61 @@ describe("desktop frontend refactor capabilities", () => {
     };
 
     let currentWorkspace = projectA;
+    let resolveProjectBOpen!: (value: WorkspacePayload) => void;
     window.desktop.chooseWorkspace = async () => projectB.path;
-    request.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+    request.mockImplementation((method: string, params?: Record<string, unknown>) => {
       if (method === "workspace.open") {
-        currentWorkspace = params?.path === projectB.path ? projectB : projectA;
-        return currentWorkspace;
+        if (params?.path === projectB.path) {
+          return new Promise<WorkspacePayload>((resolve) => {
+            resolveProjectBOpen = (payload) => {
+              currentWorkspace = payload;
+              resolve(payload);
+            };
+          });
+        }
+        currentWorkspace = projectA;
+        return Promise.resolve(projectA);
       }
-      if (method === "session.list" || method === "command.list") return [];
-      if (method === "memory.status") return currentWorkspace.memory;
-      if (method === "memory.list" || method === "memory.conflicts") return [];
-      if (method === "memory.clear") return { count: 1, memory: currentWorkspace.memory };
-      return {};
+      if (method === "session.list" || method === "command.list") return Promise.resolve([]);
+      if (method === "memory.status") return Promise.resolve(currentWorkspace.memory);
+      if (method === "memory.list" || method === "memory.conflicts") return Promise.resolve([]);
+      if (method === "memory.clear") return Promise.resolve({ count: 1, memory: currentWorkspace.memory });
+      return Promise.resolve({});
     });
 
     mount();
     fireEvent.click(await screen.findByRole("button", { name: "管理长期记忆" }));
     expect(await screen.findByRole("dialog", { name: "长期记忆管理" })).toBeInTheDocument();
 
+    // Start clear confirmation in Project A while drawer stays open.
     fireEvent.click(screen.getByRole("button", { name: /清空项目记忆/ }));
     expect(screen.getByRole("button", { name: "确认清空项目" })).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "关闭长期记忆管理" }));
-    expect(screen.queryByRole("dialog", { name: "长期记忆管理" })).not.toBeInTheDocument();
-
+    // Initiate workspace switch to Project B while workspace.open(B) is still pending.
     fireEvent.click(screen.getByRole("button", { name: "打开项目" }));
     await waitFor(() => expect(request).toHaveBeenCalledWith("workspace.open", { path: projectB.path, resume: true }));
 
-    fireEvent.click(screen.getByRole("button", { name: "管理长期记忆" }));
+    // Drawer and confirmation must vanish immediately while B is opening, and reopening must be locked.
+    expect(screen.queryByRole("dialog", { name: "长期记忆管理" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "确认清空项目" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "管理长期记忆" })).toBeDisabled();
+    expect(request).not.toHaveBeenCalledWith("memory.clear", expect.anything());
+
+    // Finish opening Project B and verify reopening the drawer starts cleanly with no pending confirmation.
+    await act(async () => {
+      resolveProjectBOpen(projectB);
+      await Promise.resolve();
+    });
+    const memoryBtn = await screen.findByRole("button", { name: "管理长期记忆" });
+    await waitFor(() => expect(memoryBtn).toBeEnabled());
+    fireEvent.click(memoryBtn);
     expect(await screen.findByRole("dialog", { name: "长期记忆管理" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "确认清空项目" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: /清空项目记忆/ })).toBeInTheDocument();
     expect(request).not.toHaveBeenCalledWith("memory.clear", expect.anything());
   });
 
-  it("preserves unsent draft when opening command palette via / button and dismissing with Escape", async () => {
+  it("keeps toolbar / command filtering separate from chat draft, executes on Enter, and preserves draft on Escape", async () => {
     request.mockImplementation(async (method: string) => {
       if (method === "workspace.open") return makeWorkspace();
       if (method === "session.list") return [];
@@ -261,7 +282,11 @@ describe("desktop frontend refactor capabilities", () => {
         return [
           { name: "help", label: "帮助", description: "显示可用命令" },
           { name: "model", label: "模型", description: "切换当前模型" },
+          { name: "memory", label: "长期记忆", description: "查看记忆" },
         ];
+      }
+      if (method === "model.list") {
+        return [{ id: "claude-sonnet", name: "Claude Sonnet", provider: "anthropic", current: true }];
       }
       return {};
     });
@@ -271,13 +296,70 @@ describe("desktop frontend refactor capabilities", () => {
     const textarea = screen.getByRole("textbox");
     fireEvent.change(textarea, { target: { value: "保留这段未发送草稿" } });
 
+    // 1. Click / button -> separate search input filters commands without touching the chat draft.
     fireEvent.click(screen.getByRole("button", { name: "打开命令菜单" }));
-    expect(await screen.findByRole("button", { name: /\/help/ })).toBeInTheDocument();
+    const paletteSearch = await screen.findByRole("searchbox", { name: "筛选命令" });
+    expect(paletteSearch).toHaveFocus();
     expect(textarea).toHaveValue("保留这段未发送草稿");
 
-    fireEvent.keyDown(textarea, { key: "Escape" });
-    await waitFor(() => expect(screen.queryByRole("button", { name: /\/help/ })).not.toBeInTheDocument());
+    fireEvent.change(paletteSearch, { target: { value: "m" } });
+    expect(screen.getByRole("button", { name: /\/model/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /\/help/ })).not.toBeInTheDocument();
     expect(textarea).toHaveValue("保留这段未发送草稿");
+
+    // 2. Pressing Enter executes the filtered command instead of sending "m" as chat text.
+    fireEvent.keyDown(paletteSearch, { key: "Enter" });
+    await waitFor(() => expect(request).toHaveBeenCalledWith("model.list"));
+    expect(request).not.toHaveBeenCalledWith("run.start", expect.anything());
+    expect(textarea).toHaveValue("保留这段未发送草稿");
+
+    // 3. Reopen / palette, filter, and press Escape -> menu closes and draft remains intact.
+    fireEvent.click(screen.getByRole("button", { name: "打开命令菜单" }));
+    const reopenSearch = await screen.findByRole("searchbox", { name: "筛选命令" });
+    fireEvent.change(reopenSearch, { target: { value: "h" } });
+    fireEvent.keyDown(reopenSearch, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("searchbox", { name: "筛选命令" })).not.toBeInTheDocument());
+    expect(request).not.toHaveBeenCalledWith("run.start", expect.anything());
+    expect(textarea).toHaveValue("保留这段未发送草稿");
+  });
+
+  it("ignores Enter while IME composition is active for normal send, running steer/followUp and command palette", async () => {
+    request.mockImplementation(async (method: string) => {
+      if (method === "workspace.open") return makeWorkspace();
+      if (method === "session.list") return [];
+      if (method === "command.list") {
+        return [{ name: "model", label: "模型", description: "切换模型" }];
+      }
+      if (method === "run.start") return { runId: "run-1" };
+      if (method === "run.steer" || method === "run.followUp") return { queued: true };
+      return {};
+    });
+
+    mount();
+    await screen.findByText("Claude Sonnet");
+    const textarea = screen.getByRole("textbox");
+
+    // Idle IME Enter must not call run.start.
+    fireEvent.change(textarea, { target: { value: "中文输入法草稿" } });
+    fireEvent.keyDown(textarea, { key: "Enter", isComposing: true });
+    expect(request).not.toHaveBeenCalledWith("run.start", expect.anything());
+    expect(textarea).toHaveValue("中文输入法草稿");
+
+    // Command palette IME Enter must not execute a slash command.
+    fireEvent.click(screen.getByRole("button", { name: "打开命令菜单" }));
+    const search = await screen.findByRole("searchbox", { name: "筛选命令" });
+    fireEvent.keyDown(search, { key: "Enter", isComposing: true });
+    expect(request).not.toHaveBeenCalledWith("model.list");
+    fireEvent.keyDown(search, { key: "Escape" });
+
+    // Running IME Enter must not send run.steer or run.followUp.
+    await emit("run.started", {}, "run-ime-1");
+    fireEvent.click(screen.getByRole("button", { name: "转向" }));
+    fireEvent.change(textarea, { target: { value: "正在选候选词" } });
+    fireEvent.keyDown(textarea, { key: "Enter", isComposing: true });
+    expect(request).not.toHaveBeenCalledWith("run.steer", expect.anything());
+    expect(request).not.toHaveBeenCalledWith("run.followUp", expect.anything());
+    expect(textarea).toHaveValue("正在选候选词");
   });
 
   it("prevents duplicate queued RPCs on rapid Enter or button clicks and keeps draft on error", async () => {
@@ -462,12 +544,11 @@ describe("desktop frontend refactor capabilities", () => {
       expect(renderedReadCards).toBeLessThan(100);
     });
 
-    // Collapsing the group and receiving an approval re-opens the group cleanly.
-    const header = screen.queryByRole("button", { name: /查阅工作区文件/ });
-    if (header) {
-      fireEvent.click(header);
-      expect(header).toHaveAttribute("aria-expanded", "false");
-    }
+    // Collapse the group while at top of viewport, then emit a trailing approval tool.
+    const header = screen.getByRole("button", { name: /查阅工作区文件/ });
+    fireEvent.click(header);
+    expect(header).toHaveAttribute("aria-expanded", "false");
+
     await emit("tool_execution_start", {
       tool_call_id: "call-edit-approval",
       tool_name: "edit",
@@ -480,10 +561,25 @@ describe("desktop frontend refactor capabilities", () => {
       args: { path: "src/target.ts" },
     }, "run-1");
 
-    const groupHeader = screen.queryByTestId("tool-group");
-    if (groupHeader) {
-      expect(groupHeader).toHaveTextContent("等待审批");
-    }
+    const updatedHeader = screen.getByTestId("tool-group");
+    expect(updatedHeader).toHaveTextContent("等待审批");
+    expect(screen.getByRole("button", { name: /检查工作区并应用修改/ })).toHaveAttribute("aria-expanded", "true");
+
+    // Scroll the virtualized timeline to the trailing approval item and resolve it.
+    const scroller = document.querySelector(".timeline") as HTMLElement;
+    expect(scroller).not.toBeNull();
+    const totalHeight = 203 * 40;
+    Object.defineProperty(scroller, "offsetHeight", { configurable: true, value: 400 });
+    Object.defineProperty(scroller, "scrollHeight", { configurable: true, value: totalHeight });
+    Object.defineProperty(scroller, "scrollTop", { configurable: true, writable: true, value: totalHeight - 400 });
+    fireEvent.scroll(scroller);
+
+    const allowButton = await screen.findByRole("button", { name: "允许一次" });
+    fireEvent.click(allowButton);
+    await waitFor(() => expect(request).toHaveBeenCalledWith("approval.resolve", {
+      approvalId: "appr-200",
+      approved: true,
+    }));
   });
 
   it("displays an error alert when clicking the sidebar model button fails to load models", async () => {
@@ -549,10 +645,11 @@ describe("desktop frontend refactor capabilities", () => {
     await emit("message_start", { message: { role: "assistant", content: "" } }, "run-w1");
     expect(screen.getAllByTestId("working-indicator")).toHaveLength(1);
 
-    // 3. First text delta arrives -> Working disappears.
+    // 3. First text delta arrives -> Working disappears, and message_end does NOT flash Working before run.completed.
     await emit("message_update", { kind: "text_delta", delta: "正在检查" }, "run-w1");
     expect(screen.queryByTestId("working-indicator")).not.toBeInTheDocument();
-    await emit("message_end", { message: { role: "assistant", content: "正在检查" } }, "run-w1");
+    await emit("message_end", { message: { role: "assistant", content: "正在检查", stop_reason: "end_turn" } }, "run-w1");
+    expect(screen.queryByTestId("working-indicator")).not.toBeInTheDocument();
 
     // 4. Active tool hides Working; once tool completes while run continues, Working returns for the inter-step gap.
     await emit("tool_execution_start", {
@@ -587,5 +684,27 @@ describe("desktop frontend refactor capabilities", () => {
     // 6. Run completion hides Working cleanly.
     await emit("run.completed", {}, "run-w1");
     expect(screen.queryByTestId("working-indicator")).not.toBeInTheDocument();
+  });
+
+  it("clears empty Working placeholder when a run fails or is cancelled without message_end", async () => {
+    mount();
+    await screen.findByText("Claude Sonnet");
+
+    await emit("run.started", {}, "run-fail-1");
+    await emit("message_start", { message: { role: "assistant", content: "" } }, "run-fail-1");
+    expect(screen.getByTestId("working-indicator")).toHaveTextContent("Working");
+
+    await emit("run.failed", { message: "upstream timeout" }, "run-fail-1");
+    expect(screen.queryByTestId("working-indicator")).not.toBeInTheDocument();
+    expect(await screen.findByRole("alert")).toHaveTextContent("upstream timeout");
+
+    // Also verify partial text survives cancellation without remaining stuck in streaming state.
+    await emit("run.started", {}, "run-cancel-1");
+    await emit("message_start", { message: { role: "assistant", content: "" } }, "run-cancel-1");
+    await emit("message_update", { kind: "text_delta", delta: "半截回答" }, "run-cancel-1");
+    await emit("run.cancelled", {}, "run-cancel-1");
+    expect(screen.queryByTestId("working-indicator")).not.toBeInTheDocument();
+    expect(screen.getByText("半截回答")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "复制回复" })).toBeInTheDocument();
   });
 });

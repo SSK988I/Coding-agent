@@ -525,6 +525,27 @@ describe("timeline state", () => {
 
     expect(completed.activeMessageIdsByRun).toEqual({});
     expect(afterLateDelta).toBe(completed);
-    expect((selectTimelineItems(completed)[0] as TimelineMessageItem).text).toBe("");
+    expect(selectTimelineItems(completed)).toEqual([]);
+  });
+
+  it("removes empty streaming placeholders and finalizes partial assistant text on run failure or cancellation", () => {
+    const emptyFailed = reduceRuntimeEventBatch(createTimelineState(), [
+      runtimeEvent(1, "run.started"),
+      runtimeEvent(2, "message_start", { message: assistant("") }),
+      runtimeEvent(3, "run.failed", { message: "stream dropped" }),
+    ]);
+    expect(emptyFailed.running).toBe(false);
+    expect(selectTimelineItems(emptyFailed)).toEqual([]);
+
+    const partialCancelled = reduceRuntimeEventBatch(createTimelineState(), [
+      runtimeEvent(1, "run.started"),
+      runtimeEvent(2, "message_start", { message: assistant("") }),
+      runtimeEvent(3, "message_update", { kind: "text_delta", delta: "已收到的部分输出" }),
+      runtimeEvent(4, "run.cancelled"),
+    ]);
+    expect(partialCancelled.running).toBe(false);
+    expect(selectTimelineItems(partialCancelled)).toMatchObject([
+      { kind: "message", role: "assistant", text: "已收到的部分输出", status: "cancelled" },
+    ]);
   });
 });

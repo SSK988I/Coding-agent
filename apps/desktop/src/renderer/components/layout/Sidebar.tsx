@@ -127,6 +127,7 @@ export function Sidebar({
               type="button"
               className="workspace-quick-tile"
               onClick={onOpenMemoryDrawer}
+              disabled={disabledWorkspaceControls && !running}
               title="打开记忆详情与冲突管理"
             >
               <span className="workspace-quick-tile__label">记忆</span>
@@ -139,7 +140,7 @@ export function Sidebar({
               type="button"
               className={`memory-toggle ${workspace.memory.enabled ? "on" : "off"}`}
               onClick={onToggleMemory}
-              disabled={running || compacting || sessionNavigating}
+              disabled={disabledWorkspaceControls}
               aria-pressed={workspace.memory.enabled}
             >
               <span className={`status-dot ${workspace.memory.enabled ? "status-dot--ok" : ""}`.trim()} aria-hidden="true" />
@@ -149,7 +150,7 @@ export function Sidebar({
               type="button"
               className={`memory-toggle ${workspace.memory.enabled && workspace.memory.autoExtractEnabled !== false ? "on" : "off"}`}
               onClick={onToggleAutoExtract}
-              disabled={running || compacting || sessionNavigating || !workspace.memory.enabled}
+              disabled={disabledWorkspaceControls || !workspace.memory.enabled}
               aria-pressed={workspace.memory.enabled && workspace.memory.autoExtractEnabled !== false}
             >
               <span

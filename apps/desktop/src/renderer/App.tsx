@@ -40,12 +40,12 @@ export function App() {
     setInput,
     setSidebarOpen,
     setWorkbenchOpen,
-    setMemoryDrawerOpen,
+    openMemoryDrawer,
+    toggleMemoryDrawer,
   } = session;
 
   const toggleSidebar = useCallback(() => setSidebarOpen((value) => !value), [setSidebarOpen]);
   const toggleWorkbench = useCallback(() => setWorkbenchOpen((value) => !value), [setWorkbenchOpen]);
-  const toggleMemoryDrawer = useCallback(() => setMemoryDrawerOpen((value) => !value), [setMemoryDrawerOpen]);
 
   const virtuosoComponents = useMemo(() => ({
     Header: () => <div className="timeline-spacer timeline-spacer--top" aria-hidden="true" />,
@@ -191,7 +191,8 @@ export function App() {
         planBadgeLabel={planBadgeLabel}
         planStatusActive={Boolean(session.planStatusMessage)}
         theme={theme}
-        busyWorkspaceActions={session.running || session.compacting || session.sessionNavigating}
+        busyWorkspaceActions={session.running || session.compacting || session.sessionNavigating || session.workspaceSwitching}
+        workspaceSwitching={session.workspaceSwitching}
         onToggleSidebar={toggleSidebar}
         onToggleWorkbench={toggleWorkbench}
         onToggleMemoryDrawer={toggleMemoryDrawer}
@@ -216,6 +217,7 @@ export function App() {
             || session.running
             || session.compacting
             || session.sessionNavigating
+            || session.workspaceSwitching
             || Boolean(session.pendingSessionArchive)
           }
           disabledWorkspaceControls={
@@ -223,6 +225,7 @@ export function App() {
             || session.running
             || session.compacting
             || session.sessionNavigating
+            || session.workspaceSwitching
           }
           running={session.running}
           compacting={session.compacting}
@@ -244,7 +247,7 @@ export function App() {
             workspace?.memory.autoExtractEnabled === false ? "auto on" : "auto off",
           )}
           onToggleWebSearch={() => void session.toggleWebSearch()}
-          onOpenMemoryDrawer={() => session.setMemoryDrawerOpen(true)}
+          onOpenMemoryDrawer={openMemoryDrawer}
         />
 
         <main className="conversation" aria-busy={session.sessionNavigating} inert={session.sessionNavigating}>
@@ -328,8 +331,12 @@ export function App() {
               <CommandPalette
                 commands={session.visibleCommands}
                 selectedIndex={session.selectedCommandIndex}
+                searchable={session.commandMenuMode === "palette"}
+                query={session.commandPaletteQuery}
+                onQueryChange={session.onCommandPaletteQueryChange}
                 onSelectIndex={session.setSelectedCommandIndex}
                 onExecute={(name) => void session.executeSlashCommand(name)}
+                onClose={session.closeCommandMenu}
               />
             )}
 
@@ -418,7 +425,7 @@ export function App() {
           workspaceKey={memoryWorkspaceKey}
           open={session.memoryDrawerOpen}
           memory={workspace.memory}
-          disabled={session.running || session.compacting || session.sessionNavigating}
+          disabled={session.running || session.compacting || session.sessionNavigating || session.workspaceSwitching}
           onClose={session.closeMemoryDrawer}
           onMemoryChange={session.setMemoryState}
         />

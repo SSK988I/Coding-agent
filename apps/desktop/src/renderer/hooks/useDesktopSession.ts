@@ -180,7 +180,9 @@ export function useDesktopSession() {
   const restoredSessionFocusRef = useRef<string | null>(null);
   const [timelineState, setTimelineState] = useState<TimelineState>(() => createTimelineState());
   const [commandOptions, setCommandOptions] = useState<CommandOption[]>([]);
-  const [commandMenuOpen, setCommandMenuOpen] = useState(false);
+  const [commandMenuMode, setCommandMenuMode] = useState<"inline" | "palette" | null>(null);
+  const [commandPaletteQuery, setCommandPaletteQuery] = useState("");
+  const commandMenuOpen = commandMenuMode !== null;
   const [selectedCommandIndex, setSelectedCommandIndex] = useState(0);
   const [modelOptions, setModelOptions] = useState<ModelOption[]>([]);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
@@ -193,6 +195,8 @@ export function useDesktopSession() {
   const [running, setRunning] = useState(false);
   const [startingRun, setStartingRun] = useState(false);
   const [compacting, setCompacting] = useState(false);
+  const [workspaceSwitching, setWorkspaceSwitching] = useState(false);
+  const workspaceSwitchingRef = useRef(false);
   const [pendingSessionNavigation, setPendingSessionNavigation] = useState<string | null>(null);
   const sessionNavigationRef = useRef(false);
   const sessionNavigating = pendingSessionNavigation !== null;
@@ -235,6 +239,7 @@ export function useDesktopSession() {
   const submittingRef = useRef(false);
   const imageRunDraftRef = useRef<AttachmentRunDraft | null>(null);
   const activeRunIdRef = useRef<string | null>(null);
+  const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [collapsedToolGroups, setCollapsedToolGroups] = useState<ReadonlySet<string>>(() => new Set());
   const autoExpandedErrorGroupsRef = useRef<Set<string>>(new Set());
   const [pendingPermissionChange, setPendingPermissionChange] = useState(false);
@@ -283,7 +288,7 @@ export function useDesktopSession() {
       : planStatusPhase === "recovery_error" ? "PLAN RECOVERY" : "PLAN";
   const conversationReadOnly = Boolean(workspace?.archived) || Boolean(pendingSessionArchive);
   const composerBlocked = !workspace || awaitingPlanDecision || planCommandMenuOpen
-    || compacting || sessionNavigating || Boolean(planStatusMessage) || conversationReadOnly;
+    || compacting || sessionNavigating || workspaceSwitching || Boolean(planStatusMessage) || conversationReadOnly;
   const canQueueWhileRunning = Boolean(
     workspace
     && running
@@ -293,8 +298,19 @@ export function useDesktopSession() {
     && !startingRun
     && pendingPlanAction === null
     && !sessionNavigating
+    && !workspaceSwitching
     && !pendingSessionArchive,
   );
+
+  const openMemoryDrawer = useCallback(() => {
+    if (workspaceSwitchingRef.current) return;
+    setMemoryDrawerOpen(true);
+  }, []);
+
+  const toggleMemoryDrawer = useCallback(() => {
+    if (workspaceSwitchingRef.current) return;
+    setMemoryDrawerOpen((value) => !value);
+  }, []);
 
   const setMemoryState = useCallback((memory: MemoryStatePayload) => {
     setWorkspace((current) => (current ? { ...current, memory: { ...current.memory, ...memory } } : current));
@@ -340,7 +356,8 @@ export function useDesktopSession() {
       if (path !== workspacePathRef.current) return;
       if (!result.archived) restoredSessionFocusRef.current = result.sessionId;
       if (result.archived && workspaceSessionIdRef.current === result.sessionId) {
-        setCommandMenuOpen(false);
+        setCommandMenuMode(null);
+        setCommandPaletteQuery("");
         setModelPickerOpen(false);
         setPlanCommandMenuOpen(false);
       }
@@ -394,6 +411,7 @@ export function useDesktopSession() {
       attachments.clear();
       imageRunDraftRef.current = null;
       activeRunIdRef.current = null;
+      setActiveRunId(null);
       queueRequestIdRef.current += 1;
       queuingRef.current = false;
       setQueuing(false);
@@ -409,7 +427,8 @@ export function useDesktopSession() {
       autoExpandedErrorGroupsRef.current = new Set();
       setTimelineState(createTimelineStateFromMessages(payload.messages, payload.sessionId, payload.turnChanges));
     }
-    setCommandMenuOpen(false);
+    setCommandMenuMode(null);
+    setCommandPaletteQuery("");
     setModelPickerOpen(false);
     clearToast();
     setNetworkApproval(null);
@@ -555,6 +574,15 @@ export function useDesktopSession() {
   };
 
   const openWorkspace = async (path: string, resume = true) => {
+    const alreadyLocked = workspaceSwitchingRef.current;
+    if (!alreadyLocked) {
+      workspaceSwitchingRef.current = true;
+      setWorkspaceSwitching(true);
+    }
+    setMemoryDrawerOpen(false);
+    setCommandMenuMode(null);
+    setCommandPaletteQuery("");
+    setModelPickerOpen(false);
     setError(null);
     try {
       const result = await window.agent.request<WorkspacePayload>("workspace.open", { path, resume });
@@ -562,6 +590,11 @@ export function useDesktopSession() {
       applyWorkspace(result);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      if (!alreadyLocked) {
+        workspaceSwitchingRef.current = false;
+        setWorkspaceSwitching(false);
+      }
     }
   };
 
@@ -642,7 +675,10 @@ export function useDesktopSession() {
         ? { ...current, stats: payload.stats as SessionStats } : current);
     }
     if (type === "run.started") {
-      if (envelope.runId) activeRunIdRef.current = envelope.runId;
+      if (envelope.runId) {
+        activeRunIdRef.current = envelope.runId;
+        setActiveRunId(envelope.runId);
+      }
       const imageDraft = imageRunDraftRef.current;
       if (imageDraft && !imageDraft.runId) imageDraft.runId = envelope.runId;
       const submission = planSubmissionRef.current;
@@ -655,6 +691,7 @@ export function useDesktopSession() {
     }
     if (type === "run.completed" || type === "run.cancelled" || type === "run.failed") {
       activeRunIdRef.current = null;
+      setActiveRunId(null);
       setRunning(false);
       const imageDraft = imageRunDraftRef.current;
       if (imageDraft && (!imageDraft.runId || imageDraft.runId === envelope.runId)) {
@@ -753,8 +790,20 @@ export function useDesktopSession() {
   };
 
   const chooseWorkspace = async () => {
-    const selected = await window.desktop.chooseWorkspace();
-    if (selected) await openWorkspace(selected, true);
+    if (workspaceSwitchingRef.current || running || compacting || sessionNavigationRef.current) return;
+    workspaceSwitchingRef.current = true;
+    setWorkspaceSwitching(true);
+    setMemoryDrawerOpen(false);
+    setCommandMenuMode(null);
+    setCommandPaletteQuery("");
+    setModelPickerOpen(false);
+    try {
+      const selected = await window.desktop.chooseWorkspace();
+      if (selected) await openWorkspace(selected, true);
+    } finally {
+      workspaceSwitchingRef.current = false;
+      setWorkspaceSwitching(false);
+    }
   };
 
   const addNotice = (text: string) => {
@@ -831,9 +880,10 @@ export function useDesktopSession() {
   };
 
   const executeSlashCommand = async (name: string, args = "") => {
-    if (sessionNavigationRef.current) return;
+    if (sessionNavigationRef.current || workspaceSwitchingRef.current) return;
     setInput((current) => (current.trimStart().startsWith("/") ? "" : current));
-    setCommandMenuOpen(false);
+    setCommandMenuMode(null);
+    setCommandPaletteQuery("");
     setError(null);
     try {
       if (name === "model") {
@@ -1124,7 +1174,10 @@ export function useDesktopSession() {
       const result = await window.agent.request<{ runId: string }>("run.start", {
         text, ...(images.length ? { images } : {}), ...(files.length ? { files } : {}),
       });
-      if (result.runId) activeRunIdRef.current = result.runId;
+      if (result.runId) {
+        activeRunIdRef.current = result.runId;
+        setActiveRunId(result.runId);
+      }
       if (imageDraft) imageDraft.runId = result.runId;
       if (workspaceSessionIdRef.current === sessionId && !imageDraft?.failed) {
         setInput((current) => current === originalInput ? "" : current);
@@ -1132,6 +1185,8 @@ export function useDesktopSession() {
       }
     } catch (reason) {
       if (workspaceSessionIdRef.current === sessionId) {
+        activeRunIdRef.current = null;
+        setActiveRunId(null);
         setRunning(false);
         setError(reason instanceof Error ? reason.message : String(reason));
       }
@@ -1377,32 +1432,52 @@ export function useDesktopSession() {
     return !term || `${model.name} ${model.id} ${model.provider}`.toLocaleLowerCase().includes(term);
   });
 
-  const commandQuery = input.startsWith("/") ? input.slice(1).toLocaleLowerCase() : "";
+  const commandQuery = commandMenuMode === "palette"
+    ? commandPaletteQuery.trim().toLocaleLowerCase()
+    : (input.startsWith("/") ? input.slice(1).toLocaleLowerCase() : "");
   const visibleCommands = commandOptions.filter((command) =>
     !commandQuery
     || command.name.toLocaleLowerCase().includes(commandQuery)
     || command.label.toLocaleLowerCase().includes(commandQuery),
   );
 
+  const onCommandPaletteQueryChange = useCallback((value: string) => {
+    setCommandPaletteQuery(value);
+    setSelectedCommandIndex(0);
+  }, []);
+
+  const closeCommandMenu = useCallback(() => {
+    setCommandMenuMode(null);
+    setCommandPaletteQuery("");
+    requestAnimationFrame(() => composerRef.current?.focus());
+  }, []);
+
   const toggleCommandMenu = useCallback(() => {
     if (!workspace || running || compacting || composerBlocked || workspace.archived) return;
     setModelPickerOpen(false);
     setSelectedCommandIndex(0);
-    setCommandMenuOpen((open) => !open);
-    requestAnimationFrame(() => composerRef.current?.focus());
+    setCommandPaletteQuery("");
+    setCommandMenuMode((mode) => {
+      if (mode !== null) {
+        requestAnimationFrame(() => composerRef.current?.focus());
+        return null;
+      }
+      return "palette";
+    });
   }, [workspace, running, compacting, composerBlocked]);
 
   useEffect(() => {
     if (!commandMenuOpen) return;
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.isComposing || event.keyCode === 229) return;
       if (event.key === "Escape") {
         event.preventDefault();
-        setCommandMenuOpen(false);
+        closeCommandMenu();
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [commandMenuOpen]);
+  }, [closeCommandMenu, commandMenuOpen]);
 
   const onInputChange = (value: string) => {
     setInput(value);
@@ -1412,11 +1487,13 @@ export function useDesktopSession() {
       && value.startsWith("/")
       && !/\s/.test(value);
     if (isCommandSearch) setModelPickerOpen(false);
-    setCommandMenuOpen(isCommandSearch);
+    setCommandPaletteQuery("");
+    setCommandMenuMode(isCommandSearch ? "inline" : null);
     setSelectedCommandIndex(0);
   };
 
   const onInputKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.nativeEvent.isComposing || event.keyCode === 229) return;
     if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === "v"
       && !event.repeat && !composerBlocked && !running && !compacting) {
       attachments.prepareClipboardPaste();
@@ -1438,7 +1515,7 @@ export function useDesktopSession() {
       }
       if (event.key === "Escape") {
         event.preventDefault();
-        setCommandMenuOpen(false);
+        closeCommandMenu();
         return;
       }
       if ((event.key === "Enter" || event.key === "Tab") && visibleCommands.length) {
@@ -1630,11 +1707,26 @@ export function useDesktopSession() {
     ));
     if (hasActiveOrApprovalTool) return false;
     const last = timelineItems.at(-1);
-    if (last?.kind === "message" && last.role === "assistant" && last.status === "streaming") {
+    if (!last) return true;
+    if (last.kind === "message" && last.role === "assistant") {
+      if (last.status === "streaming") return false;
+      if (activeRunId && last.runId === activeRunId) return false;
+      if (!activeRunId && last.runId === null && timelineState.running) return false;
+    }
+    if (last.kind === "changes" && activeRunId && last.runId === activeRunId) {
       return false;
     }
     return true;
-  }, [compacting, networkApproval, pendingPlanAction, running, timelineItems, workspace?.planState.pendingQuestion]);
+  }, [
+    activeRunId,
+    compacting,
+    networkApproval,
+    pendingPlanAction,
+    running,
+    timelineItems,
+    timelineState.running,
+    workspace?.planState.pendingQuestion,
+  ]);
 
   const renderTimelineItems = useMemo<RenderTimelineItem[]>(() => {
     const flattened: RenderTimelineItem[] = [];
@@ -1724,6 +1816,8 @@ export function useDesktopSession() {
     setUsageAnalysisOpen,
     memoryDrawerOpen,
     setMemoryDrawerOpen,
+    openMemoryDrawer,
+    toggleMemoryDrawer,
     closeMemoryDrawer,
     sidebarOpen,
     setSidebarOpen,
@@ -1734,6 +1828,7 @@ export function useDesktopSession() {
     sidecarStatus,
     statusLabel,
     workspace,
+    workspaceSwitching,
     sessions,
     showArchivedSessions,
     sessionsLoading,
@@ -1780,7 +1875,11 @@ export function useDesktopSession() {
 
     // Command palette & Model picker
     commandMenuOpen,
+    commandMenuMode,
+    commandPaletteQuery,
+    onCommandPaletteQueryChange,
     toggleCommandMenu,
+    closeCommandMenu,
     selectedCommandIndex,
     setSelectedCommandIndex,
     visibleCommands,

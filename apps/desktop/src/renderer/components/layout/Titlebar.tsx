@@ -23,6 +23,7 @@ export interface TitlebarProps {
   planStatusActive: boolean;
   theme: DesktopTheme;
   busyWorkspaceActions: boolean;
+  workspaceSwitching?: boolean;
   onToggleSidebar: () => void;
   onToggleWorkbench: () => void;
   onToggleMemoryDrawer: () => void;
@@ -42,6 +43,7 @@ export const Titlebar = memo(function Titlebar({
   planStatusActive,
   theme,
   busyWorkspaceActions,
+  workspaceSwitching = false,
   onToggleSidebar,
   onToggleWorkbench,
   onToggleMemoryDrawer,
@@ -124,7 +126,7 @@ export const Titlebar = memo(function Titlebar({
           aria-label="管理长期记忆"
           aria-expanded={memoryDrawerOpen}
           onClick={onToggleMemoryDrawer}
-          disabled={!workspace}
+          disabled={!workspace || workspaceSwitching}
           title="打开长期记忆管理面板"
         >
           <Brain size={14} strokeWidth={1.55} aria-hidden="true" />
