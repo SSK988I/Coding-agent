@@ -602,3 +602,68 @@ def test_stdio_queued_text_reaches_model_and_session(monkeypatch, tmp_path, meth
             await wire.close(serving)
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("method,expected_source", [("run.steer", "steer"), ("run.followUp", "follow_up")])
+def test_stdio_queued_slash_prefixed_text_reaches_model_and_persists_source(
+    monkeypatch, tmp_path, method, expected_source,
+):
+    async def scenario():
+        wire = Wire()
+        runtime = DesktopRuntime(lambda _: None)
+        manager = SessionManager.create(cwd=str(tmp_path), agent_dir=tmp_path)
+        session = AgentSession(AgentSessionConfig(
+            cwd=str(tmp_path), session_manager=manager, tools=[],
+            model=Model(id="test", cost=ModelCost(input=0, output=0, cache_read=0, cache_write=0)),
+        ))
+        runtime._session = session
+        entered, release = asyncio.Event(), asyncio.Event()
+        contexts = []
+
+        class Stream:
+            def __init__(self, first):
+                self.first = first
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise StopAsyncIteration
+
+            async def result(self):
+                if self.first:
+                    entered.set()
+                    await release.wait()
+                return AssistantMessage(content=[TextContent(text="done")])
+
+        def stream(_model, context, _options):
+            contexts.append(list(context.messages))
+            return Stream(len(contexts) == 1)
+
+        session.agent.stream_fn = stream
+        serving = wire.start(monkeypatch, runtime)
+        try:
+            wire.send("start", "run.start", text="original task")
+            run_id = (await wire.response("start"))["result"]["runId"]
+            await asyncio.wait_for(entered.wait(), 2)
+            wire.send("queue", method, text="/src/main.py 是要改的文件", runId=run_id, sessionId=manager.header.id)
+            assert (await wire.response("queue"))["result"]["queued"] is True
+            running = runtime._run_task
+            release.set()
+            await asyncio.wait_for(running, 2)
+
+            assert len(contexts) == 2
+            assert [m.content for m in contexts[-1] if m.role == "user"] == [
+                "original task", "/src/main.py 是要改的文件",
+            ]
+            restored = SessionManager.open(manager.path).build_session_context().messages
+            user_messages = [m for m in restored if m.role == "user"]
+            assert [(m.content, m.source) for m in user_messages] == [
+                ("original task", "prompt"),
+                ("/src/main.py 是要改的文件", expected_source),
+            ]
+        finally:
+            release.set()
+            await wire.close(serving)
+
+    asyncio.run(scenario())

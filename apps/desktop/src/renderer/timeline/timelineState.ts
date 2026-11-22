@@ -181,6 +181,72 @@ export function readAgentMessageContent(message: AgentMessage): {
   return { text, thinking, ...fileProps, ...(images.length ? { images } : {}) };
 }
 
+const CONFIRMED_PLAN_EXECUTION_PREFIX = "<confirmed_plan_execution>";
+const CONFIRMED_PLAN_EXECUTION_LABEL = "执行已确认计划";
+
+const LEGACY_LOCAL_SLASH_COMMANDS = new Set([
+  "help", "new", "model", "compact", "subagents", "clear",
+  "session", "plan", "cancel-plan", "execute-plan", "memory",
+  "login", "logout", "thinking", "tree", "resume", "settings",
+  "name", "permissions", "export", "copy", "hotkeys", "exit", "quit",
+]);
+
+function normalizeUserDisplayText(text: string): string {
+  return text.trimStart().startsWith(CONFIRMED_PLAN_EXECUTION_PREFIX)
+    ? CONFIRMED_PLAN_EXECUTION_LABEL
+    : text;
+}
+
+function isLocalCommandUserMessage(
+  message: AgentMessage,
+  content: { text: string; images?: ImageAttachmentPayload[]; files?: FileAttachmentMetadata[] },
+): boolean {
+  if (message.role !== "user") return false;
+  const source = typeof message.source === "string" ? message.source.trim() : "";
+  if (source === "local_command") return true;
+  if (source.length > 0) return false;
+  if (content.images?.length || content.files?.length) return false;
+  const trimmed = content.text.trimStart();
+  if (!trimmed.startsWith("/")) return false;
+  const body = trimmed.slice(1);
+  if (!body || /^\s+$/.test(body)) return true;
+  if (/^\s/.test(body)) return false;
+  const token = body.split(/\s+/, 1)[0]?.toLowerCase() ?? "";
+  return LEGACY_LOCAL_SLASH_COMMANDS.has(token);
+}
+
+interface NormalizedUserContent {
+  text: string;
+  thinking: string;
+  images?: ImageAttachmentPayload[];
+  files?: FileAttachmentMetadata[];
+}
+
+function normalizeUserMessageForTimeline(message: AgentMessage): NormalizedUserContent | null {
+  const content = readAgentMessageContent(message);
+  if (isLocalCommandUserMessage(message, content)) return null;
+  const text = normalizeUserDisplayText(content.text);
+  if (!text && !content.images?.length && !content.files?.length) return null;
+  return { ...content, text };
+}
+
+function userContentMatches(a: NormalizedUserContent, b: NormalizedUserContent): boolean {
+  if (a.text !== b.text) return false;
+  const aImages = a.images ?? [];
+  const bImages = b.images ?? [];
+  if (aImages.length !== bImages.length) return false;
+  for (let i = 0; i < aImages.length; i += 1) {
+    if (aImages[i].data !== bImages[i].data || aImages[i].mime_type !== bImages[i].mime_type) return false;
+  }
+  const aFiles = a.files ?? [];
+  const bFiles = b.files ?? [];
+  if (aFiles.length !== bFiles.length) return false;
+  for (let i = 0; i < aFiles.length; i += 1) {
+    if (aFiles[i].path !== bFiles[i].path || aFiles[i].name !== bFiles[i].name) return false;
+  }
+  return true;
+}
+
 /** Converts the current JSONL-backed transcript to the same item model as live events. */
 export function timelineItemsFromPersistedMessages(
   messages: readonly AgentMessage[],
@@ -195,6 +261,7 @@ export function timelineItemsFromPersistedMessages(
       if (block.type === "toolCall" && block.id) calls.set(block.id, block);
     }
   }
+  let lastVisibleUserContent: NormalizedUserContent | null = null;
   return messages.flatMap<TimelineItem>((message, index): TimelineItem[] => {
     const timestamp = typeof message.timestamp === "number" ? message.timestamp : index;
     if (message.role === "toolResult") {
@@ -235,12 +302,37 @@ export function timelineItemsFromPersistedMessages(
           result: "未找到执行结果；不能据此判断是否产生了副作用。", status: "uncertain",
         }] : []) : [];
 
-    const content = readAgentMessageContent(message);
-    if (message.role === "user" && !content.images?.length && !content.files?.length && content.text.trimStart().startsWith("/")) return [];
-    if (message.role === "user" && content.text.trimStart().startsWith("<confirmed_plan_execution>")) {
-      content.text = "执行已确认计划";
+    if (message.role === "user") {
+      const content = normalizeUserMessageForTimeline(message);
+      if (!content) return [];
+      if (
+        message.source === "internal_retry"
+        && lastVisibleUserContent
+        && userContentMatches(lastVisibleUserContent, content)
+      ) {
+        return [];
+      }
+      lastVisibleUserContent = content;
+      return [{
+        id: `persisted-${timestamp}-${index}`,
+        kind: "message",
+        order: index,
+        revision: 0,
+        sessionId,
+        runId: null,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        role: "user",
+        text: content.text,
+        thinking: content.thinking,
+        ...(content.images ? { images: content.images } : {}),
+        ...(content.files ? { files: content.files } : {}),
+        status: message.stop_reason,
+      } satisfies TimelineMessageItem];
     }
-    if (message.role === "assistant" && !content.text && !content.thinking && !content.images?.length) return incomplete;
+
+    const content = readAgentMessageContent(message);
+    if (!content.text && !content.thinking && !content.images?.length) return incomplete;
 
     return [{
       id: `persisted-${timestamp}-${index}`,
@@ -251,7 +343,7 @@ export function timelineItemsFromPersistedMessages(
       runId: null,
       createdAt: timestamp,
       updatedAt: timestamp,
-      role: message.role,
+      role: "assistant",
       text: content.text,
       thinking: content.thinking,
       ...(content.images ? { images: content.images } : {}),
@@ -397,7 +489,8 @@ export function reduceRuntimeEventBatch(
     if (type === "run.started") {
       // Admission is authoritative: rejected requests never become sent messages.
       // The stable run key also makes duplicate start notifications idempotent.
-      const text = typeof payload.text === "string" ? payload.text : "";
+      const rawText = typeof payload.text === "string" ? payload.text : "";
+      const text = rawText ? normalizeUserDisplayText(rawText) : "";
       const files = attachmentMetadata(payload.files);
       const images: ImageAttachmentPayload[] = Array.isArray(payload.images)
         ? payload.images.flatMap((image) => {
@@ -545,12 +638,17 @@ export function reduceRuntimeEventBatch(
       const raw = agentMessage(payload.message);
       if (!raw) continue;
       if (raw.role === "user") {
-        const content = readAgentMessageContent(raw);
-        if (!content.text && !content.images?.length && !content.files?.length) continue;
+        if (payload.internalRetry === true || payload.internal_retry === true || raw.source === "internal_retry") {
+          continue;
+        }
+        const content = normalizeUserMessageForTimeline(raw);
+        if (!content) continue;
+        const isQueuedDelivery = raw.source === "steer" || raw.source === "follow_up";
         const initialId = `user:${encodeURIComponent(runKey)}`;
         const initialItem = entities[initialId];
         if (
-          initialItem?.kind === "message"
+          !isQueuedDelivery
+          && initialItem?.kind === "message"
           && initialItem.role === "user"
           && !initialUserMatchedByRun[runKey]
           && initialItem.text === content.text

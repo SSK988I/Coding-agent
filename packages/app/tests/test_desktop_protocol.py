@@ -235,6 +235,31 @@ def test_llm_conversion_repairs_legacy_incomplete_tool_history() -> None:
     assert converted[2].content == "next request"
 
 
+def test_llm_conversion_preserves_delivered_slash_messages_and_filters_local_commands() -> None:
+    converted = convert_to_llm([
+        UserMessage(content="/"),
+        UserMessage(content="/ "),
+        UserMessage(content="/\n"),
+        UserMessage(content="/model"),
+        UserMessage(content="/custom-local", source=" local_command "),
+        UserMessage(content="/ model"),
+        UserMessage(content="/ ", source="steer"),
+        UserMessage(content="/src/main.py 是要改的文件", source="steer"),
+        UserMessage(content="/model 帮我看一下配置", source="follow_up"),
+        UserMessage(content="/src/legacy_path.py 是普通路径"),
+        UserMessage(content="retried prompt", source="internal_retry"),
+    ])
+
+    assert [message.content for message in converted] == [
+        "/ model",
+        "/ ",
+        "/src/main.py 是要改的文件",
+        "/model 帮我看一下配置",
+        "/src/legacy_path.py 是普通路径",
+        "retried prompt",
+    ]
+
+
 def test_desktop_command_catalog_only_exposes_supported_commands() -> None:
     import asyncio
 

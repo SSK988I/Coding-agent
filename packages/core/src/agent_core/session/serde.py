@@ -150,6 +150,14 @@ def _user_attachments(raw: Any) -> list[dict[str, Any]]:
     return result
 
 
+def _user_source(raw: Any) -> str | None:
+    if isinstance(raw, str):
+        value = raw.strip()
+        if value:
+            return value
+    return None
+
+
 # ─── messages ───────────────────────────────────────
 
 def message_to_dict(message: Message) -> dict:
@@ -160,11 +168,13 @@ def message_to_dict(message: Message) -> dict:
     role = getattr(message, "role", None)
     if role == "user":
         assert isinstance(message, UserMessage)
+        source = _user_source(getattr(message, "source", None))
         return {
             "role": "user",
             "content": _encode_user_content(message.content),
             "timestamp": getattr(message, "timestamp", None),
             **({"attachments": _user_attachments(message.attachments)} if message.attachments else {}),
+            **({"source": source} if source is not None else {}),
         }
     if role == "assistant":
         assert isinstance(message, AssistantMessage)
@@ -208,6 +218,7 @@ def dict_to_message(d: dict) -> Message:
             content=_decode_user_content(d.get("content", "")),
             timestamp=float(d.get("timestamp") or 0.0),
             attachments=_user_attachments(d.get("attachments")),
+            source=_user_source(d.get("source")),
         )
     if role == "assistant":
         return AssistantMessage(

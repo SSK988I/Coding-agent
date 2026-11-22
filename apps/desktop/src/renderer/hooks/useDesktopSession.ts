@@ -1200,6 +1200,9 @@ export function useDesktopSession() {
       else setError(`未知命令：/${rawName}`);
       return;
     }
+    setCommandMenuMode(null);
+    setCommandPaletteQuery("");
+    setSelectedCommandIndex(0);
     setError(null);
     const sessionId = workspace.sessionId;
     const originalInput = input;
@@ -1534,13 +1537,21 @@ export function useDesktopSession() {
     setSelectedCommandIndex(0);
   };
 
+  const onInputFocus = useCallback(() => {
+    if (commandMenuMode === "palette") {
+      setCommandMenuMode(null);
+      setCommandPaletteQuery("");
+      setSelectedCommandIndex(0);
+    }
+  }, [commandMenuMode]);
+
   const onInputKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.nativeEvent.isComposing || event.keyCode === 229) return;
     if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === "v"
       && !event.repeat && !composerBlocked && !running && !compacting) {
       attachments.prepareClipboardPaste();
     }
-    if (commandMenuOpen) {
+    if (commandMenuMode === "inline") {
       if (event.key === "ArrowDown") {
         event.preventDefault();
         setSelectedCommandIndex((index) => visibleCommands.length
@@ -1563,9 +1574,13 @@ export function useDesktopSession() {
       if ((event.key === "Enter" || (event.key === "Tab" && !event.shiftKey)) && visibleCommands.length) {
         event.preventDefault();
         const command = visibleCommands[Math.min(selectedCommandIndex, visibleCommands.length - 1)];
-        void executeSlashCommand(command.name, "", { consumeInput: commandMenuMode === "inline" });
+        void executeSlashCommand(command.name, "", { consumeInput: true });
         return;
       }
+    } else if (commandMenuMode === "palette" && event.key === "Escape") {
+      event.preventDefault();
+      closeCommandMenu();
+      return;
     }
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
@@ -1908,6 +1923,7 @@ export function useDesktopSession() {
     networkApproval,
     pendingNetworkDecision,
     onInputChange,
+    onInputFocus,
     onInputKeyDown,
     submit,
     sendQueuedMessage,

@@ -94,9 +94,22 @@ def test_dict_to_usage_handles_none():
 
 def test_user_message_string_content_roundtrip():
     m = UserMessage(content="hi there")
-    out = dict_to_message(message_to_dict(m))
+    d = message_to_dict(m)
+    assert "source" not in d
+    out = dict_to_message(d)
     assert isinstance(out, UserMessage)
     assert out.content == "hi there"
+    assert out.source is None
+
+
+def test_user_message_source_roundtrip():
+    m = UserMessage(content="/src/main.py 是要改的文件", source="steer")
+    d = message_to_dict(m)
+    assert d["source"] == "steer"
+    out = dict_to_message(d)
+    assert isinstance(out, UserMessage)
+    assert out.content == "/src/main.py 是要改的文件"
+    assert out.source == "steer"
 
 
 def test_user_message_block_content_roundtrip():

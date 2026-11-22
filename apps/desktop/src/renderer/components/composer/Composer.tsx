@@ -46,6 +46,7 @@ export interface ComposerProps {
   queueMode: QueueDeliveryMode;
   onQueueModeChange: (mode: QueueDeliveryMode) => void;
   onInputChange: (value: string) => void;
+  onInputFocus?: () => void;
   onInputKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void;
   onOpenCommands: () => void;
   onSubmit: (event?: FormEvent) => void;
@@ -90,6 +91,7 @@ export function Composer({
   queueMode,
   onQueueModeChange,
   onInputChange,
+  onInputFocus,
   onInputKeyDown,
   onOpenCommands,
   onSubmit,
@@ -228,6 +230,7 @@ export function Composer({
           ref={composerRef}
           value={input}
           onChange={(event) => onInputChange(event.target.value)}
+          onFocus={onInputFocus}
           onKeyDown={onInputKeyDown}
           placeholder={placeholder}
           disabled={textareaDisabled}

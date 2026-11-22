@@ -1390,7 +1390,11 @@ class AgentSession:
             # user's request is retried against the compacted context.
             if outcome is not None and outcome.need_retry:
                 self._last_assistant_message = None
-                await self._agent.prompt(message)
+                self._agent._next_prompt_source = "internal_retry"
+                try:
+                    await self._agent.prompt(message)
+                finally:
+                    self._agent._next_prompt_source = None
                 # A second compaction pass after the retry is intentionally skipped:
                 # Limit overflow recovery to one attempt per turn.
 
@@ -1897,7 +1901,16 @@ class AgentSession:
                         })
 
         # Forward to external listeners.
-        self._emit_event(event)
+        forwarded_event: Any = event
+        if isinstance(event, dict) and etype == "message_end":
+            msg = event.get("message")
+            if (
+                msg is not None
+                and getattr(msg, "role", None) == "user"
+                and getattr(msg, "source", None) == "internal_retry"
+            ):
+                forwarded_event = {**event, "internal_retry": True}
+        self._emit_event(forwarded_event)
 
     def _emit_event(self, event: Any) -> None:
         """Emit an event to all registered listeners.

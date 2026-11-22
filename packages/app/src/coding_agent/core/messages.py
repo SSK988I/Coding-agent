@@ -147,6 +147,38 @@ def create_custom_message(
 # ─── convert_to_llm ───────────────────────────
 
 
+_LEGACY_LOCAL_SLASH_COMMANDS = frozenset({
+    "help", "new", "model", "compact", "subagents", "clear",
+    "session", "plan", "cancel-plan", "execute-plan", "memory",
+    "login", "logout", "thinking", "tree", "resume", "settings",
+    "name", "permissions", "export", "copy", "hotkeys", "exit", "quit",
+})
+
+
+def _is_local_command_user_message(message: Any) -> bool:
+    if getattr(message, "role", None) != "user":
+        return False
+    raw_source = getattr(message, "source", None)
+    source = raw_source.strip() if isinstance(raw_source, str) else ""
+    if source == "local_command":
+        return True
+    if source:
+        return False
+    content = getattr(message, "content", None)
+    if not isinstance(content, str):
+        return False
+    trimmed = content.lstrip()
+    if not trimmed.startswith("/"):
+        return False
+    body = trimmed[1:]
+    if not body or body.isspace():
+        return True
+    if body[0].isspace():
+        return False
+    token = body.split(None, 1)[0].lower()
+    return token in _LEGACY_LOCAL_SLASH_COMMANDS
+
+
 def convert_to_llm(messages: list[AgentAppMessage]) -> list[Message]:
     """Transform app messages (incl. custom roles) into LLM-compatible messages.
 
@@ -160,11 +192,11 @@ def convert_to_llm(messages: list[AgentAppMessage]) -> list[Message]:
     for m in messages:
         role = getattr(m, "role", None)
         if role in ("user", "assistant", "toolResult"):
-            if role == "user" and isinstance(getattr(m, "content", None), str):
-                if m.content.lstrip().startswith("/"):
-                    # Slash commands are application control messages. Early
-                    # desktop builds accidentally persisted them as prompts.
-                    continue
+            if role == "user" and _is_local_command_user_message(m):
+                # Local slash commands are application control messages.
+                # Delivered user prompts (e.g. steer/follow_up) carry an
+                # explicit source and are always preserved.
+                continue
             result.append(m)
         elif role == "bashExecution":
             if getattr(m, "exclude_from_context", False):

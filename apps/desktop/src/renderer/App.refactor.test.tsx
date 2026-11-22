@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RuntimeEvent, WorkspacePayload } from "../shared/types";
 import { App } from "./App";
 
-const makeWorkspace = (): WorkspacePayload => ({
+const makeWorkspace = (overrides: Partial<WorkspacePayload> = {}): WorkspacePayload => ({
   path: "E:\\code\\Coding-agent",
   sessionId: "session-1",
   model: { id: "claude-sonnet", name: "Claude Sonnet", provider: "anthropic", input: ["text", "image"] },
@@ -33,6 +33,7 @@ const makeWorkspace = (): WorkspacePayload => ({
     status: "idle",
     errorCode: null,
   },
+  ...overrides,
 });
 
 describe("desktop frontend refactor capabilities", () => {
@@ -824,5 +825,134 @@ describe("desktop frontend refactor capabilities", () => {
     expect(screen.getAllByText("原提问")).toHaveLength(1);
     const messages = Array.from(document.querySelectorAll(".message .message-body")).map((node) => node.textContent?.trim());
     expect(messages).toEqual(["原提问", "回复一复制", "补充转向指令", "回复二复制"]);
+  });
+
+  it("does not execute /clear on Enter or Tab after focus returns from detached toolbar palette to chat composer", async () => {
+    request.mockImplementation(async (method: string) => {
+      if (method === "workspace.open") return makeWorkspace();
+      if (method === "session.list") return [];
+      if (method === "command.list") {
+        return [
+          { name: "clear", label: "清空会话", description: "重置当前对话" },
+          { name: "help", label: "帮助", description: "显示可用命令" },
+        ];
+      }
+      if (method === "run.start") return { accepted: true, runId: "run-draft-1" };
+      if (method === "session.clear") return makeWorkspace({ sessionId: "session-cleared" });
+      return {};
+    });
+
+    mount();
+    await screen.findByText("Claude Sonnet");
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "写好的普通草稿" } });
+
+    // Open detached toolbar palette and filter for "clear".
+    fireEvent.click(screen.getByRole("button", { name: "打开命令菜单" }));
+    const paletteSearch = await screen.findByRole("searchbox", { name: "筛选命令" });
+    expect(paletteSearch).toHaveFocus();
+    fireEvent.change(paletteSearch, { target: { value: "clear" } });
+
+    // Even before focus moves, textarea keyDown in detached palette mode must not trigger session.clear.
+    fireEvent.keyDown(textarea, { key: "Tab" });
+    expect(request).not.toHaveBeenCalledWith("session.clear");
+
+    // Move focus genuinely back from palette searchbox to chat textarea -> detached palette closes.
+    textarea.focus();
+    fireEvent.focus(textarea);
+    expect(textarea).toHaveFocus();
+    await waitFor(() => expect(screen.queryByRole("searchbox", { name: "筛选命令" })).not.toBeInTheDocument());
+
+    // Tab must not call session.clear; Enter must submit the draft via run.start instead of session.clear.
+    fireEvent.keyDown(textarea, { key: "Tab" });
+    expect(request).not.toHaveBeenCalledWith("session.clear");
+
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    await waitFor(() => expect(request).toHaveBeenCalledWith("run.start", {
+      text: "写好的普通草稿",
+    }));
+    expect(request).not.toHaveBeenCalledWith("session.clear");
+  });
+
+  it("keeps slash-prefixed steer messages visible both live and after reopening the session", async () => {
+    const persistedMessages = [
+      { role: "user", content: "先看项目结构", source: "prompt", timestamp: 1 },
+      { role: "assistant", content: "正在查看", stop_reason: "end_turn", timestamp: 2 },
+      { role: "user", content: "/src/main.py 是要改的文件", source: "steer", timestamp: 3 },
+      { role: "assistant", content: "已修改 /src/main.py", stop_reason: "end_turn", timestamp: 4 },
+    ];
+    request.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+      if (method === "workspace.open") return makeWorkspace();
+      if (method === "command.list") return [];
+      if (method === "session.list") {
+        return [
+          {
+            id: "session-1",
+            name: null,
+            first_message: "先看项目结构",
+            message_count: 4,
+            modified: "2026-11-22T00:00:00Z",
+            archived: false,
+            current: true,
+          },
+          {
+            id: "session-2",
+            name: null,
+            first_message: "另一个问题",
+            message_count: 1,
+            modified: "2026-11-21T00:00:00Z",
+            archived: false,
+            current: false,
+          },
+        ];
+      }
+      if (method === "run.steer") return { queued: true };
+      if (method === "session.open") {
+        if (params?.sessionId === "session-2") {
+          return makeWorkspace({
+            sessionId: "session-2",
+            messages: [{ role: "user", content: "另一个问题", source: "prompt", timestamp: 1 }],
+          });
+        }
+        return makeWorkspace({
+          sessionId: "session-1",
+          messages: persistedMessages,
+        });
+      }
+      return {};
+    });
+
+    mount();
+    await screen.findByText("Claude Sonnet");
+
+    // Live run with a /-prefixed steer message.
+    await emit("run.started", { text: "先看项目结构" }, "run-slash-1");
+    await emit("message_end", { message: { role: "user", content: "先看项目结构", source: "prompt" } }, "run-slash-1");
+    await emit("message_start", { message: { role: "assistant", content: "" } }, "run-slash-1");
+    await emit("message_end", { message: { role: "assistant", content: "正在查看", stop_reason: "end_turn" } }, "run-slash-1");
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.click(screen.getByRole("button", { name: "转向" }));
+    fireEvent.change(textarea, { target: { value: "/src/main.py 是要改的文件" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    await waitFor(() => expect(request).toHaveBeenCalledWith("run.steer", {
+      text: "/src/main.py 是要改的文件",
+      sessionId: "session-1",
+      runId: "run-slash-1",
+    }));
+
+    await emit("message_end", { message: { role: "user", content: "/src/main.py 是要改的文件", source: "steer" } }, "run-slash-1");
+    await emit("message_start", { message: { role: "assistant", content: "" } }, "run-slash-1");
+    await emit("message_end", { message: { role: "assistant", content: "已修改 /src/main.py", stop_reason: "end_turn" } }, "run-slash-1");
+    await emit("run.completed", {}, "run-slash-1");
+
+    expect(screen.getByText("/src/main.py 是要改的文件")).toBeInTheDocument();
+
+    // Switch away to session-2 and reopen session-1 -> /-prefixed steer message must remain visible.
+    fireEvent.click(await screen.findByRole("button", { name: /另一个问题/ }));
+    await screen.findByText("另一个问题");
+    fireEvent.click(await screen.findByRole("button", { name: /先看项目结构/ }));
+    expect(await screen.findByText("/src/main.py 是要改的文件")).toBeInTheDocument();
+    expect(screen.getByText("已修改 /src/main.py")).toBeInTheDocument();
   });
 });

@@ -858,7 +858,7 @@ class DesktopRuntime:
                     *([TextContent(text=text)] if text.strip() else []),
                     *images,
                     *(files.content if files is not None else []),
-                ], attachments=files.metadata if files is not None else [])
+                ], attachments=files.metadata if files is not None else [], source="prompt")
                 if images or files is not None else text
             )
             attachments.track(message)
@@ -906,7 +906,7 @@ class DesktopRuntime:
         if not isinstance(text, str) or not text.strip():
             raise RpcError("INVALID_PARAMS", "run.steer 需要非空 text")
         session = self._require_queueable_run(params)
-        session.agent.steer(text)
+        session.agent.steer(UserMessage(content=text, source="steer"))
         return {"queued": True}
 
     async def _run_follow_up(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -914,7 +914,7 @@ class DesktopRuntime:
         if not isinstance(text, str) or not text.strip():
             raise RpcError("INVALID_PARAMS", "run.followUp 需要非空 text")
         session = self._require_queueable_run(params)
-        session.agent.follow_up(text)
+        session.agent.follow_up(UserMessage(content=text, source="follow_up"))
         return {"queued": True}
 
     def _require_queueable_run(self, params: dict[str, Any]) -> AgentSession:
@@ -1365,6 +1365,8 @@ class DesktopRuntime:
             }
         else:
             payload = {key: value for key, value in event.items() if key != "type"}
+            if event_type == "message_end" and payload.pop("internal_retry", False):
+                payload["internalRetry"] = True
         self._publish(event_type, payload)
         if event_type in {"message_end", "turn_end", "agent_end", "auto_compaction_end", "compaction_end"}:
             self._publish_stats()

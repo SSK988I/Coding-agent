@@ -132,6 +132,7 @@ class Agent:
         # loop via get_steering_messages / get_follow_up_messages callbacks.
         self._steering_queue = PendingMessageQueue(steering_mode)
         self._follow_up_queue = PendingMessageQueue(follow_up_mode)
+        self._next_prompt_source: str | None = None
 
     # ── subscription ───────────────────────────────────────────────────
 
@@ -170,7 +171,7 @@ class Agent:
         Steering messages are injected before the next assistant turn —
         i.e. they cut in line on the current run while it is still looping.
         """
-        for item in self._normalize_prompt_input(message):
+        for item in self._normalize_prompt_input(message, source="steer"):
             self._steering_queue.enqueue(item)
 
     def follow_up(self, message) -> None:
@@ -180,7 +181,7 @@ class Agent:
         stops (no more tool calls, no steering pending), starting a new
         inner run.
         """
-        for item in self._normalize_prompt_input(message):
+        for item in self._normalize_prompt_input(message, source="follow_up"):
             self._follow_up_queue.enqueue(item)
 
     def clear_steering_queue(self) -> None:
@@ -210,7 +211,13 @@ class Agent:
                 "Agent is already processing a prompt. Wait for completion before prompting again."
             )
 
-        prompts = self._normalize_prompt_input(message)
+        prompt_source = self._next_prompt_source
+        self._next_prompt_source = None
+        prompts = self._normalize_prompt_input(
+            message,
+            source=prompt_source or "prompt",
+            override_source=prompt_source is not None,
+        )
         await self._run_with_lifecycle(
             lambda signal: run_agent_loop(
                 prompts,
@@ -266,13 +273,37 @@ class Agent:
 
     # ── internals ──────────────────────────────────────────────────────
 
-    def _normalize_prompt_input(self, message: Any) -> list:
-        if isinstance(message, list):
-            return message
-        if isinstance(message, str):
-            from agent_llm import UserMessage
-            return [UserMessage(content=message)]
-        return [message]
+    def _normalize_prompt_input(
+        self,
+        message: Any,
+        *,
+        source: str | None = None,
+        override_source: bool = False,
+    ) -> list:
+        from dataclasses import replace
+        from agent_llm import ImageContent, UserMessage
+
+        items = message if isinstance(message, list) else [message]
+        normalized: list[Any] = []
+        for item in items:
+            if isinstance(item, str):
+                normalized.append(UserMessage(content=item, source=source))
+            elif (
+                isinstance(item, UserMessage)
+                and source is not None
+                and (override_source or item.source is None)
+            ):
+                has_tracked_media = bool(item.attachments) or (
+                    isinstance(item.content, list)
+                    and any(isinstance(block, ImageContent) for block in item.content)
+                )
+                if override_source or not has_tracked_media:
+                    normalized.append(replace(item, source=source))
+                else:
+                    normalized.append(item)
+            else:
+                normalized.append(item)
+        return normalized
 
     def _create_context_snapshot(self) -> AgentContext:
         return AgentContext(

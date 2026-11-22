@@ -328,7 +328,7 @@ export function App() {
               onAbortExecution={() => void session.abortPlanExecution()}
             />
 
-            {session.commandMenuOpen && !workspace?.archived && (
+            {session.commandMenuOpen && !workspace?.archived && !session.running && !session.compacting && (
               <CommandPalette
                 commands={session.visibleCommands}
                 selectedIndex={session.selectedCommandIndex}
@@ -383,6 +383,7 @@ export function App() {
               queueMode={session.queueMode}
               onQueueModeChange={session.setQueueMode}
               onInputChange={session.onInputChange}
+              onInputFocus={session.onInputFocus}
               onInputKeyDown={session.onInputKeyDown}
               onOpenCommands={session.toggleCommandMenu}
               onSubmit={session.submit}
