@@ -1100,10 +1100,15 @@ class AgentSession:
             "</confirmed_plan_execution>\n"
             "Execute this exact confirmed plan now."
         )
+        execution_message = UserMessage(
+            content=execution_prompt,
+            source="plan_execution",
+            message_id=uuid.uuid4().hex[:12],
+        )
         try:
             await self._extract_accepted_plan_memory(latest, started_entry)
             if not self._plan_abort_requested:
-                await self.prompt(execution_prompt, _plan_run_id=run_id)
+                await self.prompt(execution_message, _plan_run_id=run_id)
             stop_reason = getattr(self._last_assistant_message, "stop_reason", None)
             if (before_complete is not None and not self._plan_abort_requested
                     and stop_reason not in {None, "aborted", "error", "length"}):
@@ -1319,7 +1324,14 @@ class AgentSession:
                 "PLAN_RECOVERY_REQUIRED",
                 "当前 Plan 状态需要先查看详情、重新规划或取消",
             )
-        if isinstance(message, str) and message.lstrip().startswith("<confirmed_plan_execution>"):
+        if (
+            getattr(message, "source", None) == "plan_execution"
+            or (
+                _plan_run_id is not None
+                and isinstance(message, str)
+                and message.lstrip().startswith("<confirmed_plan_execution>")
+            )
+        ):
             _retrieve_memory = False
             _extract_memory = False
             _memory_mode = "plan_execution"
@@ -1376,7 +1388,10 @@ class AgentSession:
         self._last_assistant_message = None
 
         try:
+            if hasattr(self._agent, "_last_prompt_user_ids"):
+                self._agent._last_prompt_user_ids = []
             await self._agent.prompt(message)
+            initial_prompt_ids = list(getattr(self._agent, "_last_prompt_user_ids", []))
 
             # Auto-compaction check after each turn.
             # The orchestrator emits compaction_start/end via on_event.
@@ -1390,11 +1405,11 @@ class AgentSession:
             # user's request is retried against the compacted context.
             if outcome is not None and outcome.need_retry:
                 self._last_assistant_message = None
-                self._agent._next_prompt_source = "internal_retry"
+                self._agent._next_prompt_retry_of = initial_prompt_ids
                 try:
                     await self._agent.prompt(message)
                 finally:
-                    self._agent._next_prompt_source = None
+                    self._agent._next_prompt_retry_of = None
                 # A second compaction pass after the retry is intentionally skipped:
                 # Limit overflow recovery to one attempt per turn.
 
@@ -1904,12 +1919,13 @@ class AgentSession:
         forwarded_event: Any = event
         if isinstance(event, dict) and etype == "message_end":
             msg = event.get("message")
-            if (
-                msg is not None
-                and getattr(msg, "role", None) == "user"
-                and getattr(msg, "source", None) == "internal_retry"
-            ):
-                forwarded_event = {**event, "internal_retry": True}
+            if msg is not None and getattr(msg, "role", None) == "user":
+                raw_retry_of = getattr(msg, "retry_of", None)
+                raw_source = getattr(msg, "source", None)
+                has_retry_link = isinstance(raw_retry_of, str) and bool(raw_retry_of.strip())
+                is_legacy_retry = isinstance(raw_source, str) and raw_source.strip() == "internal_retry"
+                if has_retry_link or is_legacy_retry:
+                    forwarded_event = {**event, "internal_retry": True}
         self._emit_event(forwarded_event)
 
     def _emit_event(self, event: Any) -> None:

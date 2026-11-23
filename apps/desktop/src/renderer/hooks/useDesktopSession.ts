@@ -182,8 +182,12 @@ export function useDesktopSession() {
   const [commandOptions, setCommandOptions] = useState<CommandOption[]>([]);
   const [commandMenuMode, setCommandMenuMode] = useState<"inline" | "palette" | null>(null);
   const [commandPaletteQuery, setCommandPaletteQuery] = useState("");
-  const commandMenuOpen = commandMenuMode !== null;
   const [selectedCommandIndex, setSelectedCommandIndex] = useState(0);
+  const clearCommandMenu = useCallback(() => {
+    setCommandMenuMode(null);
+    setCommandPaletteQuery("");
+    setSelectedCommandIndex(0);
+  }, []);
   const [modelOptions, setModelOptions] = useState<ModelOption[]>([]);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [modelQuery, setModelQuery] = useState("");
@@ -679,6 +683,9 @@ export function useDesktopSession() {
   const handleRuntimeSideEffects = (envelope: RuntimeEvent) => {
     const { type, payload } = envelope.event;
     if (type === "session.archived" || type === "session.unarchived") {
+      if (type === "session.archived" && payload.sessionId === workspaceSessionIdRef.current) {
+        clearCommandMenu();
+      }
       setWorkspace((current) => current && current.sessionId === payload.sessionId
         ? { ...current, archived: payload.archived === true } : current);
       void refreshSessions();
@@ -710,6 +717,7 @@ export function useDesktopSession() {
       const submission = planSubmissionRef.current;
       if (submission && !submission.runId) submission.runId = envelope.runId;
       setRunning(true);
+      clearCommandMenu();
       // Plan submission needs a persistent progress affordance after its menu
       // closes. Other actions move immediately to their phase-specific UI.
       setPendingPlanAction((current) => current === "submit" ? current : null);
@@ -741,6 +749,7 @@ export function useDesktopSession() {
     if (type === "compaction_start") {
       compactingRef.current = true;
       setCompacting(true);
+      clearCommandMenu();
       return;
     }
     if (type === "compaction_end") {
@@ -1200,9 +1209,7 @@ export function useDesktopSession() {
       else setError(`未知命令：/${rawName}`);
       return;
     }
-    setCommandMenuMode(null);
-    setCommandPaletteQuery("");
-    setSelectedCommandIndex(0);
+    clearCommandMenu();
     setError(null);
     const sessionId = workspace.sessionId;
     const originalInput = input;
@@ -1298,6 +1305,7 @@ export function useDesktopSession() {
   const answerPlanQuestion = async (answer: string) => {
     const question = workspace?.planState.pendingQuestion;
     if (!question || !answer.trim()) return;
+    clearCommandMenu();
     setError(null);
     try {
       await window.agent.request("plan.answer", {
@@ -1318,6 +1326,7 @@ export function useDesktopSession() {
   const executePlan = async () => {
     const plan = workspace?.planState.latestRevision;
     if (!plan || running || compacting || workspace?.planState.phase !== "ready") return;
+    clearCommandMenu();
     setError(null);
     setRunning(true);
     setPendingPlanAction("execute");
@@ -1343,6 +1352,7 @@ export function useDesktopSession() {
   const handoffPlan = async () => {
     const plan = workspace?.planState.latestRevision;
     if (!plan || running || compacting || !canHandoffPlan) return;
+    clearCommandMenu();
     setError(null);
     setRunning(true);
     setPendingPlanAction("handoff");
@@ -1434,6 +1444,7 @@ export function useDesktopSession() {
       || workspace.planState.phase !== "drafting") return;
     const submission: PlanSubmission = { sessionId: workspace.sessionId, runId: null };
     planSubmissionRef.current = submission;
+    clearCommandMenu();
     setPlanCommandMenuOpen(false);
     setPlanSubmissionNotice(null);
     setInput("");
@@ -1477,7 +1488,13 @@ export function useDesktopSession() {
     return !term || `${model.name} ${model.id} ${model.provider}`.toLocaleLowerCase().includes(term);
   });
 
-  const commandQuery = commandMenuMode === "palette"
+  const canShowCommandMenu = Boolean(
+    workspace && !workspace.archived && !running && !compacting && !composerBlocked,
+  );
+  const effectiveCommandMenuMode = canShowCommandMenu ? commandMenuMode : null;
+  const commandMenuOpen = effectiveCommandMenuMode !== null;
+
+  const commandQuery = effectiveCommandMenuMode === "palette"
     ? commandPaletteQuery.trim().toLocaleLowerCase()
     : (input.startsWith("/") ? input.slice(1).toLocaleLowerCase() : "");
   const visibleCommands = commandOptions.filter((command) =>
@@ -1492,13 +1509,12 @@ export function useDesktopSession() {
   }, []);
 
   const closeCommandMenu = useCallback(() => {
-    setCommandMenuMode(null);
-    setCommandPaletteQuery("");
+    clearCommandMenu();
     requestAnimationFrame(() => composerRef.current?.focus());
-  }, []);
+  }, [clearCommandMenu]);
 
   const toggleCommandMenu = useCallback(() => {
-    if (!workspace || running || compacting || composerBlocked || workspace.archived) return;
+    if (!canShowCommandMenu) return;
     setModelPickerOpen(false);
     setSelectedCommandIndex(0);
     setCommandPaletteQuery("");
@@ -1509,7 +1525,7 @@ export function useDesktopSession() {
       }
       return "palette";
     });
-  }, [workspace, running, compacting, composerBlocked]);
+  }, [canShowCommandMenu]);
 
   useEffect(() => {
     if (!commandMenuOpen) return;
@@ -1526,9 +1542,7 @@ export function useDesktopSession() {
 
   const onInputChange = (value: string) => {
     setInput(value);
-    const isCommandSearch = Boolean(workspace)
-      && !running
-      && !compacting
+    const isCommandSearch = canShowCommandMenu
       && value.startsWith("/")
       && !/\s/.test(value);
     if (isCommandSearch) setModelPickerOpen(false);
@@ -1539,11 +1553,9 @@ export function useDesktopSession() {
 
   const onInputFocus = useCallback(() => {
     if (commandMenuMode === "palette") {
-      setCommandMenuMode(null);
-      setCommandPaletteQuery("");
-      setSelectedCommandIndex(0);
+      clearCommandMenu();
     }
-  }, [commandMenuMode]);
+  }, [clearCommandMenu, commandMenuMode]);
 
   const onInputKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.nativeEvent.isComposing || event.keyCode === 229) return;
@@ -1551,7 +1563,7 @@ export function useDesktopSession() {
       && !event.repeat && !composerBlocked && !running && !compacting) {
       attachments.prepareClipboardPaste();
     }
-    if (commandMenuMode === "inline") {
+    if (effectiveCommandMenuMode === "inline") {
       if (event.key === "ArrowDown") {
         event.preventDefault();
         setSelectedCommandIndex((index) => visibleCommands.length
@@ -1577,7 +1589,7 @@ export function useDesktopSession() {
         void executeSlashCommand(command.name, "", { consumeInput: true });
         return;
       }
-    } else if (commandMenuMode === "palette" && event.key === "Escape") {
+    } else if (effectiveCommandMenuMode === "palette" && event.key === "Escape") {
       event.preventDefault();
       closeCommandMenu();
       return;
@@ -1934,7 +1946,7 @@ export function useDesktopSession() {
 
     // Command palette & Model picker
     commandMenuOpen,
-    commandMenuMode,
+    commandMenuMode: effectiveCommandMenuMode,
     commandPaletteQuery,
     onCommandPaletteQueryChange,
     toggleCommandMenu,

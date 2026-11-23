@@ -132,7 +132,8 @@ class Agent:
         # loop via get_steering_messages / get_follow_up_messages callbacks.
         self._steering_queue = PendingMessageQueue(steering_mode)
         self._follow_up_queue = PendingMessageQueue(follow_up_mode)
-        self._next_prompt_source: str | None = None
+        self._next_prompt_retry_of: list[str | None] | None = None
+        self._last_prompt_user_ids: list[str | None] = []
 
     # ── subscription ───────────────────────────────────────────────────
 
@@ -211,13 +212,24 @@ class Agent:
                 "Agent is already processing a prompt. Wait for completion before prompting again."
             )
 
-        prompt_source = self._next_prompt_source
-        self._next_prompt_source = None
+        prompt_retry_of = self._next_prompt_retry_of
+        self._next_prompt_retry_of = None
         prompts = self._normalize_prompt_input(
             message,
-            source=prompt_source or "prompt",
-            override_source=prompt_source is not None,
+            source="prompt",
+            assign_message_id=True,
+            retry_of_ids=prompt_retry_of,
         )
+        self._last_prompt_user_ids = [
+            (
+                raw_id.strip() or None
+                if isinstance(raw_id := getattr(item, "message_id", None), str)
+                else None
+            )
+            if getattr(item, "role", None) == "user"
+            else None
+            for item in prompts
+        ]
         await self._run_with_lifecycle(
             lambda signal: run_agent_loop(
                 prompts,
@@ -278,29 +290,57 @@ class Agent:
         message: Any,
         *,
         source: str | None = None,
-        override_source: bool = False,
+        assign_message_id: bool = False,
+        retry_of_ids: list[str | None] | None = None,
     ) -> list:
         from dataclasses import replace
+        import uuid
         from agent_llm import ImageContent, UserMessage
+
+        def _clean_tag(value: Any) -> str | None:
+            if isinstance(value, str):
+                stripped = value.strip()
+                if stripped:
+                    return stripped
+            return None
 
         items = message if isinstance(message, list) else [message]
         normalized: list[Any] = []
-        for item in items:
+        for idx, item in enumerate(items):
+            is_retry = retry_of_ids is not None
+            raw_retry_target = retry_of_ids[idx] if retry_of_ids is not None and idx < len(retry_of_ids) else None
+            retry_target = _clean_tag(raw_retry_target)
             if isinstance(item, str):
-                normalized.append(UserMessage(content=item, source=source))
-            elif (
-                isinstance(item, UserMessage)
-                and source is not None
-                and (override_source or item.source is None)
-            ):
+                effective_source = "internal_retry" if is_retry and not retry_target else source
+                normalized.append(UserMessage(
+                    content=item,
+                    source=effective_source,
+                    message_id=uuid.uuid4().hex[:12] if assign_message_id else None,
+                    retry_of=retry_target,
+                ))
+            elif isinstance(item, UserMessage):
                 has_tracked_media = bool(item.attachments) or (
                     isinstance(item.content, list)
                     and any(isinstance(block, ImageContent) for block in item.content)
                 )
-                if override_source or not has_tracked_media:
-                    normalized.append(replace(item, source=source))
+                existing_source = _clean_tag(item.source)
+                existing_message_id = _clean_tag(item.message_id)
+                updates: dict[str, Any] = {}
+                if is_retry:
+                    if retry_target:
+                        updates["retry_of"] = retry_target
+                        if existing_source is None and source is not None:
+                            updates["source"] = source
+                    else:
+                        updates["source"] = "internal_retry"
+                    if assign_message_id:
+                        updates["message_id"] = uuid.uuid4().hex[:12]
                 else:
-                    normalized.append(item)
+                    if source is not None and existing_source is None and not has_tracked_media:
+                        updates["source"] = source
+                    if assign_message_id and existing_message_id is None and not has_tracked_media:
+                        updates["message_id"] = uuid.uuid4().hex[:12]
+                normalized.append(replace(item, **updates) if updates else item)
             else:
                 normalized.append(item)
         return normalized

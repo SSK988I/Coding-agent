@@ -155,7 +155,7 @@ _LEGACY_LOCAL_SLASH_COMMANDS = frozenset({
 })
 
 
-def _is_local_command_user_message(message: Any) -> bool:
+def is_local_command_user_message(message: Any) -> bool:
     if getattr(message, "role", None) != "user":
         return False
     raw_source = getattr(message, "source", None)
@@ -179,6 +179,9 @@ def _is_local_command_user_message(message: Any) -> bool:
     return token in _LEGACY_LOCAL_SLASH_COMMANDS
 
 
+_is_local_command_user_message = is_local_command_user_message
+
+
 def convert_to_llm(messages: list[AgentAppMessage]) -> list[Message]:
     """Transform app messages (incl. custom roles) into LLM-compatible messages.
 
@@ -192,7 +195,7 @@ def convert_to_llm(messages: list[AgentAppMessage]) -> list[Message]:
     for m in messages:
         role = getattr(m, "role", None)
         if role in ("user", "assistant", "toolResult"):
-            if role == "user" and _is_local_command_user_message(m):
+            if role == "user" and is_local_command_user_message(m):
                 # Local slash commands are application control messages.
                 # Delivered user prompts (e.g. steer/follow_up) carry an
                 # explicit source and are always preserved.

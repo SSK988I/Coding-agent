@@ -191,10 +191,15 @@ const LEGACY_LOCAL_SLASH_COMMANDS = new Set([
   "name", "permissions", "export", "copy", "hotkeys", "exit", "quit",
 ]);
 
-function normalizeUserDisplayText(text: string): string {
-  return text.trimStart().startsWith(CONFIRMED_PLAN_EXECUTION_PREFIX)
-    ? CONFIRMED_PLAN_EXECUTION_LABEL
-    : text;
+function normalizeUserDisplayText(text: string, source?: string | null): string {
+  const normalizedSource = typeof source === "string" ? source.trim() : "";
+  if (normalizedSource === "plan_execution") {
+    return CONFIRMED_PLAN_EXECUTION_LABEL;
+  }
+  if (normalizedSource.length === 0 && text.trimStart().startsWith(CONFIRMED_PLAN_EXECUTION_PREFIX)) {
+    return CONFIRMED_PLAN_EXECUTION_LABEL;
+  }
+  return text;
 }
 
 function isLocalCommandUserMessage(
@@ -225,7 +230,7 @@ interface NormalizedUserContent {
 function normalizeUserMessageForTimeline(message: AgentMessage): NormalizedUserContent | null {
   const content = readAgentMessageContent(message);
   if (isLocalCommandUserMessage(message, content)) return null;
-  const text = normalizeUserDisplayText(content.text);
+  const text = normalizeUserDisplayText(content.text, message.source);
   if (!text && !content.images?.length && !content.files?.length) return null;
   return { ...content, text };
 }
@@ -261,6 +266,7 @@ export function timelineItemsFromPersistedMessages(
       if (block.type === "toolCall" && block.id) calls.set(block.id, block);
     }
   }
+  const seenVisibleUserIds = new Set<string>();
   let lastVisibleUserContent: NormalizedUserContent | null = null;
   return messages.flatMap<TimelineItem>((message, index): TimelineItem[] => {
     const timestamp = typeof message.timestamp === "number" ? message.timestamp : index;
@@ -305,7 +311,10 @@ export function timelineItemsFromPersistedMessages(
     if (message.role === "user") {
       const content = normalizeUserMessageForTimeline(message);
       if (!content) return [];
-      if (
+      const retryOf = typeof message.retry_of === "string" ? message.retry_of.trim() : "";
+      if (retryOf) {
+        if (seenVisibleUserIds.has(retryOf)) return [];
+      } else if (
         message.source === "internal_retry"
         && lastVisibleUserContent
         && userContentMatches(lastVisibleUserContent, content)
@@ -313,6 +322,9 @@ export function timelineItemsFromPersistedMessages(
         return [];
       }
       lastVisibleUserContent = content;
+      const persistedMessageId = typeof message.message_id === "string" ? message.message_id.trim() : "";
+      if (persistedMessageId) seenVisibleUserIds.add(persistedMessageId);
+      if (retryOf) seenVisibleUserIds.add(retryOf);
       return [{
         id: `persisted-${timestamp}-${index}`,
         kind: "message",
@@ -490,7 +502,9 @@ export function reduceRuntimeEventBatch(
       // Admission is authoritative: rejected requests never become sent messages.
       // The stable run key also makes duplicate start notifications idempotent.
       const rawText = typeof payload.text === "string" ? payload.text : "";
-      const text = rawText ? normalizeUserDisplayText(rawText) : "";
+      const text = rawText
+        ? normalizeUserDisplayText(rawText, payload.planExecution === true ? "plan_execution" : "prompt")
+        : "";
       const files = attachmentMetadata(payload.files);
       const images: ImageAttachmentPayload[] = Array.isArray(payload.images)
         ? payload.images.flatMap((image) => {
@@ -638,7 +652,13 @@ export function reduceRuntimeEventBatch(
       const raw = agentMessage(payload.message);
       if (!raw) continue;
       if (raw.role === "user") {
-        if (payload.internalRetry === true || payload.internal_retry === true || raw.source === "internal_retry") {
+        const retryOf = typeof raw.retry_of === "string" ? raw.retry_of.trim() : "";
+        if (
+          payload.internalRetry === true
+          || payload.internal_retry === true
+          || retryOf.length > 0
+          || raw.source === "internal_retry"
+        ) {
           continue;
         }
         const content = normalizeUserMessageForTimeline(raw);

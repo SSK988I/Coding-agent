@@ -694,9 +694,92 @@ describe("timeline state", () => {
       ["user", "请总结这个大仓库"],
       ["assistant", "第二轮回复"],
     ]);
+
+    // Interleaved follow-up B + overflow retry of original A -> live and reopened timelines both show A, B (not A, B, A).
+    const interleavedLive = reduceRuntimeEventBatch(createTimelineState(), [
+      runtimeEvent(1, "run.started", { text: "A" }),
+      runtimeEvent(2, "message_end", { message: { role: "user", content: "A", source: "prompt", message_id: "m-a" } }),
+      runtimeEvent(3, "message_start", { message: assistant("") }),
+      runtimeEvent(4, "message_end", { message: assistant("回复 A", { stop_reason: "end_turn" }) }),
+      runtimeEvent(5, "message_end", { message: { role: "user", content: "B", source: "follow_up" } }),
+      runtimeEvent(6, "message_start", { message: assistant("") }),
+      runtimeEvent(7, "message_end", { message: assistant("", { stop_reason: "error", error_message: "context overflow" }) }),
+      runtimeEvent(8, "compaction_start", { reason: "overflow" }),
+      runtimeEvent(9, "compaction_end", { reason: "overflow", aborted: false, summary_preview: "摘要" }),
+      runtimeEvent(10, "message_end", {
+        message: { role: "user", content: "A", source: "prompt", message_id: "m-a-retry", retry_of: "m-a" },
+        internalRetry: true,
+      }),
+      runtimeEvent(11, "message_start", { message: assistant("") }),
+      runtimeEvent(12, "message_end", { message: assistant("压缩后回复", { stop_reason: "end_turn" }) }),
+      runtimeEvent(13, "run.completed"),
+    ]);
+    expect(selectTimelineItems(interleavedLive).map((item) => (
+      item.kind === "message" ? [item.role, item.text] : item.kind === "compaction" ? [item.kind, item.summary] : [item.kind, item.id]
+    ))).toEqual([
+      ["user", "A"],
+      ["assistant", "回复 A"],
+      ["user", "B"],
+      ["compaction", "摘要"],
+      ["assistant", "压缩后回复"],
+    ]);
+
+    // Persisted reopen when A and B are both still present: retry of A (retry_of: "m-a") is skipped.
+    const interleavedReopenKept = createTimelineStateFromMessages([
+      { role: "compactionSummary", content: "", summary: "摘要", tokens_before: 9000, timestamp: 1 },
+      { role: "user", content: "A", source: "prompt", message_id: "m-a", timestamp: 2 },
+      assistant("回复 A", { timestamp: 3, stop_reason: "end_turn" }),
+      { role: "user", content: "B", source: "follow_up", timestamp: 4 },
+      assistant("", { timestamp: 5, stop_reason: "error", error_message: "context overflow" }),
+      { role: "user", content: "A", source: "prompt", message_id: "m-a-retry", retry_of: "m-a", timestamp: 6 },
+      assistant("压缩后回复", { timestamp: 7, stop_reason: "end_turn" }),
+    ], "session-1");
+    expect(selectTimelineItems(interleavedReopenKept).map((item) => (
+      item.kind === "message" ? [item.role, item.text] : item.kind === "compaction" ? [item.kind, item.summary] : [item.kind, item.id]
+    ))).toEqual([
+      ["compaction", "摘要"],
+      ["user", "A"],
+      ["assistant", "回复 A"],
+      ["user", "B"],
+      ["assistant", "压缩后回复"],
+    ]);
+
+    // Persisted reopen when original A was summarized into CompactionSummary: retry of A must stay visible.
+    const interleavedReopenSummarized = createTimelineStateFromMessages([
+      { role: "compactionSummary", content: "", summary: "摘要", tokens_before: 9000, timestamp: 1 },
+      { role: "user", content: "B", source: "follow_up", timestamp: 4 },
+      { role: "user", content: "A", source: "prompt", message_id: "m-a-retry", retry_of: "m-a", timestamp: 6 },
+      assistant("压缩后回复", { timestamp: 7, stop_reason: "end_turn" }),
+    ], "session-1");
+    expect(selectTimelineItems(interleavedReopenSummarized).map((item) => (
+      item.kind === "message" ? [item.role, item.text] : item.kind === "compaction" ? [item.kind, item.summary] : [item.kind, item.id]
+    ))).toEqual([
+      ["compaction", "摘要"],
+      ["user", "B"],
+      ["user", "A"],
+      ["assistant", "压缩后回复"],
+    ]);
+
+    // Contrast: user actively sends A again after B (no retry_of) -> must show A, B, A.
+    const explicitRepeatAfterB = createTimelineStateFromMessages([
+      { role: "user", content: "A", source: "prompt", message_id: "m-a", timestamp: 1 },
+      assistant("回复 A", { timestamp: 2, stop_reason: "end_turn" }),
+      { role: "user", content: "B", source: "follow_up", timestamp: 3 },
+      assistant("回复 B", { timestamp: 4, stop_reason: "end_turn" }),
+      { role: "user", content: "A", source: "follow_up", timestamp: 5 },
+      assistant("再次回复 A", { timestamp: 6, stop_reason: "end_turn" }),
+    ], "session-1");
+    expect((selectTimelineItems(explicitRepeatAfterB) as TimelineMessageItem[]).map((item) => [item.role, item.text])).toEqual([
+      ["user", "A"],
+      ["assistant", "回复 A"],
+      ["user", "B"],
+      ["assistant", "回复 B"],
+      ["user", "A"],
+      ["assistant", "再次回复 A"],
+    ]);
   });
 
-  it("renders confirmed plan execution identically across live events and persisted history", () => {
+  it("renders confirmed plan execution identically across live events and persisted history without hijacking pasted examples", () => {
     const executionPrompt = [
       "<confirmed_plan_execution>",
       "plan_id: plan-1",
@@ -711,16 +794,26 @@ describe("timeline state", () => {
 
     const liveState = reduceRuntimeEventBatch(createTimelineState(), [
       runtimeEvent(1, "run.started", { planExecution: true }),
-      runtimeEvent(2, "message_start", { message: { role: "user", content: executionPrompt } }),
-      runtimeEvent(3, "message_end", { message: { role: "user", content: executionPrompt } }),
+      runtimeEvent(2, "message_start", { message: { role: "user", content: executionPrompt, source: "plan_execution", message_id: "plan-m1" } }),
+      runtimeEvent(3, "message_end", { message: { role: "user", content: executionPrompt, source: "plan_execution", message_id: "plan-m1" } }),
       // Even an overflow retry during plan execution must not duplicate the collapsed label.
-      runtimeEvent(4, "message_end", { message: { role: "user", content: executionPrompt }, internalRetry: true }),
+      runtimeEvent(4, "message_end", {
+        message: { role: "user", content: executionPrompt, source: "plan_execution", message_id: "plan-m2", retry_of: "plan-m1" },
+        internalRetry: true,
+      }),
       runtimeEvent(5, "message_start", { message: assistant("") }),
       runtimeEvent(6, "message_end", { message: assistant("计划已执行完成", { stop_reason: "end_turn" }) }),
       runtimeEvent(7, "run.completed"),
     ]);
 
     const persistedState = createTimelineStateFromMessages([
+      { role: "user", content: executionPrompt, source: "plan_execution", message_id: "plan-m1", timestamp: 10 },
+      { role: "user", content: executionPrompt, source: "plan_execution", message_id: "plan-m2", retry_of: "plan-m1", timestamp: 10.5 },
+      assistant("计划已执行完成", { timestamp: 11, stop_reason: "end_turn" }),
+    ], "session-1");
+
+    // Legacy persisted record without explicit source still collapses backward-compatibly.
+    const legacyPersistedState = createTimelineStateFromMessages([
       { role: "user", content: executionPrompt, timestamp: 10 },
       assistant("计划已执行完成", { timestamp: 11, stop_reason: "end_turn" }),
     ], "session-1");
@@ -733,6 +826,27 @@ describe("timeline state", () => {
       ["assistant", "计划已执行完成"],
     ]);
     expect(project(liveState)).toEqual(project(persistedState));
+    expect(project(liveState)).toEqual(project(legacyPersistedState));
+
+    // Pasting a <confirmed_plan_execution> example in ordinary chat (source: "prompt") must preserve verbatim text!
+    const pastedExample = "<confirmed_plan_execution>\n示例内容\n</confirmed_plan_execution>\n请问这个标签是什么含义？";
+    const pastedLive = reduceRuntimeEventBatch(createTimelineState(), [
+      runtimeEvent(1, "run.started", { text: pastedExample }),
+      runtimeEvent(2, "message_end", { message: { role: "user", content: pastedExample, source: "prompt", message_id: "u-1" } }),
+      runtimeEvent(3, "message_start", { message: assistant("") }),
+      runtimeEvent(4, "message_end", { message: assistant("这是内部计划执行标记", { stop_reason: "end_turn" }) }),
+      runtimeEvent(5, "run.completed"),
+    ]);
+    const pastedPersisted = createTimelineStateFromMessages([
+      { role: "user", content: pastedExample, source: "prompt", message_id: "u-1", timestamp: 1 },
+      assistant("这是内部计划执行标记", { timestamp: 2, stop_reason: "end_turn" }),
+    ], "session-1");
+
+    expect(project(pastedLive)).toEqual([
+      ["user", pastedExample],
+      ["assistant", "这是内部计划执行标记"],
+    ]);
+    expect(project(pastedPersisted)).toEqual(project(pastedLive));
   });
 
   it("preserves slash-prefixed steer/follow-up messages across live and persisted timelines while filtering local commands", () => {

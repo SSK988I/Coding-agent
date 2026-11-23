@@ -212,6 +212,8 @@ export interface PermissionModePayload {
 export interface AgentMessage {
   attachments?: FileAttachmentMetadata[];
   source?: string | null;
+  message_id?: string | null;
+  retry_of?: string | null;
   tool_call_id?: string;
   tool_name?: string;
   details?: unknown;

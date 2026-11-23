@@ -328,7 +328,7 @@ export function App() {
               onAbortExecution={() => void session.abortPlanExecution()}
             />
 
-            {session.commandMenuOpen && !workspace?.archived && !session.running && !session.compacting && (
+            {session.commandMenuOpen && (
               <CommandPalette
                 commands={session.visibleCommands}
                 selectedIndex={session.selectedCommandIndex}

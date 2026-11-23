@@ -955,4 +955,82 @@ describe("desktop frontend refactor capabilities", () => {
     expect(await screen.findByText("/src/main.py 是要改的文件")).toBeInTheDocument();
     expect(screen.getByText("已修改 /src/main.py")).toBeInTheDocument();
   });
+
+  it("closes hidden inline command menu when answering a Plan question starts a run so Tab moves focus and Enter queues draft", async () => {
+    request.mockImplementation(async (method: string) => {
+      if (method === "workspace.open") {
+        return makeWorkspace({
+          collaborationMode: "plan",
+          planState: {
+            mode: "plan",
+            phase: "awaiting_answer",
+            activePlanId: "plan-1",
+            latestRevision: null,
+            pendingQuestion: {
+              questionId: "q-1",
+              header: "范围确认",
+              question: "选择要修改的模块",
+              options: [{ label: "前端", description: "仅修改渲染层" }],
+              allowCustom: true,
+            },
+          },
+        });
+      }
+      if (method === "session.list") return [];
+      if (method === "command.list") {
+        return [
+          { name: "clear", label: "清空会话", description: "重置当前对话" },
+          { name: "help", label: "帮助", description: "显示可用命令" },
+        ];
+      }
+      if (method === "plan.answer") return { accepted: true, runId: "run-plan-answer-1" };
+      if (method === "run.steer" || method === "run.followUp") return { queued: true };
+      if (method === "session.clear") throw new Error("RUN_IN_PROGRESS");
+      return {};
+    });
+
+    mount();
+    await screen.findByText("选择要修改的模块");
+
+    // 1. Type "/cle" in the main composer so inline command menu opens.
+    const textarea = screen.getByPlaceholderText("描述你想完成的任务…");
+    fireEvent.change(textarea, { target: { value: "/cle" } });
+    expect(await screen.findByRole("button", { name: /\/clear/ })).toBeInTheDocument();
+
+    // 2. Answer the Plan question card -> run starts and command menu closes/hides.
+    fireEvent.click(screen.getByRole("button", { name: /前端/ }));
+    await waitFor(() => expect(request).toHaveBeenCalledWith("plan.answer", {
+      questionId: "q-1",
+      answer: "前端",
+    }));
+    await emit("plan.stateChanged", {
+      state: {
+        mode: "plan",
+        phase: "drafting",
+        activePlanId: "plan-1",
+        latestRevision: null,
+        pendingQuestion: null,
+      },
+    }, "run-plan-answer-1");
+    await emit("run.started", { planAnswer: true }, "run-plan-answer-1");
+
+    expect(screen.queryByRole("button", { name: /\/clear/ })).not.toBeInTheDocument();
+
+    // 3. Focus back onto composer -> Tab must NOT preventDefault, must NOT call session.clear, and must keep "/cle" draft.
+    textarea.focus();
+    fireEvent.focus(textarea);
+    const tabNotPrevented = fireEvent.keyDown(textarea, { key: "Tab" });
+    expect(tabNotPrevented).toBe(true);
+    expect(request).not.toHaveBeenCalledWith("session.clear");
+    expect(textarea).toHaveValue("/cle");
+
+    // 4. Pressing Enter while running must queue "/cle" via run.steer (NOT call session.clear).
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    await waitFor(() => expect(request).toHaveBeenCalledWith("run.steer", {
+      text: "/cle",
+      sessionId: "session-1",
+      runId: "run-plan-answer-1",
+    }));
+    expect(request).not.toHaveBeenCalledWith("session.clear");
+  });
 });

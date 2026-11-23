@@ -858,7 +858,7 @@ class DesktopRuntime:
                     *([TextContent(text=text)] if text.strip() else []),
                     *images,
                     *(files.content if files is not None else []),
-                ], attachments=files.metadata if files is not None else [], source="prompt")
+                ], attachments=files.metadata if files is not None else [], source="prompt", message_id=uuid.uuid4().hex[:12])
                 if images or files is not None else text
             )
             attachments.track(message)
