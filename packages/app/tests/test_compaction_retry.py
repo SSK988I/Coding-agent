@@ -457,15 +457,142 @@ def test_plan_execution_tags_explicit_source_and_preserves_it_on_overflow_retry(
 
 
 def test_agent_steer_and_follow_up_backfill_source_on_user_message(tmp_path):
-    from agent_llm import UserMessage
+    from agent_llm import ImageContent, TextContent, UserMessage
 
     sm = SessionManager.create(cwd=str(tmp_path), agent_dir=tmp_path)
     session = AgentSession(AgentSessionConfig(model=_model(), cwd=str(tmp_path), session_manager=sm, tools=[]))
 
     session.agent.steer(UserMessage(content="/model 看看"))
     session.agent.follow_up(UserMessage(content="/src/app.py"))
+    media_steer = UserMessage(content=[TextContent(text="看图"), ImageContent(data="iVBORw0KGgo=", mime_type="image/png")])
+    session.agent.steer(media_steer)
 
-    steered = session.agent._steering_queue.drain()
+    steered_first = session.agent._steering_queue.drain()
+    steered_second = session.agent._steering_queue.drain()
     followed = session.agent._follow_up_queue.drain()
-    assert len(steered) == 1 and steered[0].source == "steer"
+    assert len(steered_first) == 1 and steered_first[0].source == "steer"
+    assert len(steered_second) == 1 and steered_second[0] is media_steer and steered_second[0].source == "steer"
     assert len(followed) == 1 and followed[0].source == "follow_up"
+
+
+def test_direct_api_image_user_message_links_overflow_retry_and_preserves_identity(tmp_path):
+    """Direct AgentSession.prompt(UserMessage with ImageContent) assigns message_id in-place and links retry_of."""
+    import base64
+    import io
+    from PIL import Image
+    from agent_llm import AssistantMessage, ImageContent, TextContent, UserMessage
+    from coding_agent.desktop.runtime import DesktopRuntime, _RunAttachmentPersistence
+
+    png_buf = io.BytesIO()
+    Image.new("RGB", (2, 2), "white").save(png_buf, format="PNG")
+    png_b64 = base64.b64encode(png_buf.getvalue()).decode("ascii")
+
+    vision_model = Model(
+        id="vision-m",
+        context_window=1000,
+        input=["text", "image"],
+        cost=ModelCost(input=0, output=0, cache_read=0, cache_write=0),
+    )
+    sm = SessionManager.create(cwd=str(tmp_path), agent_dir=tmp_path)
+    session = AgentSession(AgentSessionConfig(model=vision_model, cwd=str(tmp_path), session_manager=sm, tools=[]))
+
+    fake_orch = MagicMock()
+    fake_orch.reset_overflow_guard = MagicMock()
+    fake_orch.abort = MagicMock()
+    fake_orch.check_compaction = AsyncMock(
+        return_value=CompactionOutcome(performed=True, reason="overflow", need_retry=True, summary_preview="s"),
+    )
+    session._compaction_orchestrator = fake_orch
+
+    runtime_events: list[dict] = []
+    runtime = DesktopRuntime(runtime_events.append)
+    runtime._session = session
+    session.on_event(runtime._on_session_event)
+
+    calls = 0
+
+    class _Stream:
+        def __init__(self, reply: AssistantMessage):
+            self._reply = reply
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        async def result(self):
+            return self._reply
+
+    def stream_fn(_model_arg, _context, _options):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            session.agent.follow_up("B")
+            return _Stream(AssistantMessage(content=[TextContent(text="reply A")], stop_reason="end_turn"))
+        if calls == 2:
+            return _Stream(AssistantMessage(
+                content=[TextContent(text="")],
+                stop_reason="error",
+                error_message="context overflow",
+            ))
+        return _Stream(AssistantMessage(content=[TextContent(text="retried image A")], stop_reason="end_turn"))
+
+    session.agent.stream_fn = stream_fn
+    image_block = ImageContent(data=png_b64, mime_type="image/png")
+    image_message = UserMessage(content=[TextContent(text="A"), image_block])
+
+    attachments = _RunAttachmentPersistence(session)
+    attachments.track(image_message)
+    try:
+        _run(session.prompt(image_message))
+        attachments.validate()
+    finally:
+        attachments.close()
+
+    assert image_message.source == "prompt"
+    assert isinstance(image_message.message_id, str) and image_message.message_id
+    assert image_message.retry_of is None
+    original_id = image_message.message_id
+
+    user_ends = [
+        ev["event"]["payload"]
+        for ev in runtime_events
+        if ev["event"]["type"] == "message_end"
+        and ev["event"]["payload"].get("message", {}).get("role") == "user"
+    ]
+    assert len(user_ends) == 3
+    assert user_ends[0]["message"]["source"] == "prompt"
+    assert user_ends[0]["message"]["message_id"] == original_id
+    assert user_ends[0]["message"].get("retry_of") is None
+    assert user_ends[0].get("internalRetry") is None
+    assert user_ends[1]["message"]["content"] == "B"
+    assert user_ends[1]["message"]["source"] == "follow_up"
+    assert user_ends[1].get("internalRetry") is None
+    assert user_ends[2]["message"]["source"] == "prompt"
+    retried_id = user_ends[2]["message"].get("message_id")
+    assert isinstance(retried_id, str) and retried_id and retried_id != original_id
+    assert user_ends[2]["message"]["retry_of"] == original_id
+    assert user_ends[2].get("internalRetry") is True
+
+    state_users = [m for m in session.state.messages if getattr(m, "role", None) == "user"]
+    assert len(state_users) == 3
+    assert state_users[0] is image_message
+    assert state_users[2] is not image_message
+    assert state_users[2].message_id == retried_id
+    assert state_users[2].retry_of == original_id
+
+    restored = SessionManager.open(sm.path).build_session_context().messages
+    restored_users = [m for m in restored if m.role == "user"]
+    assert len(restored_users) == 3
+    assert restored_users[0].source == "prompt"
+    assert restored_users[0].message_id == original_id
+    assert restored_users[0].retry_of is None
+    assert any(isinstance(b, ImageContent) and b.data == image_block.data for b in restored_users[0].content)
+    assert restored_users[1].content == "B"
+    assert restored_users[1].source == "follow_up"
+    assert restored_users[1].retry_of is None
+    assert restored_users[2].source == "prompt"
+    assert restored_users[2].message_id == retried_id
+    assert restored_users[2].retry_of == original_id
+    assert any(isinstance(b, ImageContent) and b.data == image_block.data for b in restored_users[2].content)

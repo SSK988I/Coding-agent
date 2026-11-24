@@ -336,10 +336,19 @@ class Agent:
                     if assign_message_id:
                         updates["message_id"] = uuid.uuid4().hex[:12]
                 else:
-                    if source is not None and existing_source is None and not has_tracked_media:
-                        updates["source"] = source
-                    if assign_message_id and existing_message_id is None and not has_tracked_media:
-                        updates["message_id"] = uuid.uuid4().hex[:12]
+                    if has_tracked_media:
+                        # Fill missing metadata in-place for media UserMessages so callers
+                        # tracking object identity (e.g. _RunAttachmentPersistence) keep the
+                        # exact same instance while direct API calls still get retry linkage.
+                        if source is not None and existing_source is None:
+                            item.source = source
+                        if assign_message_id and existing_message_id is None:
+                            item.message_id = uuid.uuid4().hex[:12]
+                    else:
+                        if source is not None and existing_source is None:
+                            updates["source"] = source
+                        if assign_message_id and existing_message_id is None:
+                            updates["message_id"] = uuid.uuid4().hex[:12]
                 normalized.append(replace(item, **updates) if updates else item)
             else:
                 normalized.append(item)

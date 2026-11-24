@@ -818,6 +818,14 @@ describe("timeline state", () => {
       assistant("计划已执行完成", { timestamp: 11, stop_reason: "end_turn" }),
     ], "session-1");
 
+    // Intermediate PR version (78ac462) saved plan execution with source: "prompt", no message_id,
+    // and optional overflow retry with source: "internal_retry" and no message_id.
+    const intermediatePrPersistedState = createTimelineStateFromMessages([
+      { role: "user", content: executionPrompt, source: "prompt", timestamp: 10 },
+      { role: "user", content: executionPrompt, source: "internal_retry", timestamp: 10.5 },
+      assistant("计划已执行完成", { timestamp: 11, stop_reason: "end_turn" }),
+    ], "session-1");
+
     const project = (state: ReturnType<typeof createTimelineState>) =>
       (selectTimelineItems(state) as TimelineMessageItem[]).map((item) => [item.role, item.text]);
 
@@ -827,8 +835,10 @@ describe("timeline state", () => {
     ]);
     expect(project(liveState)).toEqual(project(persistedState));
     expect(project(liveState)).toEqual(project(legacyPersistedState));
+    expect(project(liveState)).toEqual(project(intermediatePrPersistedState));
 
-    // Pasting a <confirmed_plan_execution> example in ordinary chat (source: "prompt") must preserve verbatim text!
+    // Pasting a <confirmed_plan_execution> example in ordinary chat (source: "prompt") must preserve verbatim text,
+    // including both an exact template paste in current sessions (with message_id) and partial snippets in legacy sessions.
     const pastedExample = "<confirmed_plan_execution>\n示例内容\n</confirmed_plan_execution>\n请问这个标签是什么含义？";
     const pastedLive = reduceRuntimeEventBatch(createTimelineState(), [
       runtimeEvent(1, "run.started", { text: pastedExample }),
@@ -841,12 +851,75 @@ describe("timeline state", () => {
       { role: "user", content: pastedExample, source: "prompt", message_id: "u-1", timestamp: 1 },
       assistant("这是内部计划执行标记", { timestamp: 2, stop_reason: "end_turn" }),
     ], "session-1");
+    const intermediatePrPastedSnippet = createTimelineStateFromMessages([
+      { role: "user", content: pastedExample, source: "prompt", timestamp: 1 },
+      assistant("这是内部计划执行标记", { timestamp: 2, stop_reason: "end_turn" }),
+    ], "session-1");
+    const pastedExactTemplateLive = reduceRuntimeEventBatch(createTimelineState(), [
+      runtimeEvent(1, "run.started", { text: executionPrompt }),
+      runtimeEvent(2, "message_end", { message: { role: "user", content: executionPrompt, source: "prompt", message_id: "u-exact" } }),
+      runtimeEvent(3, "message_start", { message: assistant("") }),
+      runtimeEvent(4, "message_end", { message: assistant("收到粘贴模板", { stop_reason: "end_turn" }) }),
+      runtimeEvent(5, "run.completed"),
+    ]);
+    const pastedExactTemplatePersisted = createTimelineStateFromMessages([
+      { role: "user", content: executionPrompt, source: "prompt", message_id: "u-exact", timestamp: 1 },
+      assistant("收到粘贴模板", { timestamp: 2, stop_reason: "end_turn" }),
+    ], "session-1");
+    const intermediatePrMediaWithTemplate = createTimelineStateFromMessages([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: executionPrompt },
+          { type: "image", data: "aGVsbG8=", mime_type: "image/png" },
+        ],
+        source: "prompt",
+        timestamp: 1,
+      },
+      assistant("收到带图消息", { timestamp: 2, stop_reason: "end_turn" }),
+    ], "session-1");
+    const intermediatePrFileAttachmentWithTemplate = createTimelineStateFromMessages([
+      {
+        role: "user",
+        content: executionPrompt,
+        attachments: [{ name: "plan.txt", path: "plan.txt", mime_type: "text/plain", size: 12 }],
+        source: "prompt",
+        timestamp: 1,
+      },
+      assistant("收到带文件消息", { timestamp: 2, stop_reason: "end_turn" }),
+    ], "session-1");
+    const intermediatePrCompactedInternalRetryOnly = createTimelineStateFromMessages([
+      { role: "compactionSummary", content: "", summary: "摘要", tokens_before: 9000, timestamp: 1 },
+      { role: "user", content: executionPrompt, source: "internal_retry", timestamp: 2 },
+      assistant("计划已执行完成", { timestamp: 3, stop_reason: "end_turn" }),
+    ], "session-1");
 
     expect(project(pastedLive)).toEqual([
       ["user", pastedExample],
       ["assistant", "这是内部计划执行标记"],
     ]);
     expect(project(pastedPersisted)).toEqual(project(pastedLive));
+    expect(project(intermediatePrPastedSnippet)).toEqual(project(pastedLive));
+    expect(project(pastedExactTemplateLive)).toEqual([
+      ["user", executionPrompt],
+      ["assistant", "收到粘贴模板"],
+    ]);
+    expect(project(pastedExactTemplatePersisted)).toEqual(project(pastedExactTemplateLive));
+    expect(project(intermediatePrMediaWithTemplate)).toEqual([
+      ["user", executionPrompt],
+      ["assistant", "收到带图消息"],
+    ]);
+    expect(project(intermediatePrFileAttachmentWithTemplate)).toEqual([
+      ["user", executionPrompt],
+      ["assistant", "收到带文件消息"],
+    ]);
+    expect(selectTimelineItems(intermediatePrCompactedInternalRetryOnly).map((item) => (
+      item.kind === "message" ? [item.role, item.text] : item.kind === "compaction" ? [item.kind, item.summary] : [item.kind, item.id]
+    ))).toEqual([
+      ["compaction", "摘要"],
+      ["user", "执行已确认计划"],
+      ["assistant", "计划已执行完成"],
+    ]);
   });
 
   it("preserves slash-prefixed steer/follow-up messages across live and persisted timelines while filtering local commands", () => {

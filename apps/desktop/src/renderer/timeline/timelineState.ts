@@ -183,6 +183,8 @@ export function readAgentMessageContent(message: AgentMessage): {
 
 const CONFIRMED_PLAN_EXECUTION_PREFIX = "<confirmed_plan_execution>";
 const CONFIRMED_PLAN_EXECUTION_LABEL = "执行已确认计划";
+const LEGACY_CONFIRMED_PLAN_EXECUTION_RE =
+  /^\s*<confirmed_plan_execution>\r?\nplan_id:[ \t]+\S+\r?\nrevision:[ \t]+\d+\r?\ndigest:[ \t]+\S+\r?\ntitle:[ \t]+\S[^\r\n]*\r?\n\r?\n[\s\S]*\r?\n<\/confirmed_plan_execution>\r?\nExecute this exact confirmed plan now\.\s*$/;
 
 const LEGACY_LOCAL_SLASH_COMMANDS = new Set([
   "help", "new", "model", "compact", "subagents", "clear",
@@ -191,12 +193,32 @@ const LEGACY_LOCAL_SLASH_COMMANDS = new Set([
   "name", "permissions", "export", "copy", "hotkeys", "exit", "quit",
 ]);
 
-function normalizeUserDisplayText(text: string, source?: string | null): string {
+interface NormalizeUserDisplayOptions {
+  allowLegacyPromptPlanExecution?: boolean;
+  messageId?: string | null;
+  hasMedia?: boolean;
+}
+
+function normalizeUserDisplayText(
+  text: string,
+  source?: string | null,
+  options?: NormalizeUserDisplayOptions,
+): string {
   const normalizedSource = typeof source === "string" ? source.trim() : "";
   if (normalizedSource === "plan_execution") {
     return CONFIRMED_PLAN_EXECUTION_LABEL;
   }
   if (normalizedSource.length === 0 && text.trimStart().startsWith(CONFIRMED_PLAN_EXECUTION_PREFIX)) {
+    return CONFIRMED_PLAN_EXECUTION_LABEL;
+  }
+  const hasMessageId = typeof options?.messageId === "string" && options.messageId.trim().length > 0;
+  if (
+    options?.allowLegacyPromptPlanExecution
+    && (normalizedSource === "prompt" || normalizedSource === "internal_retry")
+    && !hasMessageId
+    && !options.hasMedia
+    && LEGACY_CONFIRMED_PLAN_EXECUTION_RE.test(text)
+  ) {
     return CONFIRMED_PLAN_EXECUTION_LABEL;
   }
   return text;
@@ -227,10 +249,17 @@ interface NormalizedUserContent {
   files?: FileAttachmentMetadata[];
 }
 
-function normalizeUserMessageForTimeline(message: AgentMessage): NormalizedUserContent | null {
+function normalizeUserMessageForTimeline(
+  message: AgentMessage,
+  options?: { allowLegacyPromptPlanExecution?: boolean },
+): NormalizedUserContent | null {
   const content = readAgentMessageContent(message);
   if (isLocalCommandUserMessage(message, content)) return null;
-  const text = normalizeUserDisplayText(content.text, message.source);
+  const text = normalizeUserDisplayText(content.text, message.source, {
+    allowLegacyPromptPlanExecution: options?.allowLegacyPromptPlanExecution,
+    messageId: message.message_id,
+    hasMedia: Boolean(content.images?.length || content.files?.length),
+  });
   if (!text && !content.images?.length && !content.files?.length) return null;
   return { ...content, text };
 }
@@ -309,7 +338,7 @@ export function timelineItemsFromPersistedMessages(
         }] : []) : [];
 
     if (message.role === "user") {
-      const content = normalizeUserMessageForTimeline(message);
+      const content = normalizeUserMessageForTimeline(message, { allowLegacyPromptPlanExecution: true });
       if (!content) return [];
       const retryOf = typeof message.retry_of === "string" ? message.retry_of.trim() : "";
       if (retryOf) {
