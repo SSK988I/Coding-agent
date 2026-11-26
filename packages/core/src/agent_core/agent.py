@@ -295,7 +295,7 @@ class Agent:
     ) -> list:
         from dataclasses import replace
         import uuid
-        from agent_llm import ImageContent, UserMessage
+        from agent_llm import UserMessage
 
         def _clean_tag(value: Any) -> str | None:
             if isinstance(value, str):
@@ -319,10 +319,6 @@ class Agent:
                     retry_of=retry_target,
                 ))
             elif isinstance(item, UserMessage):
-                has_tracked_media = bool(item.attachments) or (
-                    isinstance(item.content, list)
-                    and any(isinstance(block, ImageContent) for block in item.content)
-                )
                 existing_source = _clean_tag(item.source)
                 existing_message_id = _clean_tag(item.message_id)
                 updates: dict[str, Any] = {}
@@ -336,19 +332,10 @@ class Agent:
                     if assign_message_id:
                         updates["message_id"] = uuid.uuid4().hex[:12]
                 else:
-                    if has_tracked_media:
-                        # Fill missing metadata in-place for media UserMessages so callers
-                        # tracking object identity (e.g. _RunAttachmentPersistence) keep the
-                        # exact same instance while direct API calls still get retry linkage.
-                        if source is not None and existing_source is None:
-                            item.source = source
-                        if assign_message_id and existing_message_id is None:
-                            item.message_id = uuid.uuid4().hex[:12]
-                    else:
-                        if source is not None and existing_source is None:
-                            updates["source"] = source
-                        if assign_message_id and existing_message_id is None:
-                            updates["message_id"] = uuid.uuid4().hex[:12]
+                    if source is not None and existing_source is None:
+                        updates["source"] = source
+                    if assign_message_id and existing_message_id is None:
+                        updates["message_id"] = uuid.uuid4().hex[:12]
                 normalized.append(replace(item, **updates) if updates else item)
             else:
                 normalized.append(item)

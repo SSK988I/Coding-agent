@@ -471,12 +471,14 @@ def test_agent_steer_and_follow_up_backfill_source_on_user_message(tmp_path):
     steered_second = session.agent._steering_queue.drain()
     followed = session.agent._follow_up_queue.drain()
     assert len(steered_first) == 1 and steered_first[0].source == "steer"
-    assert len(steered_second) == 1 and steered_second[0] is media_steer and steered_second[0].source == "steer"
+    assert len(steered_second) == 1 and steered_second[0].source == "steer"
+    assert steered_second[0].content == media_steer.content
+    assert media_steer.source is None
     assert len(followed) == 1 and followed[0].source == "follow_up"
 
 
-def test_direct_api_image_user_message_links_overflow_retry_and_preserves_identity(tmp_path):
-    """Direct AgentSession.prompt(UserMessage with ImageContent) assigns message_id in-place and links retry_of."""
+def test_direct_api_image_user_message_links_overflow_retry_without_mutating_input(tmp_path):
+    """Direct image prompts get retry links while retaining the caller's original message."""
     import base64
     import io
     from PIL import Image
@@ -543,17 +545,15 @@ def test_direct_api_image_user_message_links_overflow_retry_and_preserves_identi
     image_message = UserMessage(content=[TextContent(text="A"), image_block])
 
     attachments = _RunAttachmentPersistence(session)
-    attachments.track(image_message)
     try:
         _run(session.prompt(image_message))
         attachments.validate()
     finally:
         attachments.close()
 
-    assert image_message.source == "prompt"
-    assert isinstance(image_message.message_id, str) and image_message.message_id
+    assert image_message.source is None
+    assert image_message.message_id is None
     assert image_message.retry_of is None
-    original_id = image_message.message_id
 
     user_ends = [
         ev["event"]["payload"]
@@ -563,7 +563,8 @@ def test_direct_api_image_user_message_links_overflow_retry_and_preserves_identi
     ]
     assert len(user_ends) == 3
     assert user_ends[0]["message"]["source"] == "prompt"
-    assert user_ends[0]["message"]["message_id"] == original_id
+    original_id = user_ends[0]["message"]["message_id"]
+    assert isinstance(original_id, str) and original_id
     assert user_ends[0]["message"].get("retry_of") is None
     assert user_ends[0].get("internalRetry") is None
     assert user_ends[1]["message"]["content"] == "B"
@@ -577,7 +578,8 @@ def test_direct_api_image_user_message_links_overflow_retry_and_preserves_identi
 
     state_users = [m for m in session.state.messages if getattr(m, "role", None) == "user"]
     assert len(state_users) == 3
-    assert state_users[0] is image_message
+    assert state_users[0].content == image_message.content
+    assert state_users[0].message_id == original_id
     assert state_users[2] is not image_message
     assert state_users[2].message_id == retried_id
     assert state_users[2].retry_of == original_id
@@ -596,3 +598,11 @@ def test_direct_api_image_user_message_links_overflow_retry_and_preserves_identi
     assert restored_users[2].message_id == retried_id
     assert restored_users[2].retry_of == original_id
     assert any(isinstance(b, ImageContent) and b.data == image_block.data for b in restored_users[2].content)
+
+    fake_orch.check_compaction.return_value = None
+    _run(session.prompt(image_message))
+    reused_prompt = session.state.messages[-2]
+    assert isinstance(reused_prompt, UserMessage)
+    assert reused_prompt.content == image_message.content
+    assert reused_prompt.message_id not in {None, original_id, retried_id}
+    assert reused_prompt.retry_of is None
