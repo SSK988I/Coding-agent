@@ -332,3 +332,67 @@ it("sends, approves and stops only the side conversation; unrelated session even
   await waitFor(() => expect(request).toHaveBeenCalledWith("workbench.chat.stop", { ...scope, conversationId: "child" }));
   expect(request.mock.calls.some(([method]) => method === "run.start" || method === "run.abort")).toBe(false);
 });
+
+it("restores Markdown list markers, headings and link styles for file preview and side chat", async () => {
+  const markdownDoc = [
+    "# Release Guide",
+    "",
+    "1. Install dependencies",
+    "2. Run tests",
+    "",
+    "- Keep docs updated",
+    "",
+    "[Documentation](https://example.com/docs)",
+  ].join("\n");
+
+  request.mockImplementation(async (method: string) => {
+    if (method === "workbench.files.list") {
+      return { path: "", entries: [{ name: "README.md", path: "README.md", kind: "file" }], truncated: false };
+    }
+    if (method === "workbench.files.read") {
+      return { path: "README.md", text: markdownDoc, image: null, size: markdownDoc.length, truncated: false, binary: false };
+    }
+    if (method === "workbench.chat.list") return { conversations: [{ conversationId: "child", title: "Markdown check" }] };
+    if (method === "workbench.chat.open") {
+      return {
+        ...side,
+        messages: [{ role: "assistant", content: "## Steps\n\n1. Inspect diff\n2. Verify build\n\n[Spec](https://example.com/spec)", timestamp: 1 }],
+      };
+    }
+    return {};
+  });
+
+  const filesView = render(<FilesPanel scope={scope} requestedFile={{ path: "README.md", serial: 1 }} />);
+  await screen.findByRole("heading", { level: 1, name: "Release Guide" });
+  const previewContainer = filesView.container.querySelector(".workbench-markdown");
+  expect(previewContainer?.querySelector("ol > li")).toHaveTextContent("Install dependencies");
+  expect(previewContainer?.querySelector("ul > li")).toHaveTextContent("Keep docs updated");
+  expect(previewContainer?.querySelector("a")).toHaveAttribute("href", "https://example.com/docs");
+
+  cleanup();
+
+  const chatView = render(<SideChatPanel scope={scope} />);
+  fireEvent.click(screen.getByRole("button", { name: "开始侧边对话" }));
+  await screen.findByRole("heading", { level: 2, name: "Steps" });
+  const sideMessage = chatView.container.querySelector(".side-chat-message.assistant");
+  expect(sideMessage?.querySelectorAll("ol > li")).toHaveLength(2);
+  expect(sideMessage?.querySelector("a")).toHaveAttribute("href", "https://example.com/spec");
+
+  const fsModule = "node:fs";
+  const pathModule = "node:path";
+  const fs = await import(/* @vite-ignore */ fsModule) as {
+    readFileSync: (file: string, encoding: "utf8") => string;
+  };
+  const path = await import(/* @vite-ignore */ pathModule) as {
+    resolve: (...parts: string[]) => string;
+  };
+  const stylesCss = fs.readFileSync(path.resolve("src/renderer/styles.css"), "utf8");
+  expect(stylesCss).toMatch(/\.workbench-markdown\s+ol[\s\S]*?list-style:\s*decimal/);
+  expect(stylesCss).toMatch(/\.side-chat-message\s+ol[\s\S]*?list-style:\s*decimal/);
+  expect(stylesCss).toMatch(/\.workbench-markdown\s+ul[\s\S]*?list-style:\s*disc/);
+  expect(stylesCss).toMatch(/\.side-chat-message\s+ul[\s\S]*?list-style:\s*disc/);
+  expect(stylesCss).toMatch(/\.workbench-markdown\s+h1[\s\S]*?font-weight:/);
+  expect(stylesCss).toMatch(/\.side-chat-message\s+h1[\s\S]*?font-weight:/);
+  expect(stylesCss).toMatch(/\.workbench-markdown\s+a[\s\S]*?text-decoration:\s*underline/);
+  expect(stylesCss).toMatch(/\.side-chat-message\s+a[\s\S]*?text-decoration:\s*underline/);
+});

@@ -150,6 +150,14 @@ def _user_attachments(raw: Any) -> list[dict[str, Any]]:
     return result
 
 
+def _optional_nonempty_str(raw: Any) -> str | None:
+    if isinstance(raw, str):
+        value = raw.strip()
+        if value:
+            return value
+    return None
+
+
 # ─── messages ───────────────────────────────────────
 
 def message_to_dict(message: Message) -> dict:
@@ -160,11 +168,17 @@ def message_to_dict(message: Message) -> dict:
     role = getattr(message, "role", None)
     if role == "user":
         assert isinstance(message, UserMessage)
+        source = _optional_nonempty_str(getattr(message, "source", None))
+        message_id = _optional_nonempty_str(getattr(message, "message_id", None))
+        retry_of = _optional_nonempty_str(getattr(message, "retry_of", None))
         return {
             "role": "user",
             "content": _encode_user_content(message.content),
             "timestamp": getattr(message, "timestamp", None),
             **({"attachments": _user_attachments(message.attachments)} if message.attachments else {}),
+            **({"source": source} if source is not None else {}),
+            **({"message_id": message_id} if message_id is not None else {}),
+            **({"retry_of": retry_of} if retry_of is not None else {}),
         }
     if role == "assistant":
         assert isinstance(message, AssistantMessage)
@@ -208,6 +222,9 @@ def dict_to_message(d: dict) -> Message:
             content=_decode_user_content(d.get("content", "")),
             timestamp=float(d.get("timestamp") or 0.0),
             attachments=_user_attachments(d.get("attachments")),
+            source=_optional_nonempty_str(d.get("source")),
+            message_id=_optional_nonempty_str(d.get("message_id")),
+            retry_of=_optional_nonempty_str(d.get("retry_of")),
         )
     if role == "assistant":
         return AssistantMessage(

@@ -5,6 +5,7 @@ export {
   classifyToolName,
   defaultToolRendererRegistry,
   formatToolOutput,
+  isFileReadTool,
   parseUnifiedDiff,
   truncateToolOutput,
 } from "./ToolCard";

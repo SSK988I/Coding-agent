@@ -1,5 +1,5 @@
 import { Component, lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { Alert, Button, ConfigProvider, Drawer, Empty, Segmented, Skeleton, Table, Tabs, Tag } from "antd";
+import { Alert, Button, ConfigProvider, Drawer, Empty, Segmented, Skeleton, Table, Tabs, Tag, theme as antdTheme } from "antd";
 import zhCN from "antd/locale/zh_CN";
 import type { TableColumnsType } from "antd";
 import type { SessionStats, UsageAnalysisPayload, UsageAnalysisRequest } from "../../shared/types";
@@ -108,16 +108,31 @@ export default function UsageAnalysisDrawer({ open, sessionId, workspacePath, st
   const requestDetails = useMemo(() => current ? [...current.requests].reverse() : [], [current]);
   const trendsActive = open && tab === "trend";
 
-  return <ConfigProvider locale={zhCN} button={{ autoInsertSpace: false }} theme={{ token: {
-    colorPrimary: "#71826f", colorText: "#242321", colorTextSecondary: "#77736b", colorBorder: "#dedbd4",
-    colorBgContainer: "#ffffff", colorBgElevated: "#fbfaf8", borderRadius: 8,
-    fontFamily: 'Inter, "Segoe UI", "Microsoft YaHei", sans-serif', fontSize: 13,
-  }, components: { Table: { headerBg: "#f4f3f0", rowHoverBg: "#faf9f6" }, Tabs: { titleFontSize: 13 } } }}>
+  const isDark = typeof document !== "undefined" && document.documentElement.dataset.theme !== "light";
+
+  return <ConfigProvider locale={zhCN} button={{ autoInsertSpace: false }} theme={{
+    algorithm: isDark ? antdTheme.darkAlgorithm : antdTheme.defaultAlgorithm,
+    token: isDark ? {
+      colorPrimary: "#c6a0f6", colorText: "#cad3f5", colorTextSecondary: "#a5adcb", colorBorder: "#4e5169",
+      colorBgContainer: "#2e3042", colorBgElevated: "#24273a", borderRadius: 8,
+      fontFamily: 'Inter, "Segoe UI", "Microsoft YaHei", sans-serif', fontSize: 13,
+    } : {
+      colorPrimary: "#3f7f5c", colorText: "#181920", colorTextSecondary: "#4e5263", colorBorder: "#cfd3dd",
+      colorBgContainer: "#ffffff", colorBgElevated: "#ffffff", borderRadius: 8,
+      fontFamily: 'Inter, "Segoe UI", "Microsoft YaHei", sans-serif', fontSize: 13,
+    },
+    components: {
+      Table: isDark
+        ? { headerBg: "#2e3042", rowHoverBg: "#353749" }
+        : { headerBg: "#f6f7f9", rowHoverBg: "#f4f5f8" },
+      Tabs: { titleFontSize: 13 },
+    },
+  }}>
     <Drawer open={open} onClose={onClose} title="会话用量分析" placement="right" size="min(920px, 100vw)"
       rootClassName="usage-analysis-drawer" destroyOnHidden
       afterOpenChange={(visible) => { if (!visible) notifyClosed(); }}
       closable={{ placement: "end", "aria-label": "关闭用量分析" }}
-      styles={{ body: { padding: 24 }, header: { padding: "20px 24px", borderBottomColor: "#e7e5e0" }, footer: { padding: "13px 24px" } }}
+      styles={{ body: { padding: 24 }, header: { padding: "20px 24px", borderBottomColor: isDark ? "#3e3f51" : "#e4e6ec" }, footer: { padding: "13px 24px" } }}
       extra={<Button size="small" onClick={retry} loading={loading} aria-label="刷新用量分析">刷新</Button>}
       footer={<span className="usage-analysis-footnote">仅统计当前活动分支 · 费用为估算值，不是供应商账单 · 未报告的数据以 — 表示</span>}>
       <div ref={contentRef} data-testid="usage-analysis-drawer" className="usage-analysis-content" aria-busy={loading}>

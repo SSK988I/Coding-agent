@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+import uuid
 
 from agent_llm import ImageContent, TextContent, UserMessage
 
@@ -31,7 +32,11 @@ class InitialMessageResult:
         if self.initial_message:
             content.append(TextContent(text=self.initial_message))
         content.extend(self.initial_images)
-        return UserMessage(content=content)
+        return UserMessage(
+            content=content,
+            source="prompt",
+            message_id=uuid.uuid4().hex[:12],
+        )
 
 
 def build_initial_message(

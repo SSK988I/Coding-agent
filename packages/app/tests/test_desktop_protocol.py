@@ -235,6 +235,31 @@ def test_llm_conversion_repairs_legacy_incomplete_tool_history() -> None:
     assert converted[2].content == "next request"
 
 
+def test_llm_conversion_preserves_delivered_slash_messages_and_filters_local_commands() -> None:
+    converted = convert_to_llm([
+        UserMessage(content="/"),
+        UserMessage(content="/ "),
+        UserMessage(content="/\n"),
+        UserMessage(content="/model"),
+        UserMessage(content="/custom-local", source=" local_command "),
+        UserMessage(content="/ model"),
+        UserMessage(content="/ ", source="steer"),
+        UserMessage(content="/src/main.py 是要改的文件", source="steer"),
+        UserMessage(content="/model 帮我看一下配置", source="follow_up"),
+        UserMessage(content="/src/legacy_path.py 是普通路径"),
+        UserMessage(content="retried prompt", source="internal_retry"),
+    ])
+
+    assert [message.content for message in converted] == [
+        "/ model",
+        "/ ",
+        "/src/main.py 是要改的文件",
+        "/model 帮我看一下配置",
+        "/src/legacy_path.py 是普通路径",
+        "retried prompt",
+    ]
+
+
 def test_desktop_command_catalog_only_exposes_supported_commands() -> None:
     import asyncio
 
@@ -678,3 +703,89 @@ def test_default_approval_preserves_upstream_fd_redirect_support() -> None:
     from coding_agent.desktop.runtime import _is_read_only_bash_command
     assert _is_read_only_bash_command("git log --oneline -20 --no-merges 2>&1 | head -30")
     assert not _is_read_only_bash_command("cat missing.txt 2> errors.txt")
+
+
+def test_memory_mutations_reject_stale_workspace_or_session_scope(tmp_path: Path) -> None:
+    import asyncio
+
+    workspace_a = tmp_path / "project-a"
+    workspace_b = tmp_path / "project-b"
+    workspace_a.mkdir()
+    workspace_b.mkdir()
+
+    class ScopedMemorySession:
+        def __init__(self, session_id: str, project_id: str) -> None:
+            self.memory_enabled = True
+            self.auto_extract = True
+            self.memory_identity = MemoryIdentity("local-user", project_id)
+            self.settings_manager = None
+            self.session_manager = SimpleNamespace(header=SimpleNamespace(id=session_id))
+            self.cleared: list[bool] = []
+            self.forgotten: list[tuple[str, str | None]] = []
+            self.remembered: list[tuple[str, str]] = []
+
+        async def memory_overview(self) -> MemoryOverview:
+            return MemoryOverview(
+                enabled=self.memory_enabled,
+                auto_extract_enabled=self.auto_extract,
+                user_id="local-user",
+                project_id=self.memory_identity.project_id,
+                global_count=0,
+                project_count=1 if not self.cleared else 0,
+                conflict_count=0,
+                root="memory-root",
+            )
+
+        async def memory_clear(self, *, all_scopes: bool) -> int:
+            self.cleared.append(all_scopes)
+            return 1
+
+        async def memory_forget(self, key: str, scope: str | None) -> bool:
+            self.forgotten.append((key, scope))
+            return True
+
+        async def memory_remember(self, content: str, *, scope: str) -> SimpleNamespace:
+            self.remembered.append((content, scope))
+            return SimpleNamespace(id="mem-1", content=content)
+
+        def set_memory_enabled(self, enabled: bool) -> None:
+            self.memory_enabled = enabled
+
+        def set_memory_auto_extract(self, enabled: bool) -> None:
+            self.auto_extract = enabled
+
+    events: list[dict] = []
+    runtime = DesktopRuntime(events.append)
+    session_b = ScopedMemorySession("session-b", "project-b")
+    runtime._workspace = workspace_b
+    runtime._session = session_b  # type: ignore[assignment]
+
+    # Requests carrying Project A's workspacePath or sessionId must be rejected before mutating Project B.
+    stale_calls = [
+        ("memory.clear", {"allScopes": False, "confirmed": True, "workspacePath": str(workspace_a), "sessionId": "session-a"}),
+        ("memory.clear", {"allScopes": False, "confirmed": True, "workspacePath": str(workspace_b), "sessionId": "session-a"}),
+        ("memory.forget", {"key": "k", "scope": "project", "confirmed": True, "workspacePath": str(workspace_a), "sessionId": "session-b"}),
+        ("memory.remember", {"content": "note", "scope": "project", "workspacePath": str(workspace_a), "sessionId": "session-b"}),
+        ("memory.setEnabled", {"enabled": False, "workspacePath": str(workspace_a), "sessionId": "session-b"}),
+        ("memory.setAutoExtract", {"enabled": False, "workspacePath": str(workspace_a), "sessionId": "session-b"}),
+    ]
+    for method, params in stale_calls:
+        with pytest.raises(RpcError) as exc_info:
+            asyncio.run(runtime.dispatch(method, params))
+        assert exc_info.value.code == "STALE_WORKSPACE"
+
+    assert session_b.cleared == []
+    assert session_b.forgotten == []
+    assert session_b.remembered == []
+    assert session_b.memory_enabled is True
+    assert session_b.auto_extract is True
+
+    # Matching workspacePath + sessionId succeeds on Project B.
+    cleared = asyncio.run(runtime.dispatch("memory.clear", {
+        "allScopes": False,
+        "confirmed": True,
+        "workspacePath": str(workspace_b),
+        "sessionId": "session-b",
+    }))
+    assert cleared["count"] == 1
+    assert session_b.cleared == [False]

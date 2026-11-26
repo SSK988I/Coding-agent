@@ -120,6 +120,18 @@ def test_excluded_shell_output_and_control_commands_do_not_consume_context():
     baseline = project([assistant()]).context_tokens
     assert project([assistant(), BashExecutionMessage(output="x" * 40_000, exclude_from_context=True)]).context_tokens == baseline
     assert project([UserMessage(content="/session")]).context_tokens == 0
+    assert project([UserMessage(content="/src/main.py\n" + "a" * 8_000, source="local_command")]).context_tokens == 0
+
+
+@pytest.mark.parametrize("source", ["follow_up", "steer", "prompt"])
+def test_delivered_slash_prefixed_user_message_counts_toward_context_usage(source: str):
+    baseline = project([assistant()]).context_tokens
+    payload = "/src/main.py\n" + "a" * 8_000
+    follow_up = UserMessage(content=payload, source=source)
+    stats = project([assistant(), follow_up])
+    assert stats.context_estimated is True
+    assert stats.context_tokens - baseline == len(payload) // 4 == 2_003
+    assert project([follow_up]).context_tokens == 2_003
 
 
 def test_prompt_changes_invalidate_old_measurements_until_next_request(tmp_path, monkeypatch):

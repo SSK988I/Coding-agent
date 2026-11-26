@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, cast
 
 from agent_llm.event_stream import AssistantMessageEventStream
-from agent_llm.types import AssistantMessageEvent
+from agent_llm.types import AssistantMessage, AssistantMessageEvent
 
 
 @dataclass(frozen=True)
@@ -61,7 +61,7 @@ def retrying_stream(
     """
     outer = AssistantMessageEventStream()
 
-    async def _drive() -> None:
+    async def _run_attempts() -> None:
         for attempt in range(policy.max_retries + 1):
             inner = factory()
             outer.track_child(inner)
@@ -129,6 +129,16 @@ def retrying_stream(
             outer.push(terminal)
             outer.end(error or final)
             return
+
+    async def _drive() -> None:
+        try:
+            await _run_attempts()
+        except Exception as exc:
+            # The background producer must finish the outer stream even if
+            # the provider raises before it can return a stream.
+            error = AssistantMessage(stop_reason="error", error_message=str(exc) or type(exc).__name__)
+            outer.push({"type": "error", "reason": "error", "error": error})
+            outer.end(error)
 
     outer.set_producer(asyncio.ensure_future(_drive()))
     return outer

@@ -7,7 +7,7 @@ from typing import Any
 
 from agent_core.session.compaction import calculate_context_tokens_from_usage, estimate_tokens
 from agent_core.session.prompts import ESTIMATED_IMAGE_CHARS
-from coding_agent.core.messages import convert_to_llm
+from coding_agent.core.messages import convert_to_llm, is_local_command_user_message
 
 
 @dataclass
@@ -25,7 +25,7 @@ def _message_tokens(message: Any) -> int:
     role = getattr(message, "role", None)
     if role not in {"user", "assistant", "toolResult"}:
         return sum(_message_tokens(converted) for converted in convert_to_llm([message]))
-    if role == "user" and isinstance(message.content, str) and message.content.lstrip().startswith("/"):
+    if role == "user" and is_local_command_user_message(message):
         return 0
     tokens = estimate_tokens(message)
     # The core's heuristic already counts user images, but not tool-result images.
