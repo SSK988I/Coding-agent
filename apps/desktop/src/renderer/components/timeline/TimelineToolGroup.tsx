@@ -1,7 +1,7 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, ChevronRight, Monitor } from "lucide-react";
 import type { TimelineApproval, TimelineToolItem } from "../../timeline/timelineState";
-import { ToolCard, classifyToolName } from "../tool-card";
+import { ToolCard, classifyToolName, type ToolCardProps } from "../tool-card";
 
 export function inferGroupLabel(tools: readonly TimelineToolItem[]): string {
   let hasRead = false;
@@ -109,10 +109,12 @@ export const TimelineToolGroupEntry = memo(function TimelineToolGroupEntry({
   isFirst,
   cwd,
   onResolveApproval,
+  onRecoverEdit,
 }: {
   tool: TimelineToolItem;
   railToneClass: string;
   isFirst: boolean;
+  onRecoverEdit?: ToolCardProps["onRecoverEdit"];
   cwd?: string;
   onResolveApproval?: (approval: TimelineApproval, approved: boolean) => void | Promise<void>;
 }) {
@@ -126,6 +128,7 @@ export const TimelineToolGroupEntry = memo(function TimelineToolGroupEntry({
           tool={tool}
           cwd={cwd}
           onResolveApproval={onResolveApproval}
+          onRecoverEdit={onRecoverEdit}
           defaultCollapsed
           nested
         />

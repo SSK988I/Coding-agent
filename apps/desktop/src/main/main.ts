@@ -134,7 +134,7 @@ function requestSidecar(method: string, params: Record<string, unknown> = {}): P
     const timeout = setTimeout(() => {
       pending.delete(id);
       reject(new Error(`RPC timeout: ${method}`));
-    }, 120_000);
+    }, method === "edit.retry" || method === "edit.check" ? 130_000 : 120_000); // Allow the 120-second approval window to return its decision.
     pending.set(id, { resolve, reject, timeout });
     sidecar!.stdin.write(`${JSON.stringify({ v: 1, id, method, params })}\n`, "utf8");
   });

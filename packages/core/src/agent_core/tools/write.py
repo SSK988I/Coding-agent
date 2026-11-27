@@ -74,13 +74,13 @@ class WriteTool:
 
         # Serialize per-realpath (shared with edit via _mutation) so concurrent
         # writes/edits to the same file don't interleave or clobber.
-        async with file_mutation_lock(full_path):
-            parent = os.path.dirname(full_path)
+        async with file_mutation_lock(full_path) as locked_path:
+            parent = os.path.dirname(locked_path)
             if parent:
                 os.makedirs(parent, exist_ok=True)
 
             try:
-                with open(full_path, "w", encoding="utf-8", newline="") as f:
+                with open(locked_path, "w", encoding="utf-8", newline="") as f:
                     f.write(content)
             except OSError as e:
                 raise RuntimeError(f"Failed to write {path}: {e}") from e

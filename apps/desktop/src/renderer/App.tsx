@@ -34,6 +34,7 @@ export function App() {
     isAtBottom,
     setIsAtBottom,
     resolveApproval,
+    recoverEdit,
     toggleToolGroup,
     planBadgeLabel,
     viewTurnChanges,
@@ -139,10 +140,11 @@ export function App() {
           isFirst={item.isFirst}
           cwd={workspace?.path}
           onResolveApproval={resolveApproval}
+          onRecoverEdit={recoverEdit}
         />
       </div>
     );
-  }, [resolveApproval, toggleToolGroup, workspace?.path, planBadgeLabel, viewTurnChanges]);
+  }, [resolveApproval, recoverEdit, toggleToolGroup, workspace?.path, planBadgeLabel, viewTurnChanges]);
 
   useEffect(() => {
     if (!isAtBottom || renderTimelineItems.length === 0) return;

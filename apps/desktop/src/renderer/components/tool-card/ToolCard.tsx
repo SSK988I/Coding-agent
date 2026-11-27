@@ -40,6 +40,7 @@ export interface ToolApproval {
  */
 export interface ToolCardData {
   id: string;
+  toolCallId?: string;
   name: string;
   args: unknown;
   result?: unknown;
@@ -73,6 +74,7 @@ export interface ToolCardProps {
   outputLimit?: Partial<ToolOutputLimit>;
   registry?: ToolRendererRegistry;
   onResolveApproval?: (approval: ToolApproval, approved: boolean) => void | Promise<void>;
+  onRecoverEdit?: (action: "check" | "retry", assistantEntryId: string, toolCallId: string) => Promise<void>;
   approvalPending?: boolean;
   chainedPrev?: boolean;
   chainedNext?: boolean;
@@ -550,12 +552,12 @@ function ImageToolRenderer({ tool, outputLimit }: ToolRendererProps) {
   );
 }
 
-function DiffView({ preview }: { preview: DiffPreview }) {
+function DiffView({ preview, planned = false }: { preview: DiffPreview; planned?: boolean }) {
   const lines = useMemo(() => parseUnifiedDiff(preview.text), [preview.text]);
   return (
     <div className="tool-card-view__diff" role="region" aria-label="文件差异">
       <div className="tool-card-view__diff-toolbar">
-        <span>Unified diff</span>
+        <span>{planned ? "计划修改" : "Unified diff"}</span>
         {preview.source === "generated" && <small>根据工具参数生成预览</small>}
       </div>
       <code>
@@ -586,7 +588,7 @@ function WriteToolRenderer({ tool, outputLimit }: ToolRendererProps) {
         <OutputBlock value={summary} limit={outputLimit} className="tool-card-view__output--summary" />
       )}
       {preview
-        ? <DiffView preview={preview} />
+        ? <DiffView preview={preview} planned={tool.name === "edit" && tool.status !== "done"} />
         : <div className="tool-card-view__empty">暂无可展示的差异</div>}
     </div>
   );
@@ -866,6 +868,7 @@ export const ToolCard = memo(function ToolCard({
   outputLimit,
   registry = defaultToolRendererRegistry,
   onResolveApproval,
+  onRecoverEdit,
   approvalPending = false,
   chainedPrev = false,
   chainedNext = false,
@@ -882,8 +885,13 @@ export const ToolCard = memo(function ToolCard({
   const [userToggled, setUserToggled] = useState(false);
   const [collapsed, setCollapsed] = useState(defaultCollapsed);
   const [showRawArgs, setShowRawArgs] = useState(false);
+  const [recovering, setRecovering] = useState(false);
+  const details = isRecord(tool.result) && isRecord(tool.result.details) ? tool.result.details : undefined;
+  const recoveryEntry = tool.name === "edit" && tool.status === "uncertain"
+    && details?.code === "EDIT_RECOVERY_PENDING" && typeof details.assistantEntryId === "string"
+    ? details.assistantEntryId : undefined;
   const attentionError = tool.status === "error" || tool.status === "blocked" || tool.status === "timed_out";
-  const isOpen = Boolean(tool.approval) || (userToggled ? !collapsed : (!defaultCollapsed || attentionError));
+  const isOpen = Boolean(tool.approval) || (userToggled ? !collapsed : (!defaultCollapsed || attentionError || Boolean(recoveryEntry)));
   const hint = useMemo(() => argsHeaderHint(tool), [tool.args]);
   const nestedSummary = useMemo(
     () => (nested ? nestedToolTitle(tool, hint) : null),
@@ -981,6 +989,19 @@ export const ToolCard = memo(function ToolCard({
         <div className={`thread-rail ${railToneClass}`.trim()}>
           <div className="thread-box tool-card-view__box">
             <Renderer tool={tool} cwd={cwd} outputLimit={resolvedOutputLimit} />
+            {recoveryEntry && tool.toolCallId && onRecoverEdit && (
+              <button type="button" disabled={recovering} className="tool-card-view__approval-accept"
+                onClick={async () => {
+                  setRecovering(true);
+                  try {
+                    await onRecoverEdit(details?.retryable === true ? "retry" : "check", recoveryEntry, tool.toolCallId!);
+                  } finally {
+                    setRecovering(false);
+                  }
+                }}>
+                {details?.retryable === true ? "重试原编辑" : "核对原编辑"}
+              </button>
+            )}
 
             {tool.approval && (
               <footer className="tool-card-view__approval">

@@ -126,6 +126,7 @@ class DesktopRuntime:
         self._run_id: str | None = None
         self._seq = 0
         self._approvals: dict[str, asyncio.Future[bool]] = {}
+        self._recovery_edit_entry: str | None = None
         self._approval_timeout_seconds = approval_timeout_seconds
         self._permission_mode: PermissionMode = cast(PermissionMode, SettingsManager().load().desktop_permission_mode)
         self._native_search_decision: tuple[str, bool] | None = None
@@ -136,13 +137,15 @@ class DesktopRuntime:
         if method in {
             "run.start", "run.steer", "run.followUp", "mode.enterPlan", "plan.answer",
             "plan.cancel", "plan.execute", "plan.handoff", "session.clear", "session.compact",
-            "model.select", "subagent.spawn", "workbench.chat.send",
+            "model.select", "subagent.spawn", "workbench.chat.send", "edit.check", "edit.retry",
         } or (method == "workbench.chat.open" and not params.get("conversationId")) or (
             method == "workbench.chat.approve" and params.get("allowed") is True
         ):
             self._ensure_session_not_archived()
         if method.startswith("workbench."):
             return await self._workbench_request(method, params)
+        if method in {"edit.check", "edit.retry"}:
+            return await self._recover_edit(method, params)
         handlers: dict[str, Callable[[dict[str, Any]], Awaitable[Any]]] = {
             "runtime.ping": self._ping,
             "workspace.open": self._workspace_open,
@@ -284,6 +287,7 @@ class DesktopRuntime:
             reasoning=reasoning,
             context_files=context_files,
             before_tool_call=self._before_tool_call,
+            permission_mode=self._permission_mode,
             before_native_web_search=self._before_native_web_search,
             retry_policy=RetryPolicy(
                 enabled=settings.auto_retry,
@@ -542,6 +546,24 @@ class DesktopRuntime:
             "webSearch": self._web_search_payload(session),
             **self._turn_changes_payload(session),
         }
+
+    async def _recover_edit(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        self._ensure_no_active_run("请先等待当前任务结束，再处理待恢复的编辑")
+        session = self._require_session()
+        if params.get("sessionId") != session.session_manager.header.id:
+            raise RpcError("STALE_SESSION", "会话已经切换，请重新选择原编辑")
+        entry_id, call_id = params.get("assistantEntryId"), params.get("toolCallId")
+        if not isinstance(entry_id, str) or not entry_id.strip() or not isinstance(call_id, str) or not call_id.strip():
+            raise RpcError("INVALID_PARAMS", "处理原编辑需要 assistantEntryId 和 toolCallId")
+        self._recovery_edit_entry = entry_id
+        try:
+            if method == "edit.check":
+                await session.refresh_edit_recovery(assistant_entry_id=entry_id, tool_call_id=call_id)
+                return await self._session_snapshot({})
+            result = await session.retry_edit(assistant_entry_id=entry_id, tool_call_id=call_id)
+        finally:
+            self._recovery_edit_entry = None
+        return {"snapshot": await self._session_snapshot({}), "result": to_jsonable(result)}
 
     async def _session_usage(self, params: dict[str, Any]) -> dict[str, Any]:
         session_id = params.get("sessionId")
@@ -960,6 +982,7 @@ class DesktopRuntime:
         settings = replace(settings_manager.load(), desktop_permission_mode=mode)
         settings_manager.save(settings)
         self._permission_mode = cast(PermissionMode, mode)
+        session.set_permission_mode(mode, persist=False)
         payload = {"sessionId": session.session_manager.header.id, "permissionMode": mode}
         self._publish("permission.changed", payload)
         return payload
@@ -999,6 +1022,7 @@ class DesktopRuntime:
                 "toolCallId": context.tool_call.id,
                 "toolName": context.tool_call.name,
                 "args": context.args,
+                **({"assistantEntryId": self._recovery_edit_entry} if self._recovery_edit_entry else {}),
             } if context is not None else {
                 "approvalId": approval_id,
                 "message": "是否允许本次任务使用联网搜索？",

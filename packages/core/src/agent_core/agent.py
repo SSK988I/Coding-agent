@@ -19,15 +19,20 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Awaitable, Callable, Literal
 
-from agent_llm import AssistantMessage, Message, Model, TextContent, Usage, UsageCost
+from agent_llm import AssistantMessage, Message, Model, TextContent, ToolCall, Usage, UsageCost
 
 from agent_core.agent_loop import run_agent_loop
+from agent_core.edit_recovery import EditRecovery
+from agent_core.session.session_manager import SessionManager
+from agent_core.session.types import SessionMessageEntry
+from agent_core.tools.edit import EditTool
 from agent_core.types import (
     AgentContext,
     AgentEvent,
     AgentLoopConfig,
     AgentState,
     AgentTool,
+    AgentToolResult,
     QueueMode,
     StreamFn,
 )
@@ -100,11 +105,13 @@ class Agent:
         stream_fn: StreamFn,
         get_api_key: "Callable[[str], Awaitable[str | None] | str | None] | None" = None,
         convert_to_llm: Callable[[list], "Awaitable[list[Message]] | list[Message]"] = default_convert_to_llm,
+        project_loaded_messages: Callable[[list], list] | None = None,
         reasoning: Any = None,
         session_manager: Any = None,
         tool_execution: Any = None,
         before_tool_call: Any = None,
         after_tool_call: Any = None,
+        execute_edit: Callable[..., Awaitable[AgentToolResult]] | None = None,
         steering_mode: QueueMode = "one-at-a-time",
         follow_up_mode: QueueMode = "one-at-a-time",
     ) -> None:
@@ -117,17 +124,19 @@ class Agent:
         self._active_run: _ActiveRun | None = None
         self.last_run_status: Literal["completed", "failed", "cancelled"] | None = None
         self.convert_to_llm = convert_to_llm
+        self.project_loaded_messages = project_loaded_messages
         self.stream_fn = stream_fn
         self.get_api_key = get_api_key
         self.reasoning = reasoning
         # Optional SessionManager: when set, messages are persisted as they land
         # in the transcript (message_end for user/assistant, turn_end for tool
         # results). Kept optional so the Agent stays usable without persistence.
-        self.session_manager = session_manager
+        self.attach_session(session_manager)
         # Tool-execution config threaded into AgentLoopConfig.
         self.tool_execution = tool_execution
         self.before_tool_call = before_tool_call
         self.after_tool_call = after_tool_call
+        self.execute_edit = execute_edit
         # Steering/follow-up queues. Drained by the
         # loop via get_steering_messages / get_follow_up_messages callbacks.
         self._steering_queue = PendingMessageQueue(steering_mode)
@@ -273,15 +282,48 @@ class Agent:
         the caller is responsible for reattaching/creating a session if needed.
         """
         self.clear_all_queues()
-        self._state.messages = list(messages)
+        self._state.messages = list(self.project_loaded_messages(messages) if self.project_loaded_messages else messages)
 
     def attach_session(self, session_manager: Any) -> None:
         """Attach a SessionManager so subsequent messages are persisted."""
         self.session_manager = session_manager
+        self.edit_recovery = EditRecovery(session_manager) if isinstance(session_manager, SessionManager) else None
 
     def detach_session(self) -> None:
         """Detach the current SessionManager (does not touch the file)."""
-        self.session_manager = None
+        self.attach_session(None)
+
+    async def execute_session_edit(
+        self, tool: EditTool, assistant: AssistantMessage, call: ToolCall, args: dict, signal: Any = None,
+        *, guard: Callable[[], AgentToolResult | None] | None = None,
+    ) -> AgentToolResult:
+        """Use the actual persisted assistant entry as the idempotency scope."""
+        sources = [entry for entry in self.session_manager.get_branch()
+                   if isinstance(entry, SessionMessageEntry) and entry.message is assistant]
+        matching = [block for block in assistant.content if isinstance(block, ToolCall) and block.id == call.id]
+        if (self.edit_recovery is None or len(sources) != 1 or not call.id
+                or len(matching) != 1 or matching[0] is not call):
+            return AgentToolResult(content=[TextContent(text="未能唯一定位本次编辑的会话记录，文件尚未修改。")],
+                                   status="failed", details={"code": "EDIT_PREPARE_FAILED"})
+        manager = self.session_manager
+        leaf = manager.leaf_id
+
+        def check_authority() -> AgentToolResult | None:
+            if (manager is not self.session_manager or manager.leaf_id != leaf or manager.refresh_archived()
+                    or (signal is not None and signal.is_set())):
+                return AgentToolResult(content=[TextContent(text="文件编辑已停止，或原会话分支已变更。")],
+                                       status="blocked", details={"code": "EDIT_BLOCKED"})
+            return guard() if guard is not None else None
+
+        try:
+            blocked = check_authority()
+            if blocked is not None:
+                return blocked
+            manager.flush()
+        except Exception as exc:
+            return AgentToolResult(content=[TextContent(text=f"无法保存原编辑调用，文件尚未修改：{exc}")],
+                                   status="failed", details={"code": "EDIT_PREPARE_FAILED"})
+        return await self.edit_recovery.execute(tool, sources[0].id, call.id, args, guard=check_authority)
 
     # ── internals ──────────────────────────────────────────────────────
 
@@ -371,6 +413,7 @@ class Agent:
             tool_execution=self.tool_execution,
             before_tool_call=self.before_tool_call,
             after_tool_call=self.after_tool_call,
+            execute_edit=self.execute_edit or (self.execute_session_edit if self.edit_recovery is not None else None),
             # Queue drain callbacks. The loop polls these
             # to inject steering (pre-outer + post-turn) and follow-up
             # (after the inner loop stops) messages.

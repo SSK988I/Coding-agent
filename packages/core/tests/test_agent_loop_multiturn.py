@@ -18,7 +18,10 @@ Coverage:
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
+
+import pytest
 
 from agent_llm import (
     AssistantMessage,
@@ -27,11 +30,13 @@ from agent_llm import (
     ModelCost,
     TextContent,
     ToolCall,
+    ToolResultMessage,
     UserMessage,
 )
 
-from agent_core import Agent
+from agent_core import Agent, SessionManager
 from agent_core.agent_loop import run_agent_loop
+from agent_core.tools.edit import EditTool
 from agent_core.types import (
     AgentContext,
     AgentLoopConfig,
@@ -370,6 +375,57 @@ def test_agent_has_queued_messages_reflects_state():
     assert agent.has_queued_messages() is True
     agent.clear_all_queues()
     assert agent.has_queued_messages() is False
+
+
+def _edit_agent(workspace: Path, manager: SessionManager, edit_turns: int) -> Agent:
+    arguments = {"path": "example.py", "edits": [{"oldText": "a = 1", "newText": "a = 10"}]}
+    # _tool_call uses the same provider call ID for each new assistant turn.
+    script = [_tool_call("edit", arguments) for _ in range(edit_turns)]
+    return Agent(
+        model=_model(), system_prompt="s", tools=[EditTool(cwd=str(workspace))],
+        session_manager=manager, stream_fn=_ScriptedStream([*script, _text("done")]),
+    )
+
+
+def test_edit_requires_a_durable_source_call(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    target = tmp_path / "example.py"
+    target.write_bytes(b"a = 1\n")
+    manager = SessionManager.create(cwd=str(tmp_path), sessions_dir=tmp_path / "sessions", session_id="edit-test")
+    append_message = manager.append_message
+    rejected_calls = []
+
+    def reject_edit_message(message, **kwargs):
+        if isinstance(message, AssistantMessage) and any(isinstance(block, ToolCall) for block in message.content):
+            rejected_calls.append(message)
+            raise OSError("injected failure saving the source tool call")
+        return append_message(message, **kwargs)
+
+    monkeypatch.setattr(manager, "append_message", reject_edit_message)
+    agent = _edit_agent(tmp_path, manager, edit_turns=1)
+    _run(agent.prompt("Edit the file"))
+
+    assert rejected_calls, "the storage fault must actually interrupt the source call"
+    assert target.read_bytes() == b"a = 1\n"
+    result, = [message for message in agent.state.messages if isinstance(message, ToolResultMessage)]
+    assert result.status == "failed"
+    assert result.details["code"] == "EDIT_PREPARE_FAILED"
+
+
+def test_same_edit_in_two_assistant_entries_is_two_operations(tmp_path: Path):
+    target = tmp_path / "example.py"
+    target.write_bytes(b"a = 1\n")
+    manager = SessionManager.create(cwd=str(tmp_path), sessions_dir=tmp_path / "sessions", session_id="edit-test")
+    agent = _edit_agent(tmp_path, manager, edit_turns=2)
+
+    _run(agent.prompt("Make two successive edits"))
+
+    assert target.read_bytes() == b"a = 100\n"
+    assert manager.path is not None
+    history = SessionManager.open(manager.path).build_session_context().messages
+    results = [message for message in history if isinstance(message, ToolResultMessage)]
+    assert [(result.tool_call_id, result.status) for result in results] == [("edit-1", "completed")] * 2
+    assert "+a = 10" in results[0].details["patch"].splitlines()
+    assert "+a = 100" in results[1].details["patch"].splitlines()
 
 
 # =====================================================================

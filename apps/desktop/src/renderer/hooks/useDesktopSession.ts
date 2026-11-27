@@ -456,7 +456,7 @@ export function useDesktopSession() {
     void refreshCommands();
   };
 
-  const applySessionSnapshot = (snapshot: SessionSnapshotPayload) => {
+  const applySessionSnapshot = useCallback((snapshot: SessionSnapshotPayload) => {
     if (workspaceSessionIdRef.current !== snapshot.sessionId) return;
     setWorkspace((current) => {
       if (!current) return current;
@@ -475,7 +475,28 @@ export function useDesktopSession() {
     setRequestedChange(null);
     setTimelineState(createTimelineStateFromMessages(snapshot.messages, snapshot.sessionId, snapshot.turnChanges));
     if (snapshot.turnChangesError) setError(`历史变更记录暂不可用：${snapshot.turnChangesError}`);
-  };
+  }, []);
+
+  const recoverEdit = useCallback(async (action: "check" | "retry", assistantEntryId: string, toolCallId: string) => {
+    const sessionId = workspace?.sessionId;
+    if (!sessionId || workspaceSessionIdRef.current !== sessionId) return;
+    setError(null);
+    try {
+      if (action === "check") {
+        applySessionSnapshot(await window.agent.request<SessionSnapshotPayload>("edit.check", { sessionId, assistantEntryId, toolCallId }));
+        return;
+      }
+      const { snapshot, result } = await window.agent.request<{
+        snapshot: SessionSnapshotPayload;
+        result: { status?: string; content: { text?: string }[] };
+      }>("edit.retry", { sessionId, assistantEntryId, toolCallId });
+      if (workspaceSessionIdRef.current !== sessionId) return;
+      applySessionSnapshot(snapshot);
+      if (result.status && result.status !== "completed") setError(result.content[0]?.text ?? "原编辑尚未完成");
+    } catch (reason) {
+      if (workspaceSessionIdRef.current === sessionId) setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }, [workspace?.sessionId, applySessionSnapshot]);
 
   const refreshSessionSnapshot = async () => {
     const snapshot = await window.agent.request<SessionSnapshotPayload>("session.snapshot");
@@ -1607,7 +1628,7 @@ export function useDesktopSession() {
   const resolveApproval = useCallback(async (approval: TimelineApproval, approved: boolean) => {
     setTimelineState((current) => {
       const item = Object.values(current.entities).find((candidate): candidate is TimelineToolItem => (
-        candidate.kind === "tool" && candidate.toolCallId === approval.toolCallId
+        candidate.kind === "tool" && candidate.approval?.approvalId === approval.approvalId
       ));
       if (!item) return current;
       return updateTimelineItem(current, item.id, (candidate) => candidate.kind === "tool"
@@ -1916,6 +1937,7 @@ export function useDesktopSession() {
     renderTimelineItems,
     lastTimelineSignature,
     resolveApproval,
+    recoverEdit: workspace?.archived || running || compacting ? undefined : recoverEdit,
     toggleToolGroup,
     viewTurnChanges,
 

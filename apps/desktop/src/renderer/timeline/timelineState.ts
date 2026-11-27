@@ -286,26 +286,37 @@ export function timelineItemsFromPersistedMessages(
   messages: readonly AgentMessage[],
   sessionId: string | null = null,
 ): TimelineItem[] {
-  const calls = new Map<string, ContentBlock>();
-  const answered = new Set<string>();
-  for (const message of messages) {
-    if (message.role === "toolResult" && message.tool_call_id) answered.add(message.tool_call_id);
+  const latestCall = new Map<string, { index: number; block: ContentBlock }>();
+  const resultOwners = new Map<number, { index: number; block: ContentBlock }>();
+  const answered = new Set<ContentBlock>();
+  for (const [index, message] of messages.entries()) {
+    if (message.role === "toolResult" && message.tool_call_id) {
+      const owner = latestCall.get(message.tool_call_id);
+      if (owner) {
+        resultOwners.set(index, owner);
+        answered.add(owner.block);
+      }
+    }
     if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
     for (const block of message.content) {
-      if (block.type === "toolCall" && block.id) calls.set(block.id, block);
+      if (block.type === "toolCall" && block.id) latestCall.set(block.id, { index, block });
     }
   }
+  const historyToolId = (callId: string, owner?: number) =>
+    owner !== undefined && latestCall.get(callId)?.index !== owner
+      ? `${toolItemId(callId)}@${owner}` : toolItemId(callId);
   const seenVisibleUserIds = new Set<string>();
   let lastVisibleUserContent: NormalizedUserContent | null = null;
   return messages.flatMap<TimelineItem>((message, index): TimelineItem[] => {
     const timestamp = typeof message.timestamp === "number" ? message.timestamp : index;
     if (message.role === "toolResult") {
       if (!message.tool_call_id || message.tool_name === "request_user_input") return [];
+      const owner = resultOwners.get(index);
       return [{
-        id: toolItemId(message.tool_call_id), kind: "tool", order: index, revision: 0,
+        id: historyToolId(message.tool_call_id, owner?.index), kind: "tool", order: index, revision: 0,
         sessionId, runId: null, createdAt: timestamp, updatedAt: timestamp,
         toolCallId: message.tool_call_id, name: message.tool_name ?? "tool",
-        args: calls.get(message.tool_call_id)?.arguments ?? {}, result: message,
+        args: owner?.block.arguments ?? {}, result: message,
         status: projectToolStatus(message.status, message.is_error),
       }];
     }
@@ -330,8 +341,8 @@ export function timelineItemsFromPersistedMessages(
 
     const incomplete: TimelineToolItem[] = message.role === "assistant" && Array.isArray(message.content)
       ? message.content.flatMap((block) => block.type === "toolCall" && block.id
-        && !answered.has(block.id) && block.name !== "request_user_input" ? [{
-          id: toolItemId(block.id), kind: "tool", order: index, revision: 0,
+        && !answered.has(block) && block.name !== "request_user_input" ? [{
+          id: historyToolId(block.id, index), kind: "tool", order: index, revision: 0,
           sessionId, runId: null, createdAt: timestamp, updatedAt: timestamp,
           toolCallId: block.id, name: block.name ?? "tool", args: block.arguments ?? {},
           result: "未找到执行结果；不能据此判断是否产生了副作用。", status: "uncertain",
@@ -824,6 +835,20 @@ export function reduceRuntimeEventBatch(
       });
       continue;
     }
+    if (type === "edit_recovery_updated" && Array.isArray(payload.results)) {
+      for (const result of payload.results as AgentMessage[]) {
+        const entry = (result.details as { assistantEntryId?: string } | undefined)?.assistantEntryId;
+        if (!entry) continue;
+        const card = Object.values(entities).find(item => item.kind === "tool"
+          && item.toolCallId === result.tool_call_id
+          && ((item.result as AgentMessage | undefined)?.details as { assistantEntryId?: string } | undefined)?.assistantEntryId === entry);
+        if (card?.kind !== "tool") continue;
+        entities[card.id] = { ...card, result, status: projectToolStatus(result.status, Boolean(result.is_error)),
+          approval: undefined, revision: card.revision + 1, updatedAt: envelope.timestamp, lastSeq: envelope.seq };
+        changed = true;
+      }
+      continue;
+    }
     if (type === "tool_execution_end") {
       if (payload.tool_name === "request_user_input") continue;
       const toolCallId = nonEmptyString(payload.tool_call_id);
@@ -849,7 +874,13 @@ export function reduceRuntimeEventBatch(
     if (type === "approval.requested") {
       const approval = approvalFromPayload(payload);
       if (!approval) continue;
-      const id = toolItemId(approval.toolCallId);
+      const target = typeof payload.assistantEntryId === "string" && Object.values(entities).find(item => {
+        if (item.kind !== "tool" || item.toolCallId !== approval.toolCallId) return false;
+        const details = (item.result as AgentMessage | undefined)?.details;
+        return typeof details === "object" && details && "assistantEntryId" in details
+          && details.assistantEntryId === payload.assistantEntryId;
+      });
+      const id = target ? target.id : toolItemId(approval.toolCallId);
       const existing = entities[id];
       const existingTool = existing?.kind === "tool" ? existing : undefined;
       insert({
@@ -874,10 +905,11 @@ export function reduceRuntimeEventBatch(
     if (type === "approval.expired") {
       const toolCallId = nonEmptyString(payload.toolCallId);
       if (!toolCallId) continue;
-      const id = toolItemId(toolCallId);
-      const item = entities[id];
+      const item = Object.values(entities).find(candidate => candidate.kind === "tool"
+        && candidate.toolCallId === toolCallId && candidate.approval?.approvalId === payload.approvalId)
+        ?? entities[toolItemId(toolCallId)];
       if (!item || item.kind !== "tool") continue;
-      entities[id] = {
+      entities[item.id] = {
         ...item,
         approval: undefined,
         result: "工具审批已超时",

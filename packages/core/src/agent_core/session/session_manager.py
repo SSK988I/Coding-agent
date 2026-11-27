@@ -249,6 +249,9 @@ class SessionManager:
             parent_session=source.header.id,
         )
         entries = copy.deepcopy(source.get_branch())
+        from agent_core.edit_recovery import EditRecovery
+
+        EditRecovery(source).materialize_fork_results(entries)
         leaf_id = entries[-1].id if entries else None
         path = session_file_path(
             header, fork_cwd, agent_dir, sessions_dir=sessions_dir,
