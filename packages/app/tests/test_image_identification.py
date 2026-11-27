@@ -5,6 +5,7 @@ import asyncio
 import base64
 import copy
 import io
+from dataclasses import replace
 
 import pytest
 from agent_core import SessionManager
@@ -234,8 +235,6 @@ def test_visual_tasks_answer_directly_without_forcing_search_or_disclaimers(
                 assert ("When the user explicitly requests online verification" in context.system_prompt) is search_enabled
                 assert ("Web search is unavailable for this request" in context.system_prompt) is not search_enabled
                 assert ("web_search" in {tool.name for tool in context.tools or []}) is search_enabled
-                assert context.messages[-1] == original_user
-                assert context.messages[-1].content[-1] == image
                 return final_stream(AssistantMessage(content=[TextContent(text=answer)]))
             assert "<image_identification>" not in context.system_prompt
             return final_stream(AssistantMessage(content=[TextContent(text="A Python loop repeats statements.")]))
@@ -249,7 +248,11 @@ def test_visual_tasks_answer_directly_without_forcing_search_or_disclaimers(
             assert session.state.messages[-1].content == [TextContent(text=answer)]
             assert session.state.messages[-1].stop_reason == "stop"
             assert user == original_user
-            assert session.state.messages[0] == original_user
+            recorded_user = session.state.messages[0]
+            assert isinstance(recorded_user, UserMessage)
+            assert recorded_user.source == "prompt" and recorded_user.message_id
+            assert replace(recorded_user, source=None, message_id=None) == original_user
+            assert requests[0].messages[-1] == recorded_user
             assert {tool.name for tool in session.tools} == original_tools
             assert "<image_identification>" not in session.state.system_prompt
             await session.prompt("Now explain a Python loop")
@@ -257,7 +260,7 @@ def test_visual_tasks_answer_directly_without_forcing_search_or_disclaimers(
             assert backend.queries == []
             manager.flush()
             restored = SessionManager.open(manager.path).build_session_context().messages
-            assert restored[0] == original_user
+            assert restored[0] == recorded_user
             assert restored[1].content == [TextContent(text=answer)]
             assert len(restored) == len(session.state.messages)
             assert "<image_identification>" not in repr(restored)
@@ -310,13 +313,17 @@ def test_explicit_online_verification_runs_real_search_tool_and_persists_only_us
             assert session.state.messages[-1].stop_reason == "stop"
             assert "https://example.com/landmark" in session.state.messages[-1].content[0].text
             assert user == original_user
-            assert session.state.messages[0] == original_user
+            recorded_user = session.state.messages[0]
+            assert isinstance(recorded_user, UserMessage)
+            assert recorded_user.source == "prompt" and recorded_user.message_id
+            assert replace(recorded_user, source=None, message_id=None) == original_user
+            assert requests[0].messages[-1] == recorded_user
             await session.prompt("Now explain a Python loop")
             assert len(requests) == 3
             assert session.state.messages[-1].stop_reason == "stop"
             manager.flush()
             restored = SessionManager.open(manager.path).build_session_context().messages
-            assert restored[0] == original_user
+            assert restored[0] == recorded_user
             assert len(restored) == len(session.state.messages)
             assert "<image_identification>" not in repr(restored)
             assert "<image_identification>" not in session.state.system_prompt
