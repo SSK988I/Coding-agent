@@ -152,6 +152,14 @@ class UserMessage:
     # binary files are referenced by ordinary TextContent blocks, not uploaded
     # through a provider-specific file API.
     attachments: list[dict[str, Any]] = field(default_factory=list)
+    # Optional origin tag (e.g. "prompt", "steer", "follow_up",
+    # "plan_execution", "local_command") so transcript and LLM conversion can
+    # distinguish delivered messages from local slash commands and internal prompts.
+    source: str | None = None
+    # Optional stable identifier and retry link so overflow auto-retries can
+    # reference their exact original user message across interleaved follow-ups.
+    message_id: str | None = None
+    retry_of: str | None = None
 
 
 @dataclass

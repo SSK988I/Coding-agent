@@ -84,6 +84,7 @@ export interface TimelineState {
   orderedIds: readonly string[];
   activeMessageIdsByRun: Readonly<Record<string, string>>;
   messageIdsByRoute: Readonly<Record<string, string>>;
+  initialUserMatchedByRun: Readonly<Record<string, boolean>>;
   activeCompactionId: string | null;
   lastOrder: number;
   assistantSequence: number;
@@ -122,6 +123,7 @@ export function createTimelineState(items: readonly TimelineItem[] = []): Timeli
     orderedIds,
     activeMessageIdsByRun: {},
     messageIdsByRoute: {},
+    initialUserMatchedByRun: {},
     activeCompactionId: null,
     lastOrder,
     assistantSequence,
@@ -179,29 +181,142 @@ export function readAgentMessageContent(message: AgentMessage): {
   return { text, thinking, ...fileProps, ...(images.length ? { images } : {}) };
 }
 
+const CONFIRMED_PLAN_EXECUTION_PREFIX = "<confirmed_plan_execution>";
+const CONFIRMED_PLAN_EXECUTION_LABEL = "执行已确认计划";
+const LEGACY_CONFIRMED_PLAN_EXECUTION_RE =
+  /^\s*<confirmed_plan_execution>\r?\nplan_id:[ \t]+\S+\r?\nrevision:[ \t]+\d+\r?\ndigest:[ \t]+\S+\r?\ntitle:[ \t]+\S[^\r\n]*\r?\n\r?\n[\s\S]*\r?\n<\/confirmed_plan_execution>\r?\nExecute this exact confirmed plan now\.\s*$/;
+
+const LEGACY_LOCAL_SLASH_COMMANDS = new Set([
+  "help", "new", "model", "compact", "subagents", "clear",
+  "session", "plan", "cancel-plan", "execute-plan", "memory",
+  "login", "logout", "thinking", "tree", "resume", "settings",
+  "name", "permissions", "export", "copy", "hotkeys", "exit", "quit",
+]);
+
+interface NormalizeUserDisplayOptions {
+  allowLegacyPromptPlanExecution?: boolean;
+  messageId?: string | null;
+  hasMedia?: boolean;
+}
+
+function normalizeUserDisplayText(
+  text: string,
+  source?: string | null,
+  options?: NormalizeUserDisplayOptions,
+): string {
+  const normalizedSource = typeof source === "string" ? source.trim() : "";
+  if (normalizedSource === "plan_execution") {
+    return CONFIRMED_PLAN_EXECUTION_LABEL;
+  }
+  if (normalizedSource.length === 0 && text.trimStart().startsWith(CONFIRMED_PLAN_EXECUTION_PREFIX)) {
+    return CONFIRMED_PLAN_EXECUTION_LABEL;
+  }
+  const hasMessageId = typeof options?.messageId === "string" && options.messageId.trim().length > 0;
+  if (
+    options?.allowLegacyPromptPlanExecution
+    && (normalizedSource === "prompt" || normalizedSource === "internal_retry")
+    && !hasMessageId
+    && !options.hasMedia
+    && LEGACY_CONFIRMED_PLAN_EXECUTION_RE.test(text)
+  ) {
+    return CONFIRMED_PLAN_EXECUTION_LABEL;
+  }
+  return text;
+}
+
+function isLocalCommandUserMessage(
+  message: AgentMessage,
+  content: { text: string; images?: ImageAttachmentPayload[]; files?: FileAttachmentMetadata[] },
+): boolean {
+  if (message.role !== "user") return false;
+  const source = typeof message.source === "string" ? message.source.trim() : "";
+  if (source === "local_command") return true;
+  if (source.length > 0) return false;
+  if (content.images?.length || content.files?.length) return false;
+  const trimmed = content.text.trimStart();
+  if (!trimmed.startsWith("/")) return false;
+  const body = trimmed.slice(1);
+  if (!body || /^\s+$/.test(body)) return true;
+  if (/^\s/.test(body)) return false;
+  const token = body.split(/\s+/, 1)[0]?.toLowerCase() ?? "";
+  return LEGACY_LOCAL_SLASH_COMMANDS.has(token);
+}
+
+interface NormalizedUserContent {
+  text: string;
+  thinking: string;
+  images?: ImageAttachmentPayload[];
+  files?: FileAttachmentMetadata[];
+}
+
+function normalizeUserMessageForTimeline(
+  message: AgentMessage,
+  options?: { allowLegacyPromptPlanExecution?: boolean },
+): NormalizedUserContent | null {
+  const content = readAgentMessageContent(message);
+  if (isLocalCommandUserMessage(message, content)) return null;
+  const text = normalizeUserDisplayText(content.text, message.source, {
+    allowLegacyPromptPlanExecution: options?.allowLegacyPromptPlanExecution,
+    messageId: message.message_id,
+    hasMedia: Boolean(content.images?.length || content.files?.length),
+  });
+  if (!text && !content.images?.length && !content.files?.length) return null;
+  return { ...content, text };
+}
+
+function userContentMatches(a: NormalizedUserContent, b: NormalizedUserContent): boolean {
+  if (a.text !== b.text) return false;
+  const aImages = a.images ?? [];
+  const bImages = b.images ?? [];
+  if (aImages.length !== bImages.length) return false;
+  for (let i = 0; i < aImages.length; i += 1) {
+    if (aImages[i].data !== bImages[i].data || aImages[i].mime_type !== bImages[i].mime_type) return false;
+  }
+  const aFiles = a.files ?? [];
+  const bFiles = b.files ?? [];
+  if (aFiles.length !== bFiles.length) return false;
+  for (let i = 0; i < aFiles.length; i += 1) {
+    if (aFiles[i].path !== bFiles[i].path || aFiles[i].name !== bFiles[i].name) return false;
+  }
+  return true;
+}
+
 /** Converts the current JSONL-backed transcript to the same item model as live events. */
 export function timelineItemsFromPersistedMessages(
   messages: readonly AgentMessage[],
   sessionId: string | null = null,
 ): TimelineItem[] {
-  const calls = new Map<string, ContentBlock>();
-  const answered = new Set<string>();
-  for (const message of messages) {
-    if (message.role === "toolResult" && message.tool_call_id) answered.add(message.tool_call_id);
+  const latestCall = new Map<string, { index: number; block: ContentBlock }>();
+  const resultOwners = new Map<number, { index: number; block: ContentBlock }>();
+  const answered = new Set<ContentBlock>();
+  for (const [index, message] of messages.entries()) {
+    if (message.role === "toolResult" && message.tool_call_id) {
+      const owner = latestCall.get(message.tool_call_id);
+      if (owner) {
+        resultOwners.set(index, owner);
+        answered.add(owner.block);
+      }
+    }
     if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
     for (const block of message.content) {
-      if (block.type === "toolCall" && block.id) calls.set(block.id, block);
+      if (block.type === "toolCall" && block.id) latestCall.set(block.id, { index, block });
     }
   }
+  const historyToolId = (callId: string, owner?: number) =>
+    owner !== undefined && latestCall.get(callId)?.index !== owner
+      ? `${toolItemId(callId)}@${owner}` : toolItemId(callId);
+  const seenVisibleUserIds = new Set<string>();
+  let lastVisibleUserContent: NormalizedUserContent | null = null;
   return messages.flatMap<TimelineItem>((message, index): TimelineItem[] => {
     const timestamp = typeof message.timestamp === "number" ? message.timestamp : index;
     if (message.role === "toolResult") {
       if (!message.tool_call_id || message.tool_name === "request_user_input") return [];
+      const owner = resultOwners.get(index);
       return [{
-        id: toolItemId(message.tool_call_id), kind: "tool", order: index, revision: 0,
+        id: historyToolId(message.tool_call_id, owner?.index), kind: "tool", order: index, revision: 0,
         sessionId, runId: null, createdAt: timestamp, updatedAt: timestamp,
         toolCallId: message.tool_call_id, name: message.tool_name ?? "tool",
-        args: calls.get(message.tool_call_id)?.arguments ?? {}, result: message,
+        args: owner?.block.arguments ?? {}, result: message,
         status: projectToolStatus(message.status, message.is_error),
       }];
     }
@@ -226,19 +341,50 @@ export function timelineItemsFromPersistedMessages(
 
     const incomplete: TimelineToolItem[] = message.role === "assistant" && Array.isArray(message.content)
       ? message.content.flatMap((block) => block.type === "toolCall" && block.id
-        && !answered.has(block.id) && block.name !== "request_user_input" ? [{
-          id: toolItemId(block.id), kind: "tool", order: index, revision: 0,
+        && !answered.has(block) && block.name !== "request_user_input" ? [{
+          id: historyToolId(block.id, index), kind: "tool", order: index, revision: 0,
           sessionId, runId: null, createdAt: timestamp, updatedAt: timestamp,
           toolCallId: block.id, name: block.name ?? "tool", args: block.arguments ?? {},
           result: "未找到执行结果；不能据此判断是否产生了副作用。", status: "uncertain",
         }] : []) : [];
 
-    const content = readAgentMessageContent(message);
-    if (message.role === "user" && !content.images?.length && !content.files?.length && content.text.trimStart().startsWith("/")) return [];
-    if (message.role === "user" && content.text.trimStart().startsWith("<confirmed_plan_execution>")) {
-      content.text = "执行已确认计划";
+    if (message.role === "user") {
+      const content = normalizeUserMessageForTimeline(message, { allowLegacyPromptPlanExecution: true });
+      if (!content) return [];
+      const retryOf = typeof message.retry_of === "string" ? message.retry_of.trim() : "";
+      if (retryOf) {
+        if (seenVisibleUserIds.has(retryOf)) return [];
+      } else if (
+        message.source === "internal_retry"
+        && lastVisibleUserContent
+        && userContentMatches(lastVisibleUserContent, content)
+      ) {
+        return [];
+      }
+      lastVisibleUserContent = content;
+      const persistedMessageId = typeof message.message_id === "string" ? message.message_id.trim() : "";
+      if (persistedMessageId) seenVisibleUserIds.add(persistedMessageId);
+      if (retryOf) seenVisibleUserIds.add(retryOf);
+      return [{
+        id: `persisted-${timestamp}-${index}`,
+        kind: "message",
+        order: index,
+        revision: 0,
+        sessionId,
+        runId: null,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        role: "user",
+        text: content.text,
+        thinking: content.thinking,
+        ...(content.images ? { images: content.images } : {}),
+        ...(content.files ? { files: content.files } : {}),
+        status: message.stop_reason,
+      } satisfies TimelineMessageItem];
     }
-    if (message.role === "assistant" && !content.text && !content.thinking && !content.images?.length) return incomplete;
+
+    const content = readAgentMessageContent(message);
+    if (!content.text && !content.thinking && !content.images?.length) return incomplete;
 
     return [{
       id: `persisted-${timestamp}-${index}`,
@@ -249,7 +395,7 @@ export function timelineItemsFromPersistedMessages(
       runId: null,
       createdAt: timestamp,
       updatedAt: timestamp,
-      role: message.role,
+      role: "assistant",
       text: content.text,
       thinking: content.thinking,
       ...(content.images ? { images: content.images } : {}),
@@ -298,6 +444,7 @@ export function reduceRuntimeEventBatch(
   let orderedIds: string[] | undefined;
   const activeMessageIdsByRun: Record<string, string> = { ...state.activeMessageIdsByRun };
   const messageIdsByRoute: Record<string, string> = { ...state.messageIdsByRoute };
+  const initialUserMatchedByRun: Record<string, boolean> = { ...state.initialUserMatchedByRun };
   let activeCompactionId = state.activeCompactionId;
   let lastOrder = state.lastOrder;
   let assistantSequence = state.assistantSequence;
@@ -394,7 +541,10 @@ export function reduceRuntimeEventBatch(
     if (type === "run.started") {
       // Admission is authoritative: rejected requests never become sent messages.
       // The stable run key also makes duplicate start notifications idempotent.
-      const text = typeof payload.text === "string" ? payload.text : "";
+      const rawText = typeof payload.text === "string" ? payload.text : "";
+      const text = rawText
+        ? normalizeUserDisplayText(rawText, payload.planExecution === true ? "plan_execution" : "prompt")
+        : "";
       const files = attachmentMetadata(payload.files);
       const images: ImageAttachmentPayload[] = Array.isArray(payload.images)
         ? payload.images.flatMap((image) => {
@@ -417,19 +567,54 @@ export function reduceRuntimeEventBatch(
       continue;
     }
     if (type === "run.completed" || type === "run.cancelled" || type === "run.failed") {
+      const terminalStatus = type === "run.completed"
+        ? "end_turn"
+        : type === "run.cancelled"
+          ? "cancelled"
+          : "error";
+
       for (const [id, item] of Object.entries(entities)) {
-        if (item.kind !== "tool" || item.sessionId !== envelope.sessionId
-          || item.runId !== envelope.runId || !isToolActive(item.status)) continue;
-        pendingToolUpdates.delete(id);
-        entities[id] = {
-          ...item, approval: undefined, status: "uncertain",
-          result: item.result ?? "运行已结束，但未收到工具终态。", revision: item.revision + 1,
-          updatedAt: envelope.timestamp, lastSeq: envelope.seq,
-        };
-        changed = true;
+        if (item.sessionId !== envelope.sessionId || item.runId !== envelope.runId) continue;
+
+        if (item.kind === "tool" && isToolActive(item.status)) {
+          pendingToolUpdates.delete(id);
+          entities[id] = {
+            ...item,
+            approval: undefined,
+            status: "uncertain",
+            result: item.result ?? "运行已结束，但未收到工具终态。",
+            revision: item.revision + 1,
+            updatedAt: envelope.timestamp,
+            lastSeq: envelope.seq,
+          };
+          changed = true;
+          continue;
+        }
+
+        if (item.kind === "message" && item.role === "assistant" && item.status === "streaming") {
+          applyPendingDelta(id);
+          const current = entities[id];
+          if (!current || current.kind !== "message") continue;
+          if (!current.text && !current.thinking && !current.images?.length && !current.files?.length) {
+            remove(id);
+          } else {
+            entities[id] = {
+              ...current,
+              status: terminalStatus,
+              revision: current.revision + 1,
+              updatedAt: envelope.timestamp,
+              lastSeq: envelope.seq,
+            };
+            changed = true;
+          }
+        }
       }
       if (running) {
         running = false;
+        changed = true;
+      }
+      if (initialUserMatchedByRun[runKey]) {
+        delete initialUserMatchedByRun[runKey];
         changed = true;
       }
       clearMessageRoutes(runKey);
@@ -505,7 +690,67 @@ export function reduceRuntimeEventBatch(
     }
     if (type === "message_end") {
       const raw = agentMessage(payload.message);
-      if (raw?.role !== "assistant") continue;
+      if (!raw) continue;
+      if (raw.role === "user") {
+        const retryOf = typeof raw.retry_of === "string" ? raw.retry_of.trim() : "";
+        if (
+          payload.internalRetry === true
+          || payload.internal_retry === true
+          || retryOf.length > 0
+          || raw.source === "internal_retry"
+        ) {
+          continue;
+        }
+        const content = normalizeUserMessageForTimeline(raw);
+        if (!content) continue;
+        const isQueuedDelivery = raw.source === "steer" || raw.source === "follow_up";
+        const initialId = `user:${encodeURIComponent(runKey)}`;
+        const initialItem = entities[initialId];
+        if (
+          !isQueuedDelivery
+          && initialItem?.kind === "message"
+          && initialItem.role === "user"
+          && !initialUserMatchedByRun[runKey]
+          && initialItem.text === content.text
+          && (initialItem.images?.length ?? 0) === (content.images?.length ?? 0)
+          && (initialItem.files?.length ?? 0) === (content.files?.length ?? 0)
+        ) {
+          const hasSubsequentRunActivity = Object.values(entities).some((candidate) => (
+            candidate.id !== initialId
+            && candidate.sessionId === envelope.sessionId
+            && candidate.runId === envelope.runId
+            && candidate.order > initialItem.order
+          ));
+          if (!hasSubsequentRunActivity) {
+            initialUserMatchedByRun[runKey] = true;
+            changed = true;
+            continue;
+          }
+        }
+        const protocolMessageId = protocolMessageIdFromPayload(payload);
+        const id = protocolMessageId
+          ? `user:${encodeURIComponent(runKey)}:${encodeURIComponent(protocolMessageId)}`
+          : `user:${encodeURIComponent(runKey)}:${envelope.seq}`;
+        if (entities[id]) continue;
+        insert({
+          id,
+          kind: "message",
+          order: nextOrder(),
+          revision: 0,
+          sessionId: envelope.sessionId,
+          runId: envelope.runId,
+          createdAt: envelope.timestamp,
+          updatedAt: envelope.timestamp,
+          lastSeq: envelope.seq,
+          role: "user",
+          text: content.text,
+          thinking: "",
+          ...(content.images?.length ? { images: content.images } : {}),
+          ...(content.files?.length ? { files: content.files } : {}),
+        });
+        continue;
+      }
+      if (raw.role !== "assistant") continue;
       const id = resolveMessageId(
         activeMessageIdsByRun,
         messageIdsByRoute,
@@ -590,6 +835,20 @@ export function reduceRuntimeEventBatch(
       });
       continue;
     }
+    if (type === "edit_recovery_updated" && Array.isArray(payload.results)) {
+      for (const result of payload.results as AgentMessage[]) {
+        const entry = (result.details as { assistantEntryId?: string } | undefined)?.assistantEntryId;
+        if (!entry) continue;
+        const card = Object.values(entities).find(item => item.kind === "tool"
+          && item.toolCallId === result.tool_call_id
+          && ((item.result as AgentMessage | undefined)?.details as { assistantEntryId?: string } | undefined)?.assistantEntryId === entry);
+        if (card?.kind !== "tool") continue;
+        entities[card.id] = { ...card, result, status: projectToolStatus(result.status, Boolean(result.is_error)),
+          approval: undefined, revision: card.revision + 1, updatedAt: envelope.timestamp, lastSeq: envelope.seq };
+        changed = true;
+      }
+      continue;
+    }
     if (type === "tool_execution_end") {
       if (payload.tool_name === "request_user_input") continue;
       const toolCallId = nonEmptyString(payload.tool_call_id);
@@ -615,7 +874,13 @@ export function reduceRuntimeEventBatch(
     if (type === "approval.requested") {
       const approval = approvalFromPayload(payload);
       if (!approval) continue;
-      const id = toolItemId(approval.toolCallId);
+      const target = typeof payload.assistantEntryId === "string" && Object.values(entities).find(item => {
+        if (item.kind !== "tool" || item.toolCallId !== approval.toolCallId) return false;
+        const details = (item.result as AgentMessage | undefined)?.details;
+        return typeof details === "object" && details && "assistantEntryId" in details
+          && details.assistantEntryId === payload.assistantEntryId;
+      });
+      const id = target ? target.id : toolItemId(approval.toolCallId);
       const existing = entities[id];
       const existingTool = existing?.kind === "tool" ? existing : undefined;
       insert({
@@ -640,10 +905,11 @@ export function reduceRuntimeEventBatch(
     if (type === "approval.expired") {
       const toolCallId = nonEmptyString(payload.toolCallId);
       if (!toolCallId) continue;
-      const id = toolItemId(toolCallId);
-      const item = entities[id];
+      const item = Object.values(entities).find(candidate => candidate.kind === "tool"
+        && candidate.toolCallId === toolCallId && candidate.approval?.approvalId === payload.approvalId)
+        ?? entities[toolItemId(toolCallId)];
       if (!item || item.kind !== "tool") continue;
-      entities[id] = {
+      entities[item.id] = {
         ...item,
         approval: undefined,
         result: "工具审批已超时",
@@ -717,6 +983,7 @@ export function reduceRuntimeEventBatch(
     orderedIds: orderedIds ?? state.orderedIds,
     activeMessageIdsByRun,
     messageIdsByRoute,
+    initialUserMatchedByRun,
     activeCompactionId,
     lastOrder,
     assistantSequence,

@@ -216,6 +216,9 @@ class AgentLoopConfig:
     # its transcript, but adopts the refreshed system prompt and tool set
     # before the next model request.
     refresh_context: "Callable[[], Awaitable[AgentContext] | AgentContext] | None" = None
+    # For the built-in edit only, the session binds the trusted assistant entry
+    # after normal argument validation and approval.
+    execute_edit: Callable[..., Awaitable[AgentToolResult]] | None = None
 
 
 # ─── Events ───────────────────────────────────

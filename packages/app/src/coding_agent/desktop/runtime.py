@@ -126,6 +126,7 @@ class DesktopRuntime:
         self._run_id: str | None = None
         self._seq = 0
         self._approvals: dict[str, asyncio.Future[bool]] = {}
+        self._recovery_edit_entry: str | None = None
         self._approval_timeout_seconds = approval_timeout_seconds
         self._permission_mode: PermissionMode = cast(PermissionMode, SettingsManager().load().desktop_permission_mode)
         self._native_search_decision: tuple[str, bool] | None = None
@@ -136,13 +137,15 @@ class DesktopRuntime:
         if method in {
             "run.start", "run.steer", "run.followUp", "mode.enterPlan", "plan.answer",
             "plan.cancel", "plan.execute", "plan.handoff", "session.clear", "session.compact",
-            "model.select", "subagent.spawn", "workbench.chat.send",
+            "model.select", "subagent.spawn", "workbench.chat.send", "edit.check", "edit.retry",
         } or (method == "workbench.chat.open" and not params.get("conversationId")) or (
             method == "workbench.chat.approve" and params.get("allowed") is True
         ):
             self._ensure_session_not_archived()
         if method.startswith("workbench."):
             return await self._workbench_request(method, params)
+        if method in {"edit.check", "edit.retry"}:
+            return await self._recover_edit(method, params)
         handlers: dict[str, Callable[[dict[str, Any]], Awaitable[Any]]] = {
             "runtime.ping": self._ping,
             "workspace.open": self._workspace_open,
@@ -284,6 +287,7 @@ class DesktopRuntime:
             reasoning=reasoning,
             context_files=context_files,
             before_tool_call=self._before_tool_call,
+            permission_mode=self._permission_mode,
             before_native_web_search=self._before_native_web_search,
             retry_policy=RetryPolicy(
                 enabled=settings.auto_retry,
@@ -542,6 +546,24 @@ class DesktopRuntime:
             "webSearch": self._web_search_payload(session),
             **self._turn_changes_payload(session),
         }
+
+    async def _recover_edit(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        self._ensure_no_active_run("请先等待当前任务结束，再处理待恢复的编辑")
+        session = self._require_session()
+        if params.get("sessionId") != session.session_manager.header.id:
+            raise RpcError("STALE_SESSION", "会话已经切换，请重新选择原编辑")
+        entry_id, call_id = params.get("assistantEntryId"), params.get("toolCallId")
+        if not isinstance(entry_id, str) or not entry_id.strip() or not isinstance(call_id, str) or not call_id.strip():
+            raise RpcError("INVALID_PARAMS", "处理原编辑需要 assistantEntryId 和 toolCallId")
+        self._recovery_edit_entry = entry_id
+        try:
+            if method == "edit.check":
+                await session.refresh_edit_recovery(assistant_entry_id=entry_id, tool_call_id=call_id)
+                return await self._session_snapshot({})
+            result = await session.retry_edit(assistant_entry_id=entry_id, tool_call_id=call_id)
+        finally:
+            self._recovery_edit_entry = None
+        return {"snapshot": await self._session_snapshot({}), "result": to_jsonable(result)}
 
     async def _session_usage(self, params: dict[str, Any]) -> dict[str, Any]:
         session_id = params.get("sessionId")
@@ -858,7 +880,7 @@ class DesktopRuntime:
                     *([TextContent(text=text)] if text.strip() else []),
                     *images,
                     *(files.content if files is not None else []),
-                ], attachments=files.metadata if files is not None else [])
+                ], attachments=files.metadata if files is not None else [], source="prompt", message_id=uuid.uuid4().hex[:12])
                 if images or files is not None else text
             )
             attachments.track(message)
@@ -906,7 +928,7 @@ class DesktopRuntime:
         if not isinstance(text, str) or not text.strip():
             raise RpcError("INVALID_PARAMS", "run.steer 需要非空 text")
         session = self._require_queueable_run(params)
-        session.agent.steer(text)
+        session.agent.steer(UserMessage(content=text, source="steer"))
         return {"queued": True}
 
     async def _run_follow_up(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -914,7 +936,7 @@ class DesktopRuntime:
         if not isinstance(text, str) or not text.strip():
             raise RpcError("INVALID_PARAMS", "run.followUp 需要非空 text")
         session = self._require_queueable_run(params)
-        session.agent.follow_up(text)
+        session.agent.follow_up(UserMessage(content=text, source="follow_up"))
         return {"queued": True}
 
     def _require_queueable_run(self, params: dict[str, Any]) -> AgentSession:
@@ -960,6 +982,7 @@ class DesktopRuntime:
         settings = replace(settings_manager.load(), desktop_permission_mode=mode)
         settings_manager.save(settings)
         self._permission_mode = cast(PermissionMode, mode)
+        session.set_permission_mode(mode, persist=False)
         payload = {"sessionId": session.session_manager.header.id, "permissionMode": mode}
         self._publish("permission.changed", payload)
         return payload
@@ -999,6 +1022,7 @@ class DesktopRuntime:
                 "toolCallId": context.tool_call.id,
                 "toolName": context.tool_call.name,
                 "args": context.args,
+                **({"assistantEntryId": self._recovery_edit_entry} if self._recovery_edit_entry else {}),
             } if context is not None else {
                 "approvalId": approval_id,
                 "message": "是否允许本次任务使用联网搜索？",
@@ -1144,8 +1168,25 @@ class DesktopRuntime:
             for scope, conflict in conflicts
         ]
 
+    def _ensure_memory_scope(self, params: dict[str, Any]) -> None:
+        session = self._require_session()
+        expected_workspace = params.get("workspacePath")
+        expected_session = params.get("sessionId")
+        if expected_workspace is not None:
+            if not isinstance(expected_workspace, str) or not expected_workspace.strip():
+                raise RpcError("INVALID_PARAMS", "workspacePath 必须是非空字符串")
+            workspace = self._require_workspace()
+            if expected_workspace != str(workspace):
+                raise RpcError("STALE_WORKSPACE", "当前工作区已切换，请重新确认后再操作长期记忆")
+        if expected_session is not None:
+            if not isinstance(expected_session, str) or not expected_session.strip():
+                raise RpcError("INVALID_PARAMS", "sessionId 必须是非空字符串")
+            if expected_session != session.session_manager.header.id:
+                raise RpcError("STALE_WORKSPACE", "当前会话已切换，请重新确认后再操作长期记忆")
+
     async def _memory_forget(self, params: dict[str, Any]) -> dict[str, Any]:
         self._ensure_no_active_run("任务运行时不能修改长期记忆")
+        self._ensure_memory_scope(params)
         key = params.get("key")
         scope = params.get("scope")
         confirmed = params.get("confirmed")
@@ -1163,6 +1204,7 @@ class DesktopRuntime:
 
     async def _memory_remember(self, params: dict[str, Any]) -> dict[str, Any]:
         self._ensure_no_active_run("任务运行时不能修改长期记忆")
+        self._ensure_memory_scope(params)
         content = params.get("content")
         scope = params.get("scope", "global")
         if not isinstance(content, str) or not content.strip():
@@ -1181,6 +1223,7 @@ class DesktopRuntime:
 
     async def _memory_clear(self, params: dict[str, Any]) -> dict[str, Any]:
         self._ensure_no_active_run("任务运行时不能清空长期记忆")
+        self._ensure_memory_scope(params)
         all_scopes = params.get("allScopes")
         if not isinstance(all_scopes, bool) or params.get("confirmed") is not True:
             raise RpcError("CONFIRMATION_REQUIRED", "清空记忆需要范围和显式确认")
@@ -1191,6 +1234,7 @@ class DesktopRuntime:
 
     async def _memory_set_enabled(self, params: dict[str, Any]) -> dict[str, Any]:
         self._ensure_no_active_run("任务运行时不能切换长期记忆")
+        self._ensure_memory_scope(params)
         enabled = params.get("enabled")
         if not isinstance(enabled, bool):
             raise RpcError("INVALID_PARAMS", "memory.setEnabled 需要 enabled")
@@ -1208,6 +1252,7 @@ class DesktopRuntime:
 
     async def _memory_set_auto_extract(self, params: dict[str, Any]) -> dict[str, Any]:
         self._ensure_no_active_run("任务运行时不能切换自动提取")
+        self._ensure_memory_scope(params)
         enabled = params.get("enabled")
         if not isinstance(enabled, bool):
             raise RpcError("INVALID_PARAMS", "memory.setAutoExtract 需要 enabled")
@@ -1344,6 +1389,8 @@ class DesktopRuntime:
             }
         else:
             payload = {key: value for key, value in event.items() if key != "type"}
+            if event_type == "message_end" and payload.pop("internal_retry", False):
+                payload["internalRetry"] = True
         self._publish(event_type, payload)
         if event_type in {"message_end", "turn_end", "agent_end", "auto_compaction_end", "compaction_end"}:
             self._publish_stats()

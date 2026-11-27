@@ -96,6 +96,23 @@ def _credential_store_for(owner: Any) -> CredentialStore:
         owner._credential_store = store
     return store
 
+_EDIT_RECOVERY_COMMANDS = (
+    BuiltinSlashCommand("check-edits", "核对当前分支待恢复的编辑"),
+    BuiltinSlashCommand("retry-edit", "按原编辑卡片的两个标识重试该次编辑"),
+)
+
+
+def _recovered_edit_results(session: AgentSession) -> dict[tuple[str, str], ToolResultMessage]:
+    results = {}
+    for message in getattr(getattr(session, "state", None), "messages", ()):
+        if not isinstance(message, ToolResultMessage) or message.tool_name != "edit" or not isinstance(message.details, dict):
+            continue
+        entry_id = message.details.get("assistantEntryId")
+        if isinstance(entry_id, str) and entry_id:
+            results[entry_id, message.tool_call_id] = message
+    return results
+
+
 class InteractiveMode:
     """Interactive TUI mode for the coding agent.
 
@@ -373,7 +390,7 @@ class InteractiveMode:
         # Clone so we don't mutate the shared BUILTIN_SLASH_COMMANDS list.
         commands = [
             BuiltinSlashCommand(name=cmd.name, description=cmd.description, active=cmd.active)
-            for cmd in get_active_commands()
+            for cmd in (*get_active_commands(), *_EDIT_RECOVERY_COMMANDS)
         ]
         # Prompt templates: surfaced as /name for completion + expansion.
         for tpl in self._prompt_templates:
@@ -553,7 +570,9 @@ class InteractiveMode:
         """Map agent events to TUI component updates (single dispatch)."""
         etype = event.get("type")
 
-        if etype == "agent_start":
+        if etype == "edit_recovery_updated":
+            self._rebuild_chat_from_messages()
+        elif etype == "agent_start":
             self._pending_tools.clear()
             label = (
                 "正在整理并提交计划…（Esc 停止）"
@@ -829,6 +848,8 @@ class InteractiveMode:
             entries = []
         from agent_core.session.types import SessionMessageEntry
         restored_tools: dict[str, ToolExecutionComponent] = {}
+        recovered = _recovered_edit_results(self._session)
+        recovery_cards: list[tuple[ToolExecutionComponent, ToolResultMessage]] = []
         for entry in entries:
             if not isinstance(entry, SessionMessageEntry) or entry.message is None:
                 continue
@@ -853,6 +874,8 @@ class InteractiveMode:
                     card = ToolExecutionComponent(block.name, block.id, block.arguments, theme=self.theme)
                     card.set_result("未找到执行结果；不能据此判断是否产生了副作用。", status="uncertain")
                     restored_tools[block.id] = card
+                    if (projected := recovered.get((entry.id, block.id))) is not None:
+                        recovery_cards.append((card, projected))
                     self._add_to_chat(card)
             elif isinstance(msg, ToolResultMessage) and msg.tool_name != "request_user_input":
                 card = restored_tools.get(msg.tool_call_id)
@@ -860,6 +883,9 @@ class InteractiveMode:
                     card = ToolExecutionComponent(msg.tool_name, msg.tool_call_id, {}, theme=self.theme)
                     self._add_to_chat(card)
                 card.set_result(msg, msg.is_error)
+        archived = getattr(getattr(self._session.session_manager, "header", None), "archived", False)
+        for card, result in recovery_cards:
+            card.set_result(result, result.is_error, allow_recovery=not archived)
         if hasattr(self, "_subagent_cards"):
             self._subagent_cards.clear()
             self._render_subagents()
@@ -872,6 +898,31 @@ class InteractiveMode:
         trimmed = text.strip()
         parts = trimmed.split(maxsplit=1)
         cmd_name = parts[0][1:]  # strip leading /
+        if cmd_name in {"check-edits", "retry-edit"}:
+            if self._session.session_manager.refresh_archived():
+                self._add_system_message("已归档会话仅供查看。")
+                return True
+            self._is_responding = True
+            try:
+                identity = parts[1].split() if len(parts) == 2 else []
+                if cmd_name == "check-edits" and not identity:
+                    await self._session.refresh_edit_recovery()
+                    self._rebuild_chat_from_messages()
+                elif len(identity) != 2:
+                    self._add_system_message(f"请使用原编辑卡片中的 /{cmd_name} 命令。")
+                elif cmd_name == "check-edits":
+                    await self._session.refresh_edit_recovery(assistant_entry_id=identity[0], tool_call_id=identity[1])
+                    self._rebuild_chat_from_messages()
+                else:
+                    result = await self._session.retry_edit(assistant_entry_id=identity[0], tool_call_id=identity[1])
+                    self._rebuild_chat_from_messages()
+                    if result.status != "completed" and result.content:
+                        self._add_system_message(getattr(result.content[0], "text", "原编辑尚未完成"))
+            except Exception as exc:
+                self._add_system_message(f"处理原编辑失败：{exc}")
+            finally:
+                self._is_responding = False
+            return True
 
         # /skill:name — explicit skill invocation. Reads the SKILL.md content
         # and sends it as a user message so the model applies it this turn.
@@ -976,7 +1027,7 @@ class InteractiveMode:
         return True
 
     def _cmd_help(self) -> None:
-        active = get_active_commands()
+        active = (*get_active_commands(), *_EDIT_RECOVERY_COMMANDS)
         lines = ["**可用命令：**\n"]
         for cmd in active:
             lines.append(f"- `/{cmd.name}` — {cmd.description}")
@@ -1289,7 +1340,7 @@ class InteractiveMode:
             sm = self._session.session_manager
             sm.set_leaf_id(entry_id)
             ctx = sm.build_session_context()
-            self._session.agent.load_messages(ctx.messages)
+            self._session.load_branch_messages(ctx.messages)
             self._session.refresh_plan_state_from_branch()
             self._rebuild_chat_from_messages()
             self._refresh_footer()
@@ -2407,7 +2458,10 @@ class InteractiveMode:
           - Ctrl+D exits when the editor is empty; otherwise
             forward-deletes one char.
         """
-        self._print_welcome()
+        if _recovered_edit_results(self._session):
+            self._rebuild_chat_from_messages()
+        else:
+            self._print_welcome()
         self.tui.start()
 
         # Color the editor's frame to reflect the initial thinking level.

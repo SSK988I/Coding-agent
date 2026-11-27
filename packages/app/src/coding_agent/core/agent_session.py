@@ -20,6 +20,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import os
 import sys
 import time
 import uuid
@@ -32,6 +33,8 @@ from agent_llm import (
     Context,
     Model,
     ThinkingLevel,
+    ToolCall,
+    ToolResultMessage,
     UserMessage,
 )
 from agent_llm.image_utils import validate_image_messages
@@ -58,6 +61,9 @@ from agent_core import (
     WriteTool,
 )
 from agent_core.prompts import build_system_prompt
+from agent_core.types import AgentContext, AgentToolResult
+from agent_core.session.edit_calls import branch_edits
+from coding_agent.core.session_edits import as_message, project_results, recovery_error
 from coding_agent.core.retry import RetryPolicy, retrying_stream
 from coding_agent.core.image_identification import image_identification_guidance
 from coding_agent.core.usage_metrics import UsageMetrics, project_usage_metrics
@@ -383,8 +389,10 @@ class AgentSession:
             reasoning=config.reasoning,
             session_manager=self.session_manager,
             convert_to_llm=_convert_to_llm,
+            project_loaded_messages=self._project_edit_results,
             before_tool_call=self._before_tool_call,
             after_tool_call=config.after_tool_call,
+            execute_edit=self._execute_edit,
         )
         self._restore_persisted_context()
         self._agent.subscribe(self._on_agent_event)
@@ -733,6 +741,8 @@ class AgentSession:
     async def _before_tool_call(
         self, context: BeforeToolCallContext, signal: asyncio.Event,
     ) -> BeforeToolCallResult | None:
+        edit = self._edit_tool() if context.tool_call.name == "edit" else None
+        guard = self._edit_guard(edit, signal, needs_write=True) if edit is not None else None
         image_gate = self._image_tool_gate(context)
         if image_gate is not None:
             return image_gate
@@ -761,6 +771,11 @@ class AgentSession:
         result = await call_hook(self._config.before_tool_call, context, signal)
         if result is not None and result.block:
             return result
+        if guard is not None:
+            blocked = guard()
+            if blocked is not None:
+                return BeforeToolCallResult(block=True, reason=blocked.content[0].text,
+                                            code="EDIT_BLOCKED", status=blocked.status)
         if context.tool_call.name == "web_search":
             # The permission dialog may yield while Plan becomes ready or the
             # search capability is revoked. Approval does not pin old policy.
@@ -771,6 +786,199 @@ class AgentSession:
                 return BeforeToolCallResult(block=True, code="WEB_SEARCH_UNAVAILABLE",
                                             reason="当前阶段或工具配置不允许联网检索", status="blocked")
         return result
+
+    async def _execute_edit(
+        self, tool: EditTool, assistant: AssistantMessage, call: ToolCall, args: dict, signal: asyncio.Event,
+    ) -> AgentToolResult:
+        return await self._agent.execute_session_edit(
+            tool, assistant, call, args, signal, guard=self._edit_guard(tool, signal, needs_write=True),
+        )
+
+    def _edit_guard(
+        self, tool: EditTool, signal: asyncio.Event, *, needs_write: bool,
+    ) -> Callable[[], AgentToolResult | None]:
+        manager = self.session_manager
+        leaf = manager.leaf_id
+        mode = self.permission_mode
+        plan = (self._plan_state.mode, self._plan_state.phase)
+
+        def check() -> AgentToolResult | None:
+            if (signal.is_set() or manager is not self.session_manager or leaf != manager.leaf_id
+                    or mode != self.permission_mode or plan != (self._plan_state.mode, self._plan_state.phase)
+                    or manager.refresh_archived() or (needs_write and tool not in self._effective_tools())):
+                return recovery_error("EDIT_BLOCKED", "编辑已取消，或原会话、分支或权限已变更。", status="blocked")
+            return None
+
+        return check
+
+    @property
+    def _edit_recovery(self):
+        recovery = self._agent.edit_recovery
+        assert recovery is not None
+        return recovery
+
+    def _edit_tool(self) -> EditTool | None:
+        return next((tool for tool in self._development_tools if isinstance(tool, EditTool)), None)
+
+    def _source_edit_tool(self, key: tuple[str, str], fallback: EditTool) -> EditTool:
+        cwd = self._edit_recovery.original_cwd(*key)
+        return EditTool(cwd=cwd) if cwd and cwd != fallback.cwd else fallback
+
+    def _edit_approval_call(self, call: ToolCall, tool: EditTool) -> ToolCall:
+        # Authorize against today's workspace, while resolving a historic
+        # relative request against the working directory recorded when approved.
+        if os.path.normcase(os.path.abspath(tool.cwd)) == os.path.normcase(os.path.abspath(self.cwd)):
+            return call
+        path = call.arguments.get("path")
+        if not isinstance(path, str) or not path:
+            return call
+        return replace(call, arguments={**call.arguments, "path": os.path.abspath(os.path.join(tool.cwd, path))})
+
+    def _project_edit_results(self, messages: list, checked: dict | None = None) -> list:
+        replacements: dict[int, dict[str, ToolResultMessage]] = {}
+        tool = self._edit_tool() or EditTool(cwd=self.session_manager.header.cwd or self.cwd)
+        for item in branch_edits(self.session_manager.get_branch()):
+            if not item.unresolved:
+                continue
+            key = (item.entry_id, item.call.id)
+            result = (checked or {}).get(key)
+            if result is None:
+                result = self._edit_recovery.peek(*key, tool=self._source_edit_tool(key, tool), params=item.call.arguments)
+            if result is not None:
+                replacements.setdefault(id(item.assistant), {})[item.call.id] = as_message(item, result)
+        return project_results(messages, replacements)
+
+    def _update_edit_results(self, checked: dict) -> None:
+        def edit_results(messages):
+            return {
+                (message.details["assistantEntryId"], message.tool_call_id): message
+                for message in messages if isinstance(message, ToolResultMessage)
+                and message.tool_name == "edit" and isinstance(message.details, dict)
+                and "assistantEntryId" in message.details
+            }
+
+        previous = edit_results(self.state.messages)
+        self.state.messages = self._project_edit_results(self.state.messages, checked)
+        changed = [item for key, item in edit_results(self.state.messages).items() if item != previous.get(key)]
+        if changed:
+            self._emit_event({"type": "edit_recovery_updated", "session_id": self.session_manager.header.id,
+                              "results": changed})
+
+    async def refresh_edit_recovery(self, assistant_entry_id: str | None = None, tool_call_id: str | None = None) -> None:
+        """Explicitly check the selected edit, or all pending edits when neither ID is supplied."""
+        if (assistant_entry_id is None) != (tool_call_id is None):
+            raise ValueError("核对编辑需要完整的原助手条目 ID 和工具调用 ID。")
+        if self._is_processing or self.state.is_streaming:
+            return
+        self._retry_abort_event.clear()
+        self._is_processing = True
+        try:
+            selected = (assistant_entry_id, tool_call_id) if assistant_entry_id is not None else None
+            await self._check_edit_recovery(manual=True, selected=selected)
+        finally:
+            self._is_processing = False
+
+    async def _check_edit_recovery(self, *, manual: bool, selected: tuple | None = None) -> None:
+        manager = self.session_manager
+        tool = self._edit_tool()
+        if tool is None:
+            return
+        checked = {}
+        for item in branch_edits(manager.get_branch()):
+            key = (item.entry_id, item.call.id)
+            if not item.unresolved or (selected is not None and selected != key):
+                continue
+            source_tool = self._source_edit_tool(key, tool)
+            evidence = self._edit_recovery.peek(*key, tool=source_tool, params=item.call.arguments)
+            if evidence is None or (evidence.details or {}).get("code") != "EDIT_RECOVERY_PENDING":
+                continue
+            if manager.refresh_archived() or self._retry_abort_event.is_set():
+                return
+            # Inspect only a path allowed by current policy. A historic grant is
+            # never authority to read a different target or to write on resume.
+            approval_call = self._edit_approval_call(item.call, source_tool)
+            args = {"path": approval_call.arguments.get("path")}
+            mode = "ask" if self._plan_state.mode == "plan" else (self.permission_mode or "ask")
+            needs_grant = requires_approval(mode, "edit", args, Path(self.cwd), is_approval_safe_shell_command)
+            check_call = ToolCall(id=item.call.id, name="read", arguments=args)
+            if needs_grant:
+                if not manual or self._config.before_tool_call is None or tool not in self._effective_tools():
+                    checked[key] = recovery_error("EDIT_RECOVERY_PENDING", "核对原文件需要明确审批。", status="uncertain")
+                    continue
+                # Generic read is a free observation tool. Use the original edit
+                # permission for a sensitive path; checking never commits an edit.
+                check_call = approval_call
+            guard = self._edit_guard(tool, self._retry_abort_event, needs_write=needs_grant)
+            gate = await self._before_tool_call(
+                BeforeToolCallContext(item.assistant, check_call, check_call.arguments, AgentContext(tools=self._tools)),
+                self._retry_abort_event,
+            )
+            if gate is not None and gate.block:
+                checked[key] = recovery_error("EDIT_RECOVERY_PENDING", gate.reason or "当前无法核对文件。",
+                                              status="uncertain")
+                continue
+            if guard() is not None:
+                return
+            result = await self._edit_recovery.recover(source_tool, *key, item.call.arguments, guard=guard)
+            if result is not None:
+                if result.status == "blocked":
+                    return
+                if result.details and result.details.get("retryable") and tool not in self._effective_tools():
+                    result = replace(result, details={**result.details, "retryable": False})
+                checked[key] = result
+        if manager is self.session_manager:
+            self._update_edit_results(checked)
+
+    async def retry_edit(self, assistant_entry_id: str, tool_call_id: str) -> AgentToolResult:
+        """Retry this original edit after validating current session, permission and file state."""
+        if self._is_processing or self.state.is_streaming:
+            return recovery_error("EDIT_BLOCKED", "会话任务正在运行。", status="blocked")
+        manager = self.session_manager
+        key = (assistant_entry_id, tool_call_id)
+        item = next((edit for edit in branch_edits(manager.get_branch())
+                     if (edit.entry_id, edit.call.id) == key), None)
+        tool = self._edit_tool()
+        if item is None or tool is None or manager.refresh_archived():
+            return recovery_error("EDIT_BLOCKED", "原编辑不在当前可操作的会话分支。", status="blocked")
+        if not item.unresolved and item.saved is not None:
+            return AgentToolResult(content=item.saved.content, details=item.saved.details,
+                                   status=item.saved.status or ("failed" if item.saved.is_error else "completed"))
+        source_tool = self._source_edit_tool(key, tool)
+        evidence = self._edit_recovery.peek(*key, tool=source_tool, params=item.call.arguments)
+        if evidence is None:
+            return recovery_error("EDIT_RECOVERY_UNAVAILABLE", "没有对应的可信编辑记录。", status="uncertain")
+        if evidence.status != "uncertain":
+            self._update_edit_results({key: evidence})
+            return evidence
+        if tool not in self._effective_tools():
+            return recovery_error("EDIT_BLOCKED", "当前模式或工具配置禁止文件编辑。", status="blocked")
+        self._is_processing = True
+        try:
+            signal = self._retry_abort_event
+            signal.clear()
+            guard = self._edit_guard(tool, signal, needs_write=True)
+            approval_call = self._edit_approval_call(item.call, source_tool)
+            if (self._config.before_tool_call is None and
+                    requires_approval(self.permission_mode or "ask", "edit", approval_call.arguments,
+                                      Path(self.cwd), is_approval_safe_shell_command)):
+                return recovery_error("PERMISSION_APPROVAL_REQUIRED", "当前运行无法请求原文件的编辑权限。", status="blocked")
+            gate = await self._before_tool_call(
+                BeforeToolCallContext(item.assistant, approval_call, approval_call.arguments, AgentContext(tools=self._tools)),
+                signal,
+            )
+            if gate is not None and gate.block:
+                return recovery_error(gate.code or "EDIT_BLOCKED", gate.reason or "文件编辑未获准。", status=gate.status)
+            blocked = guard()
+            if blocked is not None:
+                return blocked
+            result = await self._edit_recovery.recover(source_tool, *key, item.call.arguments, retry=True, guard=guard)
+            if result is None:
+                return recovery_error("EDIT_RECOVERY_UNAVAILABLE", "未找到原编辑记录。", status="uncertain")
+            if result.status != "blocked":
+                self._update_edit_results({key: result})
+            return result
+        finally:
+            self._is_processing = False
 
     def _image_tool_gate(self, context: BeforeToolCallContext) -> BeforeToolCallResult | None:
         if context.tool_call.name != "view_image":
@@ -1100,10 +1308,15 @@ class AgentSession:
             "</confirmed_plan_execution>\n"
             "Execute this exact confirmed plan now."
         )
+        execution_message = UserMessage(
+            content=execution_prompt,
+            source="plan_execution",
+            message_id=uuid.uuid4().hex[:12],
+        )
         try:
             await self._extract_accepted_plan_memory(latest, started_entry)
             if not self._plan_abort_requested:
-                await self.prompt(execution_prompt, _plan_run_id=run_id)
+                await self.prompt(execution_message, _plan_run_id=run_id)
             stop_reason = getattr(self._last_assistant_message, "stop_reason", None)
             if (before_complete is not None and not self._plan_abort_requested
                     and stop_reason not in {None, "aborted", "error", "length"}):
@@ -1319,7 +1532,14 @@ class AgentSession:
                 "PLAN_RECOVERY_REQUIRED",
                 "当前 Plan 状态需要先查看详情、重新规划或取消",
             )
-        if isinstance(message, str) and message.lstrip().startswith("<confirmed_plan_execution>"):
+        if (
+            getattr(message, "source", None) == "plan_execution"
+            or (
+                _plan_run_id is not None
+                and isinstance(message, str)
+                and message.lstrip().startswith("<confirmed_plan_execution>")
+            )
+        ):
             _retrieve_memory = False
             _extract_memory = False
             _memory_mode = "plan_execution"
@@ -1344,7 +1564,9 @@ class AgentSession:
         # Set the guard before the first await. Otherwise two concurrent callers
         # can both pass the initial check while the first one is retrieving memory.
         self._is_processing = True
+        self._retry_abort_event.clear()
         try:
+            await self._check_edit_recovery(manual=False)
             if (
                 _retrieve_memory
                 and self.memory_service is not None
@@ -1370,13 +1592,15 @@ class AgentSession:
             self._agent.state.system_prompt = base_prompt
             raise
 
-        self._retry_abort_event.clear()
         self._compaction_orchestrator.reset_overflow_guard()
         self._turn_index += 1
         self._last_assistant_message = None
 
         try:
+            if hasattr(self._agent, "_last_prompt_user_ids"):
+                self._agent._last_prompt_user_ids = []
             await self._agent.prompt(message)
+            initial_prompt_ids = list(getattr(self._agent, "_last_prompt_user_ids", []))
 
             # Auto-compaction check after each turn.
             # The orchestrator emits compaction_start/end via on_event.
@@ -1390,7 +1614,11 @@ class AgentSession:
             # user's request is retried against the compacted context.
             if outcome is not None and outcome.need_retry:
                 self._last_assistant_message = None
-                await self._agent.prompt(message)
+                self._agent._next_prompt_retry_of = initial_prompt_ids
+                try:
+                    await self._agent.prompt(message)
+                finally:
+                    self._agent._next_prompt_retry_of = None
                 # A second compaction pass after the retry is intentionally skipped:
                 # Limit overflow recovery to one attempt per turn.
 
@@ -1855,11 +2083,15 @@ class AgentSession:
         ):
             self.session_manager.flush()
 
+    def load_branch_messages(self, messages: list) -> None:
+        """Reload the selected branch with read-only edit result projection."""
+        self._agent.load_messages(messages)
+
     def _restore_persisted_context(self) -> None:
         """Load an opened session into the live Agent without re-persisting it."""
         context = self.session_manager.build_session_context()
         if context.messages:
-            self._agent.load_messages(context.messages)
+            self.load_branch_messages(context.messages)
         if context.thinking_level is not None:
             self._agent.reasoning = (
                 None if context.thinking_level == "off" else context.thinking_level
@@ -1897,7 +2129,17 @@ class AgentSession:
                         })
 
         # Forward to external listeners.
-        self._emit_event(event)
+        forwarded_event: Any = event
+        if isinstance(event, dict) and etype == "message_end":
+            msg = event.get("message")
+            if msg is not None and getattr(msg, "role", None) == "user":
+                raw_retry_of = getattr(msg, "retry_of", None)
+                raw_source = getattr(msg, "source", None)
+                has_retry_link = isinstance(raw_retry_of, str) and bool(raw_retry_of.strip())
+                is_legacy_retry = isinstance(raw_source, str) and raw_source.strip() == "internal_retry"
+                if has_retry_link or is_legacy_retry:
+                    forwarded_event = {**event, "internal_retry": True}
+        self._emit_event(forwarded_event)
 
     def _emit_event(self, event: Any) -> None:
         """Emit an event to all registered listeners.

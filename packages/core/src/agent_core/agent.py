@@ -19,15 +19,20 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Awaitable, Callable, Literal
 
-from agent_llm import AssistantMessage, Message, Model, TextContent, Usage, UsageCost
+from agent_llm import AssistantMessage, Message, Model, TextContent, ToolCall, Usage, UsageCost
 
 from agent_core.agent_loop import run_agent_loop
+from agent_core.edit_recovery import EditRecovery
+from agent_core.session.session_manager import SessionManager
+from agent_core.session.types import SessionMessageEntry
+from agent_core.tools.edit import EditTool
 from agent_core.types import (
     AgentContext,
     AgentEvent,
     AgentLoopConfig,
     AgentState,
     AgentTool,
+    AgentToolResult,
     QueueMode,
     StreamFn,
 )
@@ -100,11 +105,13 @@ class Agent:
         stream_fn: StreamFn,
         get_api_key: "Callable[[str], Awaitable[str | None] | str | None] | None" = None,
         convert_to_llm: Callable[[list], "Awaitable[list[Message]] | list[Message]"] = default_convert_to_llm,
+        project_loaded_messages: Callable[[list], list] | None = None,
         reasoning: Any = None,
         session_manager: Any = None,
         tool_execution: Any = None,
         before_tool_call: Any = None,
         after_tool_call: Any = None,
+        execute_edit: Callable[..., Awaitable[AgentToolResult]] | None = None,
         steering_mode: QueueMode = "one-at-a-time",
         follow_up_mode: QueueMode = "one-at-a-time",
     ) -> None:
@@ -117,21 +124,25 @@ class Agent:
         self._active_run: _ActiveRun | None = None
         self.last_run_status: Literal["completed", "failed", "cancelled"] | None = None
         self.convert_to_llm = convert_to_llm
+        self.project_loaded_messages = project_loaded_messages
         self.stream_fn = stream_fn
         self.get_api_key = get_api_key
         self.reasoning = reasoning
         # Optional SessionManager: when set, messages are persisted as they land
         # in the transcript (message_end for user/assistant, turn_end for tool
         # results). Kept optional so the Agent stays usable without persistence.
-        self.session_manager = session_manager
+        self.attach_session(session_manager)
         # Tool-execution config threaded into AgentLoopConfig.
         self.tool_execution = tool_execution
         self.before_tool_call = before_tool_call
         self.after_tool_call = after_tool_call
+        self.execute_edit = execute_edit
         # Steering/follow-up queues. Drained by the
         # loop via get_steering_messages / get_follow_up_messages callbacks.
         self._steering_queue = PendingMessageQueue(steering_mode)
         self._follow_up_queue = PendingMessageQueue(follow_up_mode)
+        self._next_prompt_retry_of: list[str | None] | None = None
+        self._last_prompt_user_ids: list[str | None] = []
 
     # ── subscription ───────────────────────────────────────────────────
 
@@ -170,7 +181,7 @@ class Agent:
         Steering messages are injected before the next assistant turn —
         i.e. they cut in line on the current run while it is still looping.
         """
-        for item in self._normalize_prompt_input(message):
+        for item in self._normalize_prompt_input(message, source="steer"):
             self._steering_queue.enqueue(item)
 
     def follow_up(self, message) -> None:
@@ -180,7 +191,7 @@ class Agent:
         stops (no more tool calls, no steering pending), starting a new
         inner run.
         """
-        for item in self._normalize_prompt_input(message):
+        for item in self._normalize_prompt_input(message, source="follow_up"):
             self._follow_up_queue.enqueue(item)
 
     def clear_steering_queue(self) -> None:
@@ -210,7 +221,24 @@ class Agent:
                 "Agent is already processing a prompt. Wait for completion before prompting again."
             )
 
-        prompts = self._normalize_prompt_input(message)
+        prompt_retry_of = self._next_prompt_retry_of
+        self._next_prompt_retry_of = None
+        prompts = self._normalize_prompt_input(
+            message,
+            source="prompt",
+            assign_message_id=True,
+            retry_of_ids=prompt_retry_of,
+        )
+        self._last_prompt_user_ids = [
+            (
+                raw_id.strip() or None
+                if isinstance(raw_id := getattr(item, "message_id", None), str)
+                else None
+            )
+            if getattr(item, "role", None) == "user"
+            else None
+            for item in prompts
+        ]
         await self._run_with_lifecycle(
             lambda signal: run_agent_loop(
                 prompts,
@@ -254,25 +282,106 @@ class Agent:
         the caller is responsible for reattaching/creating a session if needed.
         """
         self.clear_all_queues()
-        self._state.messages = list(messages)
+        self._state.messages = list(self.project_loaded_messages(messages) if self.project_loaded_messages else messages)
 
     def attach_session(self, session_manager: Any) -> None:
         """Attach a SessionManager so subsequent messages are persisted."""
         self.session_manager = session_manager
+        self.edit_recovery = EditRecovery(session_manager) if isinstance(session_manager, SessionManager) else None
 
     def detach_session(self) -> None:
         """Detach the current SessionManager (does not touch the file)."""
-        self.session_manager = None
+        self.attach_session(None)
+
+    async def execute_session_edit(
+        self, tool: EditTool, assistant: AssistantMessage, call: ToolCall, args: dict, signal: Any = None,
+        *, guard: Callable[[], AgentToolResult | None] | None = None,
+    ) -> AgentToolResult:
+        """Use the actual persisted assistant entry as the idempotency scope."""
+        sources = [entry for entry in self.session_manager.get_branch()
+                   if isinstance(entry, SessionMessageEntry) and entry.message is assistant]
+        matching = [block for block in assistant.content if isinstance(block, ToolCall) and block.id == call.id]
+        if (self.edit_recovery is None or len(sources) != 1 or not call.id
+                or len(matching) != 1 or matching[0] is not call):
+            return AgentToolResult(content=[TextContent(text="未能唯一定位本次编辑的会话记录，文件尚未修改。")],
+                                   status="failed", details={"code": "EDIT_PREPARE_FAILED"})
+        manager = self.session_manager
+        leaf = manager.leaf_id
+
+        def check_authority() -> AgentToolResult | None:
+            if (manager is not self.session_manager or manager.leaf_id != leaf or manager.refresh_archived()
+                    or (signal is not None and signal.is_set())):
+                return AgentToolResult(content=[TextContent(text="文件编辑已停止，或原会话分支已变更。")],
+                                       status="blocked", details={"code": "EDIT_BLOCKED"})
+            return guard() if guard is not None else None
+
+        try:
+            blocked = check_authority()
+            if blocked is not None:
+                return blocked
+            manager.flush()
+        except Exception as exc:
+            return AgentToolResult(content=[TextContent(text=f"无法保存原编辑调用，文件尚未修改：{exc}")],
+                                   status="failed", details={"code": "EDIT_PREPARE_FAILED"})
+        return await self.edit_recovery.execute(tool, sources[0].id, call.id, args, guard=check_authority)
 
     # ── internals ──────────────────────────────────────────────────────
 
-    def _normalize_prompt_input(self, message: Any) -> list:
-        if isinstance(message, list):
-            return message
-        if isinstance(message, str):
-            from agent_llm import UserMessage
-            return [UserMessage(content=message)]
-        return [message]
+    def _normalize_prompt_input(
+        self,
+        message: Any,
+        *,
+        source: str | None = None,
+        assign_message_id: bool = False,
+        retry_of_ids: list[str | None] | None = None,
+    ) -> list:
+        from dataclasses import replace
+        import uuid
+        from agent_llm import UserMessage
+
+        def _clean_tag(value: Any) -> str | None:
+            if isinstance(value, str):
+                stripped = value.strip()
+                if stripped:
+                    return stripped
+            return None
+
+        items = message if isinstance(message, list) else [message]
+        normalized: list[Any] = []
+        for idx, item in enumerate(items):
+            is_retry = retry_of_ids is not None
+            raw_retry_target = retry_of_ids[idx] if retry_of_ids is not None and idx < len(retry_of_ids) else None
+            retry_target = _clean_tag(raw_retry_target)
+            if isinstance(item, str):
+                effective_source = "internal_retry" if is_retry and not retry_target else source
+                normalized.append(UserMessage(
+                    content=item,
+                    source=effective_source,
+                    message_id=uuid.uuid4().hex[:12] if assign_message_id else None,
+                    retry_of=retry_target,
+                ))
+            elif isinstance(item, UserMessage):
+                existing_source = _clean_tag(item.source)
+                existing_message_id = _clean_tag(item.message_id)
+                updates: dict[str, Any] = {}
+                if is_retry:
+                    if retry_target:
+                        updates["retry_of"] = retry_target
+                        if existing_source is None and source is not None:
+                            updates["source"] = source
+                    else:
+                        updates["source"] = "internal_retry"
+                    if assign_message_id:
+                        updates["message_id"] = uuid.uuid4().hex[:12]
+                else:
+                    if source is not None and existing_source is None:
+                        updates["source"] = source
+                    if assign_message_id and existing_message_id is None:
+                        updates["message_id"] = uuid.uuid4().hex[:12]
+                normalized.append(replace(item, **updates) if updates else item)
+            else:
+                normalized.append(item)
+        return normalized
 
     def _create_context_snapshot(self) -> AgentContext:
         return AgentContext(
@@ -291,6 +400,7 @@ class Agent:
             tool_execution=self.tool_execution,
             before_tool_call=self.before_tool_call,
             after_tool_call=self.after_tool_call,
+            execute_edit=self.execute_edit or (self.execute_session_edit if self.edit_recovery is not None else None),
             # Queue drain callbacks. The loop polls these
             # to inject steering (pre-outer + post-turn) and follow-up
             # (after the inner loop stops) messages.

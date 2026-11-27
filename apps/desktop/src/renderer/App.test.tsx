@@ -1280,7 +1280,9 @@ describe("desktop long-term memory", () => {
     renderApp();
     fireEvent.click(await screen.findByRole("button", { name: "已开启" }));
 
-    await waitFor(() => expect(requests).toHaveBeenCalledWith("memory.setEnabled", { enabled: false }));
+    await waitFor(() => expect(requests).toHaveBeenCalledWith("memory.setEnabled", {
+      enabled: false, workspacePath: "G:\\Coding-agent", sessionId: "session-1",
+    }));
     expect(await screen.findByRole("button", { name: "已关闭" })).toBeInTheDocument();
     expect(screen.getByText("长期记忆已关闭。")).toBeInTheDocument();
   });
@@ -1312,6 +1314,8 @@ describe("desktop long-term memory", () => {
 
     await waitFor(() => expect(requests).toHaveBeenCalledWith("memory.setAutoExtract", {
       enabled: false,
+      workspacePath: "G:\\Coding-agent",
+      sessionId: "session-1",
     }));
     expect(await screen.findByRole("button", { name: "自动提取关闭" })).toBeInTheDocument();
     expect(screen.getByText("长期记忆自动提取已关闭。")).toBeInTheDocument();
@@ -1324,7 +1328,7 @@ describe("desktop long-term memory", () => {
     fireEvent.click(screen.getByRole("button", { name: "发送 ↑" }));
 
     await waitFor(() => expect(requests).toHaveBeenCalledWith("memory.remember", {
-      content: "偏好中文回答", scope: "project",
+      content: "偏好中文回答", scope: "project", workspacePath: "G:\\Coding-agent", sessionId: "session-1",
     }));
     expect((await screen.findAllByText(/mem_manual_01/)).length).toBeGreaterThan(0);
     expect(requests).not.toHaveBeenCalledWith("run.start", expect.anything());
@@ -1339,7 +1343,7 @@ describe("desktop long-term memory", () => {
     fireEvent.click(screen.getByRole("button", { name: "发送 ↑" }));
 
     await waitFor(() => expect(requests).toHaveBeenCalledWith("memory.remember", {
-      content: "项目安装必须使用 --frozen-lockfile", scope: "project",
+      content: "项目安装必须使用 --frozen-lockfile", scope: "project", workspacePath: "G:\\Coding-agent", sessionId: "session-1",
     }));
   });
 
@@ -1352,7 +1356,7 @@ describe("desktop long-term memory", () => {
     fireEvent.click(screen.getByRole("button", { name: "发送 ↑" }));
 
     await waitFor(() => expect(requests).toHaveBeenCalledWith("memory.remember", {
-      content: "保留字面参数 --project", scope: "global",
+      content: "保留字面参数 --project", scope: "global", workspacePath: "G:\\Coding-agent", sessionId: "session-1",
     }));
   });
 
@@ -1368,7 +1372,7 @@ describe("desktop long-term memory", () => {
     fireEvent.change(composer, { target: { value: "/memory forget response.language --confirm" } });
     fireEvent.click(screen.getByRole("button", { name: "发送 ↑" }));
     await waitFor(() => expect(requests).toHaveBeenCalledWith("memory.forget", {
-      key: "response.language", scope: undefined, confirmed: true,
+      key: "response.language", scope: undefined, confirmed: true, workspacePath: "G:\\Coding-agent", sessionId: "session-1",
     }));
     expect(await screen.findByText("记忆已遗忘并写入墓碑。")).toBeInTheDocument();
   });

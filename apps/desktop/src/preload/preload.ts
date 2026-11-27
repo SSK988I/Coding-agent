@@ -22,6 +22,7 @@ const desktop: DesktopShell = {
     ipcRenderer.on("desktop:workbench-event", handler);
     return () => ipcRenderer.removeListener("desktop:workbench-event", handler);
   },
+  setTheme: (theme) => ipcRenderer.invoke("desktop:set-theme", theme),
   chooseWorkspace: () => ipcRenderer.invoke("desktop:choose-workspace"),
   getBootstrap: () => ipcRenderer.invoke("desktop:get-bootstrap"),
 };

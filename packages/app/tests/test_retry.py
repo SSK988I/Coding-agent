@@ -82,3 +82,21 @@ def test_retrying_stream_does_not_retry_auth_error():
     assert attempts == 1
     assert [event["type"] for event in events] == ["start", "error"]
     assert final.stop_reason == "error"
+
+
+def test_retrying_stream_finishes_when_factory_raises():
+    async def scenario():
+        def factory() -> AssistantMessageEventStream:
+            raise AssertionError("provider setup failed")
+
+        stream = retrying_stream(factory, RetryPolicy(max_retries=0))
+        async with asyncio.timeout(2):
+            events = [event async for event in stream]
+            final = await stream.result()
+        await stream.aclose()
+
+        assert events == [{"type": "error", "reason": "error", "error": final}]
+        assert final.stop_reason == "error"
+        assert final.error_message == "provider setup failed"
+
+    asyncio.run(scenario())

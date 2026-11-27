@@ -104,6 +104,39 @@ describe("desktop conversation turn changes", () => {
     expect(screen.getByRole("combobox", { name: "变更来源" })).toHaveValue("review");
   });
 
+  it("checks and retries the original edit card without reporting a planned diff as a turn change", async () => {
+    const callId = "call-original";
+    const scope = { sessionId: "session-1", assistantEntryId: "entry-original", toolCallId: callId };
+    const result = (retryable: boolean) => ({
+      role: "toolResult", tool_name: "edit", tool_call_id: callId, status: "uncertain", content: "编辑待完成",
+      details: { code: "EDIT_RECOVERY_PENDING", retryable, assistantEntryId: scope.assistantEntryId },
+    });
+    const assistant = { role: "assistant", content: [{ type: "toolCall", name: "edit", id: callId,
+      arguments: { path: "a.txt", edits: [{ oldText: "old", newText: "new" }] } }] };
+    current = { ...workspace(), messages: [assistant, result(false)], turnChanges: [] };
+    const fallback = request.getMockImplementation()!;
+    request.mockImplementation(async (method: string, params: Record<string, unknown> = {}) => {
+      if (method === "edit.check") return { ...current, messages: [assistant, result(true)] };
+      if (method === "edit.retry") {
+        const completed = { ...result(false), status: "completed", content: "原编辑已完成",
+          details: { patch: "--- a.txt\n+++ a.txt\n@@ -1 +1 @@\n-old\n+new" } };
+        return { snapshot: { ...current, messages: [assistant, completed] }, result: completed };
+      }
+      return fallback(method, params);
+    });
+    mount();
+    const check = await screen.findByRole("button", { name: "核对原编辑" });
+    expect(screen.getByText("计划修改")).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: /本轮变更/ })).not.toBeInTheDocument();
+    fireEvent.click(check);
+    const retry = await screen.findByRole("button", { name: "重试原编辑" });
+    expect(request).toHaveBeenCalledWith("edit.check", scope);
+    fireEvent.click(retry);
+    await waitFor(() => expect(screen.queryByRole("button", { name: "重试原编辑" })).not.toBeInTheDocument());
+    expect(request).toHaveBeenCalledWith("edit.retry", scope);
+    expect(request).not.toHaveBeenCalledWith("run.start", expect.anything());
+  });
+
   it("opens a clicked file from its own run and expands that file in the changes sidebar", async () => {
     mount();
     await screen.findByText("First response");

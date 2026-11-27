@@ -41,7 +41,7 @@ export function TerminalPanel({ scope, tabKey, active }: { scope: WorkbenchScope
     };
     void Promise.all([import("@xterm/xterm"), import("@xterm/addon-fit")]).then(async ([{ Terminal }, { FitAddon }]) => {
       if (disposed || !viewport.current) return;
-      const xterm = new Terminal({ fontFamily: "Cascadia Code, Consolas, monospace", fontSize: 13, cursorBlink: true, scrollback: 5000, theme: { background: "#202124", foreground: "#e8eaed" }, allowProposedApi: false });
+      const xterm = new Terminal({ fontFamily: "Cascadia Code, Consolas, monospace", fontSize: 13, cursorBlink: true, scrollback: 5000, theme: { background: "#1f2233", foreground: "#cad3f5", cursor: "#c6a0f6" }, allowProposedApi: false });
       currentTerminal = xterm;
       const addon = new FitAddon();
       xterm.loadAddon(addon); xterm.open(viewport.current);

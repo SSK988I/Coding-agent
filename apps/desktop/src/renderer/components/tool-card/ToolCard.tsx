@@ -4,6 +4,19 @@ import {
   useState,
   type ComponentType,
 } from "react";
+import {
+  ChevronDown,
+  ChevronRight,
+  Code2,
+  Cpu,
+  FilePenLine,
+  FileText,
+  GitBranch,
+  Globe,
+  Image as ImageIcon,
+  Monitor,
+  Search,
+} from "lucide-react";
 
 import "./ToolCard.css";
 import type { ToolDisplayStatus } from "../../../shared/toolStatus";
@@ -27,6 +40,7 @@ export interface ToolApproval {
  */
 export interface ToolCardData {
   id: string;
+  toolCallId?: string;
   name: string;
   args: unknown;
   result?: unknown;
@@ -60,7 +74,12 @@ export interface ToolCardProps {
   outputLimit?: Partial<ToolOutputLimit>;
   registry?: ToolRendererRegistry;
   onResolveApproval?: (approval: ToolApproval, approved: boolean) => void | Promise<void>;
+  onRecoverEdit?: (action: "check" | "retry", assistantEntryId: string, toolCallId: string) => Promise<void>;
   approvalPending?: boolean;
+  chainedPrev?: boolean;
+  chainedNext?: boolean;
+  defaultCollapsed?: boolean;
+  nested?: boolean;
 }
 
 export interface TruncatedToolOutput {
@@ -97,14 +116,6 @@ const STATUS_LABELS: Record<ToolCardStatus, string> = {
   uncertain: "结果未知",
 };
 
-const CATEGORY_ICONS: Record<ToolCategory, string> = {
-  shell: ">_",
-  read: "R",
-  write: "±",
-  search: "⌕",
-  generic: "⌁",
-};
-
 const SHELL_ALIASES = new Set([
   "bash",
   "shell",
@@ -136,6 +147,7 @@ const SEARCH_ALIASES = new Set([
   "file_search",
   "search_files",
 ]);
+const GIT_READ_ALIASES = new Set(["git_status", "git_log", "git_diff", "git_show"]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -405,6 +417,33 @@ function toolPath(tool: ToolCardData, diff?: DiffPreview): string | undefined {
   ]) ?? (diff ? pathFromDiff(diff.text) : undefined);
 }
 
+/**
+ * Lightweight args-only summary for the collapsed header row.
+ * Never reads `tool.result` so memoized OutputBlock formatting runs once.
+ */
+function argsHeaderHint(tool: ToolCardData): string | undefined {
+  if (!isRecord(tool.args)) return undefined;
+  const cmd = directValue(tool.args, ["command", "cmd", "script"]);
+  if (typeof cmd === "string" && cmd.trim()) return cmd.trim().split(/\r?\n/, 1)[0];
+  const path = directValue(tool.args, ["path", "file", "filePath", "file_path", "targetPath", "target_path"]);
+  if (typeof path === "string" && path.trim()) return path.trim();
+  const query = directValue(tool.args, ["query", "pattern", "search", "glob"]);
+  if (typeof query === "string" && query.trim()) return query.trim();
+  return undefined;
+}
+
+function ToolCategoryIcon({ name, category }: { name: string; category: ToolCategory }) {
+  const normalized = normalizeToolName(name);
+  if (normalized === "view_image") return <ImageIcon size={15} strokeWidth={1.55} />;
+  if (normalized === "web_search") return <Globe size={15} strokeWidth={1.55} />;
+  if (GIT_READ_ALIASES.has(normalized)) return <GitBranch size={15} strokeWidth={1.55} />;
+  if (category === "shell") return <Monitor size={15} strokeWidth={1.55} />;
+  if (category === "read") return <FileText size={15} strokeWidth={1.55} />;
+  if (category === "write") return <FilePenLine size={15} strokeWidth={1.55} />;
+  if (category === "search") return <Search size={15} strokeWidth={1.55} />;
+  return <Cpu size={15} strokeWidth={1.55} />;
+}
+
 function OutputBlock({
   value,
   limit,
@@ -449,7 +488,7 @@ function ShellToolRenderer({ tool, cwd, outputLimit }: ToolRendererProps) {
       </dl>
 
       <div className="tool-card-view__output-header">
-        <span>终端输出</span>
+        <span>纯文本 · 终端输出</span>
         <div className="tool-card-view__output-actions">
           {expanded && preview.truncated && (
             <button type="button" onClick={() => setShowFullOutput((value) => !value)}>
@@ -505,7 +544,7 @@ function ImageToolRenderer({ tool, outputLimit }: ToolRendererProps) {
         <span>图片</span>
         <code title={path}>{path ?? "未知路径"}</code>
       </div>
-      {blocks.length > 0 && <p>已返回 {blocks.length} 张图片。</p>}
+      {blocks.length > 0 && <p className="tool-card-view__caption">已返回 {blocks.length} 张图片。</p>}
       {images.length > 0 && <MessageImages images={images} />}
       {text && <OutputBlock value={text} limit={outputLimit} />}
       {!text && blocks.length === 0 && <div className="tool-card-view__empty">等待图片内容…</div>}
@@ -513,12 +552,12 @@ function ImageToolRenderer({ tool, outputLimit }: ToolRendererProps) {
   );
 }
 
-function DiffView({ preview }: { preview: DiffPreview }) {
+function DiffView({ preview, planned = false }: { preview: DiffPreview; planned?: boolean }) {
   const lines = useMemo(() => parseUnifiedDiff(preview.text), [preview.text]);
   return (
     <div className="tool-card-view__diff" role="region" aria-label="文件差异">
       <div className="tool-card-view__diff-toolbar">
-        <span>Unified diff</span>
+        <span>{planned ? "计划修改" : "Unified diff"}</span>
         {preview.source === "generated" && <small>根据工具参数生成预览</small>}
       </div>
       <code>
@@ -549,7 +588,7 @@ function WriteToolRenderer({ tool, outputLimit }: ToolRendererProps) {
         <OutputBlock value={summary} limit={outputLimit} className="tool-card-view__output--summary" />
       )}
       {preview
-        ? <DiffView preview={preview} />
+        ? <DiffView preview={preview} planned={tool.name === "edit" && tool.status !== "done"} />
         : <div className="tool-card-view__empty">暂无可展示的差异</div>}
     </div>
   );
@@ -566,6 +605,77 @@ function SearchToolRenderer({ tool, outputLimit }: ToolRendererProps) {
         <div><dt>范围</dt><dd>{path ?? "当前工作区"}{glob && glob !== pattern ? ` · ${glob}` : ""}</dd></div>
       </dl>
       <OutputBlock value={tool.result} limit={outputLimit} emptyText="等待检索结果…" />
+    </div>
+  );
+}
+
+interface WebSearchItem {
+  title: string;
+  url: string;
+  snippet?: string;
+  source?: string;
+}
+
+function extractWebSearchItems(value: unknown): WebSearchItem[] {
+  if (!isRecord(value)) return [];
+  const details = isRecord(value.details) ? value.details : value;
+  const rawResults = details.results;
+  if (!Array.isArray(rawResults)) return [];
+  return rawResults.flatMap((entry): WebSearchItem[] => {
+    if (!isRecord(entry)) return [];
+    const title = typeof entry.title === "string" ? entry.title : "";
+    const url = typeof entry.url === "string" ? entry.url : "";
+    if (!title || !/^https?:\/\//i.test(url)) return [];
+    return [{
+      title,
+      url,
+      snippet: typeof entry.snippet === "string" ? entry.snippet : undefined,
+      source: typeof entry.source === "string" ? entry.source : undefined,
+    }];
+  });
+}
+
+function WebSearchToolRenderer({ tool, outputLimit }: ToolRendererProps) {
+  const query = findString([tool.args], ["query", "pattern", "search"]);
+  const results = useMemo(() => extractWebSearchItems(tool.result), [tool.result]);
+  return (
+    <div className="tool-card-view__body">
+      <div className="tool-card-view__resource-row">
+        <span>联网检索</span>
+        <code title={query}>{query ?? "未提供查询词"}</code>
+        {results.length > 0 && <small>{results.length} 条来源</small>}
+      </div>
+      {results.length > 0 ? (
+        <ul className="tool-card-view__sources">
+          {results.map((item, index) => (
+            <li key={`${item.url}-${index}`}>
+              <div className="tool-card-view__source-title">{item.title}</div>
+              <div className="tool-card-view__source-url">{item.url}</div>
+              {item.snippet && <p className="tool-card-view__source-snippet">{item.snippet}</p>}
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <OutputBlock value={tool.result} limit={outputLimit} emptyText="正在联网检索…" />
+      )}
+    </div>
+  );
+}
+
+function GitToolRenderer({ tool, outputLimit }: ToolRendererProps) {
+  const diff = useMemo(() => diffFromStringValue(tool.result), [tool.result]);
+  const target = toolPath(tool);
+  return (
+    <div className="tool-card-view__body">
+      {target && (
+        <div className="tool-card-view__resource-row">
+          <span>Git</span>
+          <code title={target}>{target}</code>
+        </div>
+      )}
+      {diff
+        ? <DiffView preview={{ text: diff, source: "result" }} />
+        : <OutputBlock value={tool.result} limit={outputLimit} emptyText="等待 Git 输出…" />}
     </div>
   );
 }
@@ -591,11 +701,25 @@ export const BUILTIN_TOOL_RENDERERS: readonly ToolRendererDefinition[] = [
     priority: 110,
   },
   {
+    id: "web-search",
+    category: "search",
+    matches: (name) => normalizeToolName(name) === "web_search",
+    component: WebSearchToolRenderer,
+    priority: 105,
+  },
+  {
     id: "shell",
     category: "shell",
     matches: (name) => classifyToolName(name) === "shell",
     component: ShellToolRenderer,
     priority: 100,
+  },
+  {
+    id: "git-read",
+    category: "read",
+    matches: (name) => GIT_READ_ALIASES.has(normalizeToolName(name)),
+    component: GitToolRenderer,
+    priority: 95,
   },
   {
     id: "read",
@@ -666,13 +790,90 @@ export class ToolRendererRegistry {
 
 export const defaultToolRendererRegistry = new ToolRendererRegistry();
 
+function statusTone(status: ToolCardStatus): "ok" | "warn" | "err" | "idle" {
+  if (status === "done") return "ok";
+  if (status === "approval" || status === "uncertain" || status === "pending") return "warn";
+  if (status === "error" || status === "timed_out" || status === "blocked") return "err";
+  return "idle";
+}
+
+export function isFileReadTool(toolName: string): boolean {
+  const normalized = normalizeToolName(toolName);
+  if (normalized === "view_image" || GIT_READ_ALIASES.has(normalized)) return false;
+  return classifyToolName(toolName) === "read";
+}
+
+const GENERIC_FILENAMES = new Set([
+  "index.ts",
+  "index.tsx",
+  "index.js",
+  "index.jsx",
+  "index.py",
+  "__init__.py",
+  "mod.rs",
+  "main.ts",
+  "main.py",
+  "readme.md",
+  "agents.md",
+  "package.json",
+]);
+
+function compactDisplayPath(value: string): string {
+  const normalized = value.replaceAll("\\", "/").replace(/\/+$/, "");
+  const parts = normalized.split("/").filter(Boolean);
+  if (parts.length <= 1) return value;
+  const base = parts[parts.length - 1];
+  if (GENERIC_FILENAMES.has(base.toLowerCase()) && parts.length >= 2) {
+    return parts.slice(-2).join("/");
+  }
+  return base;
+}
+
+function nestedToolTitle(tool: ToolCardData, hint: string | undefined): { label: string; tooltip?: string } {
+  const normalized = normalizeToolName(tool.name);
+  const category = classifyToolName(tool.name);
+
+  if (normalized === "view_image") {
+    return { label: hint ? `查看图片 ${compactDisplayPath(hint)}` : "查看图片", tooltip: hint };
+  }
+  if (normalized === "web_search") {
+    return { label: hint ? `联网检索 "${hint}"` : "联网检索", tooltip: hint };
+  }
+  if (GIT_READ_ALIASES.has(normalized)) {
+    return { label: hint ? `${tool.name} ${compactDisplayPath(hint)}` : tool.name, tooltip: hint };
+  }
+  if (normalized === "ls" || normalized === "list_dir" || normalized === "list_files") {
+    return { label: hint ? `浏览目录 ${compactDisplayPath(hint)}` : "浏览目录", tooltip: hint };
+  }
+  if (category === "read") {
+    return { label: hint ? `读取 ${compactDisplayPath(hint)}` : "读取文件", tooltip: hint };
+  }
+  if (category === "write") {
+    const verb = normalized.includes("write") ? "写入" : "编辑";
+    return { label: hint ? `${verb} ${compactDisplayPath(hint)}` : `${verb}文件`, tooltip: hint };
+  }
+  if (category === "shell") {
+    return { label: hint || "运行终端命令", tooltip: hint };
+  }
+  if (category === "search") {
+    const verb = normalized === "glob" || normalized === "find" || normalized.includes("file") ? "查找" : "搜索";
+    return { label: hint ? `${verb} ${verb === "搜索" ? `"${hint}"` : hint}` : `${verb}工作区`, tooltip: hint };
+  }
+  return { label: hint ? `${tool.name} ${hint}` : tool.name, tooltip: hint };
+}
+
 export const ToolCard = memo(function ToolCard({
   tool,
   cwd,
   outputLimit,
   registry = defaultToolRendererRegistry,
   onResolveApproval,
+  onRecoverEdit,
   approvalPending = false,
+  chainedPrev = false,
+  chainedNext = false,
+  defaultCollapsed = false,
+  nested = false,
 }: ToolCardProps) {
   const renderer = registry.resolve(tool.name);
   const Renderer = renderer.component;
@@ -681,50 +882,170 @@ export const ToolCard = memo(function ToolCard({
     maxLines: outputLimit?.maxLines ?? DEFAULT_OUTPUT_LIMIT.maxLines,
   }), [outputLimit?.maxCharacters, outputLimit?.maxLines]);
 
+  const [userToggled, setUserToggled] = useState(false);
+  const [collapsed, setCollapsed] = useState(defaultCollapsed);
+  const [showRawArgs, setShowRawArgs] = useState(false);
+  const [recovering, setRecovering] = useState(false);
+  const details = isRecord(tool.result) && isRecord(tool.result.details) ? tool.result.details : undefined;
+  const recoveryEntry = tool.name === "edit" && tool.status === "uncertain"
+    && details?.code === "EDIT_RECOVERY_PENDING" && typeof details.assistantEntryId === "string"
+    ? details.assistantEntryId : undefined;
+  const attentionError = tool.status === "error" || tool.status === "blocked" || tool.status === "timed_out";
+  const isOpen = Boolean(tool.approval) || (userToggled ? !collapsed : (!defaultCollapsed || attentionError || Boolean(recoveryEntry)));
+  const hint = useMemo(() => argsHeaderHint(tool), [tool.args]);
+  const nestedSummary = useMemo(
+    () => (nested ? nestedToolTitle(tool, hint) : null),
+    [nested, tool.name, hint],
+  );
+  const tone = statusTone(tool.status);
+  const hasArgs = tool.args !== undefined && tool.args !== null
+    && !(isRecord(tool.args) && Object.keys(tool.args).length === 0);
+
+  const rawArgsText = useMemo(() => {
+    if (!showRawArgs) return "";
+    try {
+      return JSON.stringify(tool.args, null, 2) ?? String(tool.args);
+    } catch {
+      return String(tool.args);
+    }
+  }, [showRawArgs, tool.args]);
+
   const resolveApproval = (approved: boolean) => {
     if (!tool.approval || !onResolveApproval) return;
     void onResolveApproval(tool.approval, approved);
   };
 
+  const railToneClass = tool.status === "approval"
+    ? "thread-rail--warn"
+    : attentionError
+      ? "thread-rail--err"
+      : "";
+
+  const needsInlineAttention = nested && tool.status !== "done";
+  const emphasizeTrigger = nested && (tool.status === "approval" || attentionError);
+
   return (
     <section
-      className={`tool-card-view tool-card-view--${tool.status}`}
+      className={[
+        "tool-card-view",
+        `tool-card-view--${tool.status}`,
+        nested ? "tool-card-view--nested" : "",
+        "thread-node",
+        chainedPrev ? "thread-node--chained-prev" : "",
+        chainedNext ? "thread-node--chained-next" : "",
+      ].filter(Boolean).join(" ")}
       data-tool-category={renderer.category}
       data-tool-name={tool.name}
       aria-busy={tool.status === "running"}
     >
       <header className="tool-card-view__header">
-        <span className="tool-card-view__icon" aria-hidden="true">{CATEGORY_ICONS[renderer.category]}</span>
-        <strong>{tool.name}</strong>
-        <span className={`tool-card-view__status tool-card-view__status--${tool.status}`}>
-          {STATUS_LABELS[tool.status]}
-        </span>
+        <button
+          type="button"
+          className={`thread-trigger tool-card-view__toggle ${emphasizeTrigger ? "tool-card-view__toggle--attention" : ""}`.trim()}
+          aria-expanded={isOpen}
+          title={nestedSummary?.tooltip}
+          onClick={() => {
+            setUserToggled(true);
+            setCollapsed(isOpen);
+          }}
+        >
+          <span className="thread-trigger__icon" aria-hidden="true">
+            <ToolCategoryIcon name={tool.name} category={renderer.category} />
+          </span>
+          {nested && nestedSummary ? (
+            <span className="thread-trigger__label">{nestedSummary.label}</span>
+          ) : (
+            <>
+              <strong className="thread-trigger__title">{tool.name}</strong>
+              {!isOpen && hint && <span className="thread-trigger__summary" title={hint}>{hint}</span>}
+            </>
+          )}
+          {needsInlineAttention && (
+            <span className={`tool-card-view__inline-status tool-card-view__status--${tool.status}`}>
+              <span
+                className={`status-dot ${tone === "idle" ? "" : `status-dot--${tone}`} ${tool.status === "running" || tool.status === "pending" ? "status-dot--pulse" : ""}`.trim()}
+                aria-hidden="true"
+              />
+              {STATUS_LABELS[tool.status]}
+            </span>
+          )}
+          <span className="thread-trigger__chevron" aria-hidden="true">
+            {isOpen ? <ChevronDown size={14} strokeWidth={1.5} /> : <ChevronRight size={14} strokeWidth={1.5} />}
+          </span>
+        </button>
+
+        {!nested && (
+          <span className={`tool-card-view__status tool-card-view__status--${tool.status}`}>
+            <span
+              className={`status-dot ${tone === "idle" ? "" : `status-dot--${tone}`} ${tool.status === "running" ? "status-dot--pulse" : ""}`.trim()}
+              aria-hidden="true"
+            />
+            {STATUS_LABELS[tool.status]}
+          </span>
+        )}
       </header>
 
-      <Renderer tool={tool} cwd={cwd} outputLimit={resolvedOutputLimit} />
+      {isOpen && (
+        <div className={`thread-rail ${railToneClass}`.trim()}>
+          <div className="thread-box tool-card-view__box">
+            <Renderer tool={tool} cwd={cwd} outputLimit={resolvedOutputLimit} />
+            {recoveryEntry && tool.toolCallId && onRecoverEdit && (
+              <button type="button" disabled={recovering} className="tool-card-view__approval-accept"
+                onClick={async () => {
+                  setRecovering(true);
+                  try {
+                    await onRecoverEdit(details?.retryable === true ? "retry" : "check", recoveryEntry, tool.toolCallId!);
+                  } finally {
+                    setRecovering(false);
+                  }
+                }}>
+                {details?.retryable === true ? "重试原编辑" : "核对原编辑"}
+              </button>
+            )}
 
-      {tool.approval && (
-        <footer className="tool-card-view__approval">
-          <span>该操作需要你的确认</span>
-          <div>
-            <button
-              type="button"
-              className="tool-card-view__approval-reject"
-              disabled={approvalPending}
-              onClick={() => resolveApproval(false)}
-            >
-              拒绝
-            </button>
-            <button
-              type="button"
-              className="tool-card-view__approval-accept"
-              disabled={approvalPending}
-              onClick={() => resolveApproval(true)}
-            >
-              允许一次
-            </button>
+            {tool.approval && (
+              <footer className="tool-card-view__approval">
+                <span>该操作需要你的确认</span>
+                <div>
+                  <button
+                    type="button"
+                    className="tool-card-view__approval-reject"
+                    disabled={approvalPending}
+                    onClick={() => resolveApproval(false)}
+                  >
+                    拒绝
+                  </button>
+                  <button
+                    type="button"
+                    className="tool-card-view__approval-accept"
+                    disabled={approvalPending}
+                    onClick={() => resolveApproval(true)}
+                  >
+                    允许一次
+                  </button>
+                </div>
+              </footer>
+            )}
           </div>
-        </footer>
+
+          {hasArgs && (
+            <div className="tool-card-view__raw-wrap">
+              <button
+                type="button"
+                className="thread-code-toggle"
+                aria-expanded={showRawArgs}
+                title={showRawArgs ? "隐藏原始参数" : "查看原始工具参数"}
+                onClick={() => setShowRawArgs((value) => !value)}
+              >
+                <Code2 size={13} strokeWidth={1.6} aria-hidden="true" />
+                {showRawArgs && <span>收起参数</span>}
+              </button>
+              {showRawArgs && (
+                <pre className="tool-card-view__output tool-card-view__raw-args">{rawArgsText}</pre>
+              )}
+            </div>
+          )}
+        </div>
       )}
     </section>
   );

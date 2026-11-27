@@ -11,22 +11,27 @@ Includes the robustness features:
     the original ending (CRLF/LF) and BOM on write-back.
   - Fuzzy match fallback: when an exact match fails, normalize (NFKC + trim
     trailing whitespace + smart-quote/dash/unicode-space → ASCII) and retry.
-  - Per-realpath asyncio lock shared with ``write`` (see ``_mutation``) to
-    serialize concurrent edits/writes to the same file.
+  - A path lock shared with ``write`` across Agent processes, plus version
+    checks and an atomic replacement of the complete edited file.
 
 This tool operates on the local filesystem.
 """
 from __future__ import annotations
 
 import difflib
+import hashlib
 import json
 import os
+import stat
+import sys
+import tempfile
 import unicodedata
+from dataclasses import dataclass
 from typing import Any
 
 from agent_llm import TextContent
 
-from agent_core.tools._mutation import file_mutation_lock
+from agent_core.tools._mutation import edit_conflict, file_mutation_lock, resolved_mutation_path
 from agent_core.types import AgentToolResult, PlanAccess
 
 EDIT_SCHEMA: dict = {
@@ -34,10 +39,12 @@ EDIT_SCHEMA: dict = {
     "properties": {
         "path": {
             "type": "string",
+            "minLength": 1,
             "description": "Path to the file to edit (relative or absolute).",
         },
         "edits": {
             "type": "array",
+            "minItems": 1,
             "description": (
                 "One or more targeted replacements. Each edit is matched "
                 "against the original file, not incrementally. Do not include "
@@ -49,6 +56,7 @@ EDIT_SCHEMA: dict = {
                 "properties": {
                     "oldText": {
                         "type": "string",
+                            "minLength": 1,
                         "description": (
                             "Exact text for one targeted replacement. Must be "
                             "unique in the original file and must not overlap "
@@ -201,6 +209,8 @@ def _normalize_edits_params(params: dict) -> tuple[str, list[dict]]:
       C) edits as a JSON string            → re-parse
     """
     path = params["path"]
+    if not isinstance(path, str) or not path:
+        raise ValueError("path must be a non-empty string.")
     edits = params.get("edits")
 
     # Case C: edits is a JSON string (some models serialize arrays).
@@ -223,6 +233,8 @@ def _normalize_edits_params(params: dict) -> tuple[str, list[dict]]:
     for e in edits:
         if not isinstance(e, dict) or "oldText" not in e or "newText" not in e:
             raise ValueError("Each edit must have oldText and newText.")
+        if not isinstance(e["oldText"], str) or not isinstance(e["newText"], str):
+            raise ValueError("oldText and newText must be strings.")
         normalized.append({"oldText": e["oldText"], "newText": e["newText"]})
     return path, normalized
 
@@ -293,7 +305,119 @@ def _apply_edits(
     return result
 
 
+FileVersion = tuple[int, int, int, int]
+
+
+@dataclass(frozen=True)
+class PreparedEdit:
+    source_path: str
+    resolved_path: str
+    version: FileVersion
+    before_hash: str
+    after_hash: str
+    new_bytes: bytes
+    result: AgentToolResult
+
+
+def _version(st: os.stat_result) -> FileVersion:
+    return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns
+
+
+def _read_target(source: str, *, writable: bool = False) -> tuple[str, os.stat_result, bytes]:
+    resolved = resolved_mutation_path(source)
+    if not stat.S_ISREG(os.stat(resolved).st_mode):
+        raise edit_conflict(source, "target is not a regular file")
+    flags = os.O_RDWR if writable else os.O_RDONLY
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    with os.fdopen(os.open(resolved, flags), "rb") as file:
+        before = os.fstat(file.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            raise edit_conflict(source, "target is not a regular file")
+        if writable and before.st_nlink != 1:
+            raise edit_conflict(source, "cannot replace a file with multiple hard links")
+        raw = file.read()
+        if _version(before) != _version(os.fstat(file.fileno())):
+            raise edit_conflict(source, "file changed during read")
+    if resolved != resolved_mutation_path(source) or _version(before) != _version(os.stat(resolved)):
+        raise edit_conflict(source, "target changed during read")
+    return resolved, before, raw
+
+
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes
+
+    _security = ctypes.WinDLL("advapi32", use_last_error=True)
+    _security.GetFileSecurityW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+    ]
+    _security.SetFileSecurityW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p]
+
+    def _windows_permissions(path: str) -> bytes:
+        # Self-relative descriptor containing owner, group, and DACL.
+        size = wintypes.DWORD()
+        _security.GetFileSecurityW(path, 7, None, 0, ctypes.byref(size))
+        if not size.value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        buffer = ctypes.create_string_buffer(size.value)
+        if not _security.GetFileSecurityW(path, 7, buffer, size, ctypes.byref(size)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return buffer.raw
+
+
+def _copy_access(source: str, destination: str, metadata: os.stat_result) -> None:
+    """Apply the original access restrictions to the replacement."""
+    if os.name == "nt":
+        expected = _windows_permissions(source)
+        if _windows_permissions(destination) != expected:
+            # Control bits of a self-relative SECURITY_DESCRIPTOR start at byte 2.
+            protected = int.from_bytes(expected[2:4], "little") & 0x1000
+            dacl_flags = 4 | (0x80000000 if protected else 0x20000000)
+            if not _security.SetFileSecurityW(destination, dacl_flags, expected):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if _windows_permissions(destination) != expected:
+                raise PermissionError(f"Cannot preserve owner, group, and access permissions of {source}.")
+        encrypted = stat.FILE_ATTRIBUTE_ENCRYPTED
+        if (metadata.st_file_attributes ^ os.stat(destination).st_file_attributes) & encrypted:
+            raise PermissionError(f"Cannot preserve file encryption of {source}.")
+        return
+
+    if sys.platform == "darwin":
+        import ctypes as c
+
+        # Darwin's copyfile copies the ACL and POSIX metadata with COPYFILE_SECURITY.
+        copyfile = c.CDLL(None, use_errno=True).copyfile
+        if copyfile(os.fsencode(source), os.fsencode(destination), None, 0x3) != 0:
+            code = c.get_errno()
+            raise OSError(code, os.strerror(code), source)
+        return
+
+    staged = os.stat(destination)
+    if metadata.st_mode & (stat.S_ISUID | stat.S_ISGID):
+        raise PermissionError(f"Cannot preserve privileged execution bits while editing {source}.")
+    if (metadata.st_uid, metadata.st_gid) != (staged.st_uid, staged.st_gid):
+        os.chown(destination, metadata.st_uid, metadata.st_gid)
+    if hasattr(os, "listxattr"):
+        original = {k: os.getxattr(source, k) for k in os.listxattr(source)}
+        if "security.capability" in original:
+            raise PermissionError(f"Cannot preserve executable capabilities while editing {source}.")
+        staged_attrs = {k: os.getxattr(destination, k) for k in os.listxattr(destination)}
+        for key in staged_attrs.keys() - original.keys():
+            os.removexattr(destination, key)
+        for key, value in original.items():
+            if staged_attrs.get(key) != value:
+                os.setxattr(destination, key, value)
+    os.chmod(destination, stat.S_IMODE(metadata.st_mode))
+
+
 # ─── tool ──────────────────────────────────────────────────────────────
+
+def _preserve_access(source: str, destination: str, metadata: os.stat_result) -> None:
+    try:
+        _copy_access(source, destination, metadata)
+    except OSError as exc:
+        raise edit_conflict(source, f"cannot preserve access permissions ({exc})") from exc
+
 
 class EditTool:
     """Edit a file via exact text replacement (one or more disjoint edits).
@@ -341,20 +465,24 @@ class EditTool:
         full_path = path if os.path.isabs(path) else os.path.join(self.cwd, path)
         full_path = os.path.normpath(full_path)
 
-        if not os.path.isfile(full_path):
-            raise FileNotFoundError(f"Could not edit file: {path}. File not found.")
+        async with file_mutation_lock(full_path) as locked_path:
+            prepared = self.prepare_edit(path, edits)
+            if prepared.resolved_path != locked_path:
+                raise edit_conflict(path, "target no longer matches the locked path")
+            self.commit_edit(prepared)
+            return prepared.result
 
-        # Serialize per-realpath (shared with write via _mutation).
-        async with file_mutation_lock(full_path):
-            return self._do_edit(full_path, path, edits)
+    def inspect_file(self, path: str) -> tuple[str, FileVersion, str]:
+        resolved, metadata, raw = _read_target(os.path.join(self.cwd, path))
+        return resolved, _version(metadata), hashlib.sha256(raw).hexdigest()
 
-    def _do_edit(self, full_path: str, path: str, edits: list[dict]) -> AgentToolResult:
-        # Read.
+    def prepare_edit(self, path: str, edits: list[dict]) -> PreparedEdit:
+        """Read and compute the original result without modifying the filesystem."""
+        source = os.path.abspath(os.path.join(self.cwd, path))
         try:
-            with open(full_path, "rb") as f:
-                raw_bytes = f.read()
-        except OSError as e:
-            raise RuntimeError(f"Could not edit file: {path}. {e}") from e
+            resolved, metadata, raw_bytes = _read_target(source, writable=True)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(f"Could not edit file: {path}. File not found.") from exc
 
         raw = raw_bytes.decode("utf-8")
         text_no_bom, had_bom = _strip_bom(raw)
@@ -364,15 +492,11 @@ class EditTool:
         # Apply edits.
         new_content_lf = _apply_edits(content_lf, edits, path)
 
-        # Restore line endings + BOM, write back.
+        # The hashes describe the exact on-disk bytes, including BOM and CRLF.
         final = _restore_line_endings(new_content_lf, line_ending)
         if had_bom:
             final = _BOM + final
-        try:
-            with open(full_path, "w", encoding="utf-8", newline="") as f:
-                f.write(final)
-        except OSError as e:
-            raise RuntimeError(f"Failed to write {path}: {e}") from e
+        new_bytes = final.encode("utf-8")
 
         # Build a unified diff for details.
         diff_lines = list(difflib.unified_diff(
@@ -385,7 +509,64 @@ class EditTool:
         patch = "\n".join(diff_lines)
 
         summary = f"Successfully replaced {len(edits)} block(s) in {path}."
-        return AgentToolResult(
+        result = AgentToolResult(
             content=[TextContent(text=summary)],
             details={"patch": patch},
         )
+        return PreparedEdit(
+            source, resolved, _version(metadata), hashlib.sha256(raw_bytes).hexdigest(),
+            hashlib.sha256(new_bytes).hexdigest(), new_bytes, result,
+        )
+
+    def commit_edit(self, prepared: PreparedEdit) -> None:
+        """Stage a complete file, revalidate the original, then atomically replace it."""
+        target = prepared.resolved_path
+
+        def original_metadata() -> os.stat_result:
+            try:
+                resolved, metadata, raw = _read_target(prepared.source_path, writable=True)
+            except (FileNotFoundError, NotADirectoryError) as exc:
+                raise edit_conflict(prepared.source_path, "original target disappeared") from exc
+            if (resolved != target or _version(metadata) != prepared.version
+                    or hashlib.sha256(raw).hexdigest() != prepared.before_hash):
+                raise edit_conflict(prepared.source_path, "original file or contents changed")
+            return metadata
+
+        try:
+            before = os.stat(target)
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            raise edit_conflict(prepared.source_path, "original target disappeared") from exc
+        if _version(before) != prepared.version or resolved_mutation_path(prepared.source_path) != target:
+            raise edit_conflict(prepared.source_path, "original target changed")
+        fd, staged = tempfile.mkstemp(dir=os.path.dirname(target), prefix=".coding-agent-edit-")
+        staged_identity = os.fstat(fd)
+        replaced = False
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                if os.name == "nt":
+                    # A newly created Windows file inherits its directory ACL.
+                    _preserve_access(target, staged, before)
+                stream.write(prepared.new_bytes)
+                stream.flush()
+                if os.name != "nt":
+                    # mkstemp starts with mode 0600. Copy the final permissions
+                    # after writing so write() cannot clear special mode bits.
+                    _preserve_access(target, staged, before)
+                os.fsync(stream.fileno())
+            current = original_metadata()
+            if (current.st_mode != before.st_mode
+                    or (os.name != "nt" and current.st_ctime_ns != before.st_ctime_ns)):
+                raise edit_conflict(prepared.source_path, "file metadata changed during staging")
+            if os.name == "nt" and _windows_permissions(target) != _windows_permissions(staged):
+                raise edit_conflict(prepared.source_path, "file access permissions changed during staging")
+            if not os.path.samestat(staged_identity, os.lstat(staged)):
+                raise edit_conflict(prepared.source_path, "staging file was replaced")
+            os.replace(staged, target)
+            replaced = True
+        finally:
+            if not replaced:
+                try:
+                    if os.path.samestat(staged_identity, os.lstat(staged)):
+                        os.unlink(staged)
+                except FileNotFoundError:
+                    pass

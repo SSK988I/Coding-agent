@@ -1,10 +1,24 @@
-import type { SubagentTaskPayload } from "../../shared/types";
 import { useRef, useState } from "react";
+import { GitBranch, Square } from "lucide-react";
+import type { SubagentTaskPayload } from "../../shared/types";
 
 const LABELS: Record<SubagentTaskPayload["status"], string> = {
-  queued: "等待启动", running: "调查中", completed: "报告已返回", failed: "失败",
-  cancelled: "已停止", timed_out: "已超时", uncertain: "结果未知",
+  queued: "等待启动",
+  running: "调查中",
+  completed: "报告已返回",
+  failed: "失败",
+  cancelled: "已停止",
+  timed_out: "已超时",
+  uncertain: "结果未知",
 };
+
+function taskDotClass(status: SubagentTaskPayload["status"]): string {
+  if (status === "completed") return "status-dot status-dot--ok";
+  if (status === "running" || status === "queued") return "status-dot status-dot--pulse";
+  if (status === "failed" || status === "timed_out") return "status-dot status-dot--err";
+  if (status === "uncertain") return "status-dot status-dot--warn";
+  return "status-dot";
+}
 
 export function SubagentPanel({ tasks, onCancel, onReview, disabled = false }: {
   tasks: SubagentTaskPayload[];
@@ -21,25 +35,59 @@ export function SubagentPanel({ tasks, onCancel, onReview, disabled = false }: {
     try { await action(); }
     finally { busy.current = false; setPending(false); }
   };
+
   return (
     <section className="subagent-panel" aria-label="只读子代理">
-      <h3>只读子代理</h3>
-      {onReview && <button className="ghost-button" type="button" disabled={pending || disabled} onClick={() => void request(onReview)}>只读复核当前计划</button>}
+      <div className="subagent-panel__header">
+        <h3>只读子代理</h3>
+        {onReview && (
+          <button
+            className="ghost-button subagent-panel__review-btn"
+            type="button"
+            disabled={pending || disabled}
+            onClick={() => void request(onReview)}
+          >
+            只读复核当前计划
+          </button>
+        )}
+      </div>
       {pending && <p role="status">正在请求…</p>}
-      {!tasks.length && <p>可用 /subagents spawn 任务说明 启动独立调查。</p>}
+      {!tasks.length && <p className="subagent-panel__empty">可用 /subagents spawn 任务说明 启动独立调查。</p>}
       {tasks.map((task) => (
         <details key={task.taskId} className="subagent-task">
-          <summary>{task.purpose === "review" ? "审查" : "调查"} · {LABELS[task.status] ?? "结果未知"}
+          <summary>
+            <div className="subagent-task__head">
+              <span className="thread-trigger__icon" aria-hidden="true">
+                <GitBranch size={13} strokeWidth={1.55} />
+              </span>
+              <span className={taskDotClass(task.status)} aria-hidden="true" />
+              <strong className="subagent-task__status">
+                {task.purpose === "review" ? "审查" : "调查"} · {LABELS[task.status] ?? "结果未知"}
+              </strong>
+            </div>
             <span>{task.prompt.slice(0, 60)}</span>
           </summary>
-          <details className="subagent-brief"><summary>任务说明</summary><p>{task.prompt}</p></details>
-          <small>{task.taskId} · {task.turns}/{task.maxTurns} 轮{task.lastTool ? ` · ${task.lastTool}` : ""}</small>
-          {(task.status === "queued" || task.status === "running") && (
-            <button className="ghost-button" type="button" disabled={pending || disabled} onClick={() => void request(() => onCancel(task.taskId))}>停止子代理</button>
-          )}
-          {task.error && <p role="status">{task.error}</p>}
-          {task.output && <pre>{task.output}</pre>}
-          {task.status === "completed" && <small>报告结束不代表结论已验证；请核对证据。</small>}
+          <div className="thread-rail subagent-task__rail">
+            <details className="subagent-brief">
+              <summary>任务说明</summary>
+              <p>{task.prompt}</p>
+            </details>
+            <small>{task.taskId} · {task.turns}/{task.maxTurns} 轮{task.lastTool ? ` · ${task.lastTool}` : ""}</small>
+            {(task.status === "queued" || task.status === "running") && (
+              <button
+                className="ghost-button subagent-task__stop"
+                type="button"
+                disabled={pending || disabled}
+                onClick={() => void request(() => onCancel(task.taskId))}
+              >
+                <Square size={11} strokeWidth={1.8} aria-hidden="true" />
+                停止子代理
+              </button>
+            )}
+            {task.error && <p role="status">{task.error}</p>}
+            {task.output && <pre>{task.output}</pre>}
+            {task.status === "completed" && <small>报告结束不代表结论已验证；请核对证据。</small>}
+          </div>
         </details>
       ))}
     </section>

@@ -1,3 +1,4 @@
+import { BarChart3 } from "lucide-react";
 import type { SessionStats } from "../../shared/types";
 
 const percentage = new Intl.NumberFormat("en-US", { maximumFractionDigits: 1 });
@@ -61,9 +62,7 @@ export function UsageMetrics({ stats, onOpenAnalysis }: { stats?: SessionStats; 
       </span>
       {onOpenAnalysis && <button type="button" className="usage-analysis-trigger"
         aria-label="查看用量分析" onClick={onOpenAnalysis}>
-        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden="true">
-          <path d="M2 2v11h12M5 10V7m4 3V4m4 6V6" />
-        </svg>
+        <BarChart3 size={13} strokeWidth={1.6} aria-hidden="true" />
         用量分析
       </button>}
     </section>

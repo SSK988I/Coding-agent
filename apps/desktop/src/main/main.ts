@@ -134,7 +134,7 @@ function requestSidecar(method: string, params: Record<string, unknown> = {}): P
     const timeout = setTimeout(() => {
       pending.delete(id);
       reject(new Error(`RPC timeout: ${method}`));
-    }, 120_000);
+    }, method === "edit.retry" || method === "edit.check" ? 130_000 : 120_000); // Allow the 120-second approval window to return its decision.
     pending.set(id, { resolve, reject, timeout });
     sidecar!.stdin.write(`${JSON.stringify({ v: 1, id, method, params })}\n`, "utf8");
   });
@@ -152,12 +152,12 @@ function createWindow(): void {
     height: 920,
     minWidth: 980,
     minHeight: 640,
-    backgroundColor: "#fbfaf8",
+    backgroundColor: "#24273a",
     titleBarStyle: "hidden",
     titleBarOverlay: {
-      color: "#fbfaf8",
-      symbolColor: "#4e4b46",
-      height: 54,
+      color: "#2e3042",
+      symbolColor: "#a5adcb",
+      height: 48,
     },
     webPreferences: {
       preload: path.join(__dirname, "..", "preload", "preload.js"),
@@ -166,7 +166,25 @@ function createWindow(): void {
       sandbox: true,
     },
   });
+    if (!app.isPackaged) {
+    const wc = mainWindow.webContents;
+    wc.openDevTools({ mode: "detach" });
 
+    wc.on("context-menu", (_, params) => {
+      wc.inspectElement(params.x, params.y);
+    });
+
+    wc.on("before-input-event", (event, input) => {
+      if (input.type !== "keyDown") return;
+      const isToggleShortcut =
+        input.key === "F12" ||
+        ((input.control || input.meta) && input.shift && input.key.toLowerCase() === "i");
+      if (isToggleShortcut) {
+        wc.toggleDevTools();
+        event.preventDefault();
+      }
+    });
+  }
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   workbench = new NativeWorkbench(mainWindow, requestSidecar);
   mainWindow.webContents.on("will-navigate", (event, url) => {
@@ -179,6 +197,12 @@ function createWindow(): void {
   } else {
     void mainWindow.loadFile(path.join(desktopRoot, "dist-renderer", "index.html"));
   }
+  mainWindow.once("ready-to-show", () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.show();
+      mainWindow.focus();
+    }
+  });
   let drained = false;
   const window = mainWindow;
   mainWindow.on("close", (event) => {
@@ -212,6 +236,19 @@ app.whenReady().then(() => {
   ipcMain.handle("desktop:get-bootstrap", (event) => {
     assertTrustedSender(event);
     return { defaultWorkspace: repositoryRoot, platform: process.platform };
+  });
+  ipcMain.handle("desktop:set-theme", (event, theme: unknown) => {
+    assertTrustedSender(event);
+    if (!mainWindow || (theme !== "light" && theme !== "dark")) return;
+    const isDark = theme === "dark";
+    mainWindow.setBackgroundColor(isDark ? "#24273a" : "#ffffff");
+    if (typeof mainWindow.setTitleBarOverlay === "function") {
+      mainWindow.setTitleBarOverlay({
+        color: isDark ? "#2e3042" : "#ffffff",
+        symbolColor: isDark ? "#a5adcb" : "#4e5263",
+        height: 48,
+      });
+    }
   });
 
   createWindow();

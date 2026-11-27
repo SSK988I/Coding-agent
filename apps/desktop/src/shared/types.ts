@@ -211,6 +211,9 @@ export interface PermissionModePayload {
 
 export interface AgentMessage {
   attachments?: FileAttachmentMetadata[];
+  source?: string | null;
+  message_id?: string | null;
+  retry_of?: string | null;
   tool_call_id?: string;
   tool_name?: string;
   details?: unknown;
@@ -276,6 +279,7 @@ export interface DesktopBridge {
 export interface DesktopShell {
   workbenchRequest?<T = unknown>(method: string, params: Record<string, unknown>): Promise<T>;
   onWorkbenchEvent?(listener: (event: import("./workbench").WorkbenchNativeEvent) => void): () => void;
+  setTheme?(theme: "light" | "dark"): Promise<void>;
   chooseWorkspace(): Promise<string | null>;
   getBootstrap(): Promise<BootstrapInfo>;
 }

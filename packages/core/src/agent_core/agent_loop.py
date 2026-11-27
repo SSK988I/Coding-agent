@@ -69,6 +69,7 @@ from agent_core.types import (
     BeforeToolCallContext,
     StreamFn,
 )
+from agent_core.tools.edit import EditTool
 
 
 # ─── public entry points ───────────────────────────────────────────────
@@ -516,7 +517,7 @@ async def _execute_tool_calls_sequential(
             finalized = preparation["finalized"]
         else:
             executed = await _execute_prepared_tool_call(
-                tc, preparation["tool"], preparation["args"], signal, emit
+                tc, preparation["tool"], preparation["args"], signal, emit, assistant_message, config
             )
             finalized = await _finalize_executed_tool_call(
                 executed, context, assistant_message, tc, preparation["args"], config, signal
@@ -589,7 +590,7 @@ async def _run_one_parallel(
     """
     try:
         executed = await _execute_prepared_tool_call(
-            tc, preparation["tool"], preparation["args"], signal, emit
+            tc, preparation["tool"], preparation["args"], signal, emit, assistant_message, config
         )
         finalized = await _finalize_executed_tool_call(
             executed, context, assistant_message, tc, preparation["args"], config, signal
@@ -701,6 +702,8 @@ async def _execute_prepared_tool_call(
     args: dict,
     signal: Any,
     emit: AgentEventSink,
+    assistant_message: AssistantMessage,
+    config: AgentLoopConfig,
 ) -> _Finalized:
     """Invoke ``tool.execute`` with an ``on_update`` callback that streams partial
     results.
@@ -739,7 +742,9 @@ async def _execute_prepared_tool_call(
             "type": "tool_execution_running", "tool_call_id": tc.id,
             "tool_name": tc.name, "args": args,
         })
-        if _accepts_on_update(tool):
+        if config.execute_edit is not None and isinstance(tool, EditTool):
+            result = await config.execute_edit(tool, assistant_message, tc, args, signal)
+        elif _accepts_on_update(tool):
             result = await tool.execute(tc.id, args, signal, on_update)
         else:
             result = await tool.execute(tc.id, args, signal)

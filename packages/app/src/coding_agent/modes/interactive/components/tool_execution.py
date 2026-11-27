@@ -47,13 +47,23 @@ class ToolExecutionComponent(Container):
         # Render the initial "executing…" state.
         self._render_pending()
 
-    def set_result(self, result: Any, is_error: bool = False, status: str | None = None) -> None:
+    def set_result(self, result: Any, is_error: bool = False, status: str | None = None, *, allow_recovery: bool = True) -> None:
         """Update the card with the tool execution result."""
         raw = result if isinstance(result, str) else ""
         if hasattr(result, "content") and result.content:
             raw = getattr(result.content[0], "text", "")
         preview = self._preview_output(raw)
         outcome = status or getattr(result, "status", None) or ("failed" if is_error else "completed")
+        details = getattr(result, "details", None)
+        if (self.tool_name == "edit" and outcome == "completed" and isinstance(details, dict)
+                and details.get("assistantEntryId") and isinstance(details.get("patch"), str)):
+            preview += "\n" + details["patch"]
+        if (allow_recovery and self.tool_name == "edit" and outcome == "uncertain" and isinstance(details, dict)
+                and details.get("code") == "EDIT_RECOVERY_PENDING" and details.get("assistantEntryId")):
+            if details.get("retryable") is True:
+                preview += f"\n  重试原编辑：/retry-edit {details['assistantEntryId']} {self.tool_call_id}"
+            else:
+                preview += f"\n  核对原编辑：/check-edits {details['assistantEntryId']} {self.tool_call_id}"
         self._render_done(preview, outcome)
 
     def set_status(self, status: str) -> None:
